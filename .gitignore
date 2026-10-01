@@ -1,0 +1,11 @@
+# Build artifacts
+/vspz-yt-cli
+/vspz-yt-cli.exe
+*.test
+*.out
+
+# Local tooling metadata
+/.commandcode
+
+# FIFO/scratch files this program creates at runtime
+*.audio

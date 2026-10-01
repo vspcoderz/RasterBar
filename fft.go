@@ -1,0 +1,197 @@
+package main
+
+import "math"
+
+// Hand-rolled radix-2 Cooley-Tukey FFT. Deliberately no dependency: this
+// program's whole premise is a zero-dependency static binary (see PLAN.md), and
+// a spectrum analyser is the one piece that would otherwise have pulled in
+// gonum or a DSP package for ~80 lines of arithmetic.
+//
+// Verified against a synthetic sine wave in the tests: energy lands in the
+// expected bin and neighbours stay near zero.
+
+const (
+	fftSize    = 1024 // power of two; ~93ms window at spectrumRate
+	spectrumHz = 11025
+	bands      = 48
+)
+
+type FFT struct {
+	cos, sin []float64
+	rev      []int
+	re, im   []float64
+}
+
+func NewFFT(n int) *FFT {
+	if n <= 0 || n&(n-1) != 0 {
+		n = 1
+	}
+	f := &FFT{
+		cos: make([]float64, n/2),
+		sin: make([]float64, n/2),
+		rev: make([]int, n),
+		re:  make([]float64, n),
+		im:  make([]float64, n),
+	}
+	for i := 0; i < n/2; i++ {
+		angle := 2 * math.Pi * float64(i) / float64(n)
+		f.cos[i] = math.Cos(angle)
+		f.sin[i] = math.Sin(angle)
+	}
+	// bit-reversal permutation table, computed once
+	bits := 0
+	for (1 << bits) < n {
+		bits++
+	}
+	for i := 0; i < n; i++ {
+		r := 0
+		for b := 0; b < bits; b++ {
+			if i&(1<<b) != 0 {
+				r |= 1 << (bits - 1 - b)
+			}
+		}
+		f.rev[i] = r
+	}
+	return f
+}
+
+// hann window, computed once. Reduces spectral leakage so a single tone does
+// not smear across neighbouring bands.
+var hann = func() []float64 {
+	w := make([]float64, fftSize)
+	for i := range w {
+		w[i] = 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(fftSize-1)))
+	}
+	return w
+}()
+
+// Forward transforms re/im in place. Input length must be len(f.rev).
+func (f *FFT) Forward(re, im []float64) {
+	n := len(re)
+	if n != len(f.rev) {
+		return
+	}
+	for i := 0; i < n; i++ {
+		j := f.rev[i]
+		if i < j {
+			re[i], re[j] = re[j], re[i]
+			im[i], im[j] = im[j], im[i]
+		}
+	}
+	for size := 2; size <= n; size <<= 1 {
+		half := size / 2
+		step := n / size
+		for i := 0; i < n; i += size {
+			k := 0
+			for j := i; j < i+half; j++ {
+				c, s := f.cos[k], f.sin[k]
+				tre := re[j+half]*c + im[j+half]*s
+				tim := -re[j+half]*s + im[j+half]*c
+				re[j+half] = re[j] - tre
+				im[j+half] = im[j] - tim
+				re[j] += tre
+				im[j] += tim
+				k += step
+			}
+		}
+	}
+}
+
+// SpectrumAnalyzer turns PCM blocks into log-spaced band magnitudes.
+type SpectrumAnalyzer struct {
+	fft    *FFT
+	re, im []float64
+	edges  []int // bin index per band edge
+	mags   []float64
+	smooth []float64
+	rate   int
+	bands  int
+	window []float64
+}
+
+func NewSpectrumAnalyzer(rate, nBands int) *SpectrumAnalyzer {
+	if nBands <= 0 {
+		nBands = bands
+	}
+	if rate <= 0 {
+		rate = spectrumHz
+	}
+	s := &SpectrumAnalyzer{
+		fft:    NewFFT(fftSize),
+		re:     make([]float64, fftSize),
+		im:     make([]float64, fftSize),
+		mags:   make([]float64, nBands),
+		smooth: make([]float64, nBands),
+		edges:  make([]int, nBands+1),
+		rate:   rate,
+		bands:  nBands,
+		window: hann,
+	}
+	// Log-spaced edges from 30Hz to Nyquist. Linear spacing would put
+	// everything interesting (bass and mid) in the first two bars.
+	nyquist := float64(rate) / 2
+	const loHz = 30.0
+	for i := 0; i <= nBands; i++ {
+		frac := float64(i) / float64(nBands)
+		hz := loHz * pow(nyquist/loHz, frac)
+		bin := int(hz / nyquist * float64(fftSize/2))
+		if bin < 1 {
+			bin = 1
+		}
+		if bin > fftSize/2-1 {
+			bin = fftSize/2 - 1
+		}
+		s.edges[i] = bin
+	}
+	return s
+}
+
+func pow(base, exp float64) float64 { return math.Pow(base, exp) }
+
+// Analyze consumes mono float samples in [-1,1] and returns band magnitudes
+// smoothed over time. Fewer than fftSize samples zero-pads.
+func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
+	for i := range s.re {
+		s.re[i] = 0
+		s.im[i] = 0
+	}
+	n := len(samples)
+	if n > fftSize {
+		n = fftSize
+	}
+	for i := 0; i < n; i++ {
+		s.re[i] = samples[i] * s.window[i]
+	}
+	s.fft.Forward(s.re, s.im)
+
+	for b := 0; b < s.bands; b++ {
+		lo, hi := s.edges[b], s.edges[b+1]
+		if hi <= lo {
+			hi = lo + 1
+		}
+		var sum float64
+		for k := lo; k < hi && k < fftSize/2; k++ {
+			mag := math.Sqrt(s.re[k]*s.re[k] + s.im[k]*s.im[k])
+			sum += mag * mag
+		}
+		rms := math.Sqrt(sum / float64(hi-lo))
+		// dB, then map -70..-10 dB onto 0..1. Absolute FFT magnitudes are tiny
+		// and vary wildly with content, so a fixed linear scale is useless.
+		db := 20 * math.Log10(rms+1e-12)
+		v := (db + 70.0) / 60.0
+		switch {
+		case v < 0:
+			v = 0
+		case v > 1:
+			v = 1
+		}
+		// asymmetric smoothing: fast attack, slow release reads better
+		if v > s.smooth[b] {
+			s.smooth[b] += (v - s.smooth[b]) * 0.6
+		} else {
+			s.smooth[b] += (v - s.smooth[b]) * 0.18
+		}
+		s.mags[b] = s.smooth[b]
+	}
+	return s.mags
+}

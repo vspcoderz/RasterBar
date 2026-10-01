@@ -1,0 +1,890 @@
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"math"
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestParseYtdlpFlatPlaylist(t *testing.T) {
+	raw := []byte(`{"_type":"url","id":"lTRiuFIWV54","url":"https://www.youtube.com/watch?v=lTRiuFIWV54","title":"1 A.M Study Session","channel":"Lofi Girl","uploader":"Lofi Girl","duration":3674,"thumbnails":[{"url":"small.jpg","height":202,"width":360},{"url":"big.jpg","height":720,"width":1280}]}
+{"_type":"url","id":"abc123","url":"https://www.youtube.com/watch?v=abc123","title":"Second","channel":"Chan2","duration":0}`)
+	tracks, err := parseYtdlp(raw)
+	if err != nil {
+		t.Fatalf("parseYtdlp: %v", err)
+	}
+	if len(tracks) != 2 {
+		t.Fatalf("want 2 tracks, got %d", len(tracks))
+	}
+	got := tracks[0]
+	if got.ID != "lTRiuFIWV54" {
+		t.Errorf("ID = %q", got.ID)
+	}
+	if got.DurationText() != "1:01:14" {
+		t.Errorf("Duration = %q, want 1:01:14", got.DurationText())
+	}
+	if !strings.HasSuffix(got.Thumbs, "big.jpg") {
+		t.Errorf("Thumbs = %q, want largest", got.Thumbs)
+	}
+	if got2 := tracks[1].DurationText(); got2 != "--:--" {
+		t.Errorf("zero duration = %q, want --:--", got2)
+	}
+}
+
+func TestParseYtdlpSkipsMalformed(t *testing.T) {
+	tracks, err := parseYtdlp([]byte("not json\n{\"id\":\"ok\",\"title\":\"t\"}\n"))
+	if err != nil {
+		t.Fatalf("parseYtdlp: %v", err)
+	}
+	if len(tracks) != 1 || tracks[0].ID != "ok" {
+		t.Fatalf("got %d tracks, want 1", len(tracks))
+	}
+}
+
+func TestParseYtdlpEmptyFails(t *testing.T) {
+	if _, err := parseYtdlp([]byte("")); err == nil {
+		t.Fatal("want error on empty input")
+	}
+}
+
+func TestParseYtfzfJSONWithTerminalNoise(t *testing.T) {
+	// Shape captured from a real `ytfzf -c yt -I J` run, wrapped in the escape
+	// sequences fzf leaves behind (see PLAN.md).
+	raw := []byte("\x1b[?1049h\x1bScraping Youtube (with https://www.youtube.com) (lofi)\n" +
+		`[{"scraper":"youtube_search","url":"https://youtube.com/watch?v=BCxTQq0UiFs","title":"Chill Lofi","channel":"Art Is Sound","duration":"1:42:55","views":"6M","date":"1y ago","ID":"BCxTQq0UiFs","thumbs":"https://i.ytimg.com/x.jpg"}]` +
+		"\x1b[?25h\x1b[?1049l\n")
+	tracks, err := parseYtfzfJSON(raw)
+	if err != nil {
+		t.Fatalf("parseYtfzfJSON: %v", err)
+	}
+	if len(tracks) != 1 {
+		t.Fatalf("got %d tracks, want 1", len(tracks))
+	}
+	if tracks[0].ID != "BCxTQq0UiFs" {
+		t.Errorf("ID = %q", tracks[0].ID)
+	}
+	if tracks[0].ChannelText() != "Art Is Sound" {
+		t.Errorf("channel = %q", tracks[0].ChannelText())
+	}
+	if tracks[0].DurationText() != "1:42:55" {
+		t.Errorf("duration = %q", tracks[0].DurationText())
+	}
+}
+
+func TestParseYtfzfJSONNoArrayFails(t *testing.T) {
+	if _, err := parseYtfzfJSON([]byte("Nothing was scraped")); err == nil {
+		t.Fatal("want error when no array present")
+	}
+}
+
+func TestFormatDuration(t *testing.T) {
+	for in, want := range map[int]string{3674: "1:01:14", 65: "1:05", 3600: "1:00:00", 59: "0:59"} {
+		if got := formatDuration(in); got != want {
+			t.Errorf("formatDuration(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestRenderFrameTo(t *testing.T) {
+	const cols, rows = 4, 2
+	raw := make([]byte, cols*rows)
+	for i := range raw {
+		raw[i] = 255
+	}
+	var buf bytes.Buffer
+	if err := renderFrameTo(&buf, raw, cols, rows); err != nil {
+		t.Fatalf("renderFrameTo: %v", err)
+	}
+	want := strings.Repeat(string(ramp[len(ramp)-1])+strings.Repeat(string(ramp[len(ramp)-1]), 0), 0) +
+		strings.Repeat(string(ramp[len(ramp)-1]), cols) + "\n" +
+		strings.Repeat(string(ramp[len(ramp)-1]), cols) + "\n"
+	if got := buf.String(); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRenderFrameToDarkIsSpaces(t *testing.T) {
+	const cols, rows = 4, 2
+	var buf bytes.Buffer
+	if err := renderFrameTo(&buf, make([]byte, cols*rows), cols, rows); err != nil {
+		t.Fatalf("renderFrameTo: %v", err)
+	}
+	want := strings.Repeat(" ", cols) + "\n" + strings.Repeat(" ", cols) + "\n"
+	if got := buf.String(); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestRampCoversFullByteRange(t *testing.T) {
+	// every possible byte must map to a valid ramp index
+	for b := 0; b < 256; b++ {
+		idx := b * len(ramp) / 256
+		if idx < 0 || idx >= len(ramp) {
+			t.Fatalf("byte %d maps to out-of-range index %d", b, idx)
+		}
+	}
+	if idx := 255 * len(ramp) / 256; idx != len(ramp)-1 {
+		t.Errorf("byte 255 maps to %d, want %d (brightest char)", idx, len(ramp)-1)
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	if got := truncate("hello", 10); got != "hello" {
+		t.Errorf("short string altered: %q", got)
+	}
+	if got := truncate("abcdefghij", 5); got != "abcd…" {
+		t.Errorf("got %q, want abcd…", got)
+	}
+}
+
+func TestVisualizerReactsAndClamps(t *testing.T) {
+	v := NewVisualizer(8)
+	if got := len(v.Render()); got < 8 {
+		t.Errorf("width = %d, want at least 8", got)
+	}
+	before := v.Render()
+	v.Push([]float64{1, 1, 1, 1, 1, 1, 1, 1})
+	if v.Render() == before {
+		t.Error("visualizer did not react to Push")
+	}
+	// must clamp, not panic or invert
+	v.Push([]float64{-5, -5, -5, -5, -5, -5, -5, -5})
+	v.Push([]float64{99, 99, 99, 99, 99, 99, 99, 99})
+	if strings.ContainsAny(v.Render(), "xyz") {
+		t.Errorf("render contains out-of-ramp chars: %q", v.Render())
+	}
+}
+
+func TestVisualizerPushScalar(t *testing.T) {
+	v := NewVisualizer(16)
+	before := v.Render()
+	v.PushScalar(1.0)
+	if v.Render() == before {
+		t.Error("PushScalar had no effect")
+	}
+	v.PushScalar(-1)
+	v.PushScalar(2)
+}
+
+func TestFFTIsPowerOfTwoSized(t *testing.T) {
+	for _, n := range []int{0, 1, 3, 100} {
+		f := NewFFT(n)
+		size := len(f.rev)
+		if size&(size-1) != 0 {
+			t.Errorf("NewFFT(%d) gave non-power-of-two size %d", n, size)
+		}
+	}
+}
+
+// A pure tone must put its energy in the matching FFT bin. This is the test
+// that proves the hand-rolled FFT is actually correct and not just fast.
+func TestFFTFindsPureTone(t *testing.T) {
+	const rate = 11025
+	const toneBin = 64 // 64 * rate/fftSize = 689 Hz
+	f := NewFFT(fftSize)
+	re := make([]float64, fftSize)
+	im := make([]float64, fftSize)
+	for i := 0; i < fftSize; i++ {
+		ang := 2 * math.Pi * float64(toneBin) * float64(i) / float64(fftSize)
+		re[i] = math.Cos(ang)
+	}
+	f.Forward(re, im)
+
+	mag := func(bin int) float64 {
+		return math.Hypot(re[bin], im[bin])
+	}
+	peak := mag(toneBin)
+	if peak < 1e-6 {
+		t.Fatalf("no energy at expected bin %d (mag=%g)", toneBin, peak)
+	}
+	// the peak must dominate its neighbours, or the transform is wrong
+	for _, nb := range []int{toneBin - 8, toneBin - 2, toneBin + 2, toneBin + 8} {
+		if mag(nb) > peak*0.05 {
+			t.Errorf("leak into bin %d: %g vs peak %g", nb, mag(nb), peak)
+		}
+	}
+	// DC and the far end should be near zero for a mid-band tone
+	if mag(1) > peak*0.05 {
+		t.Errorf("unexpected DC energy: %g", mag(1))
+	}
+}
+
+func TestSpectrumAnalyzerBands(t *testing.T) {
+	s := NewSpectrumAnalyzer(11025, 32)
+	samples := make([]float64, fftSize)
+	mags := s.Analyze(samples)
+	if len(mags) != 32 {
+		t.Fatalf("got %d bands, want 32", len(mags))
+	}
+	for i, m := range mags {
+		if m < 0 || m > 1 {
+			t.Errorf("band %d = %v, want 0..1", i, m)
+		}
+	}
+	// silence must not light up the meter
+	sum := 0.0
+	for _, m := range mags {
+		sum += m
+	}
+	if sum > 0.5 {
+		t.Errorf("silence produced energy: sum=%v", sum)
+	}
+
+	// a loud low tone must move the lowest band more than the highest
+	low := make([]float64, fftSize)
+	for i := range low {
+		ang := 2 * math.Pi * 8 * float64(i) / float64(fftSize) // ~86 Hz
+		low[i] = math.Cos(ang)
+	}
+	m2 := NewSpectrumAnalyzer(11025, 32).Analyze(low)
+	if m2[0] <= m2[len(m2)-1] {
+		t.Errorf("low tone did not favour low band: first=%v last=%v", m2[0], m2[len(m2)-1])
+	}
+}
+
+func TestComputeLayoutFollowsTerminal(t *testing.T) {
+	// A small terminal must not request a big video.
+	small := computeLayout(80, 24, 0, 0)
+	if small.cols != 80 {
+		t.Errorf("small cols = %d, want 80", small.cols)
+	}
+	if small.sourceH > 360 {
+		t.Errorf("80x24 requested %dp, want <= 360p", small.sourceH)
+	}
+
+	// A large terminal should scale up.
+	big := computeLayout(240, 60, 0, 0)
+	if big.cols != 240 {
+		t.Errorf("big cols = %d, want 240", big.cols)
+	}
+	if big.sourceH <= small.sourceH {
+		t.Errorf("big terminal sourceH %d not greater than small %d", big.sourceH, small.sourceH)
+	}
+
+	// Monotonic: more columns must never lower the requested source.
+	prev := 0
+	for _, c := range []int{40, 80, 120, 160, 200, 240, 300} {
+		l := computeLayout(c, 50, 0, 0)
+		if l.sourceH < prev {
+			t.Errorf("sourceH dropped from %d to %d at %d cols", prev, l.sourceH, c)
+		}
+		prev = l.sourceH
+	}
+}
+
+func TestComputeLayoutRespectsRows(t *testing.T) {
+	// A short terminal must clamp rows, and the grid must still fit.
+	l := computeLayout(200, 12, 0, 0)
+	if l.rows >= 12 {
+		t.Errorf("rows = %d, must leave room for chrome in a 12-row window", l.rows)
+	}
+	if l.rows < 4 {
+		t.Errorf("rows = %d, want a usable minimum", l.rows)
+	}
+
+	// Very tall window: rows follow cols/aspect, not the whole window.
+	tall := computeLayout(80, 200, 0, 0)
+	if tall.rows >= 200 {
+		t.Errorf("rows = %d, want width/aspect rather than full height", tall.rows)
+	}
+}
+
+func TestComputeLayoutAspect(t *testing.T) {
+	// A taller aspect ratio (cells taller than wide) needs fewer rows.
+	normal := computeLayout(100, 50, 2.0, 0)
+	tall := computeLayout(100, 50, 4.0, 0)
+	if tall.rows >= normal.rows {
+		t.Errorf("aspect 4.0 gave rows=%d, expected fewer than aspect 2.0 rows=%d",
+			tall.rows, normal.rows)
+	}
+
+	// Zero/invalid aspect must fall back to the default, not divide by zero.
+	zero := computeLayout(100, 50, 0, 0)
+	if zero.rows <= 0 {
+		t.Error("zero aspect produced no rows")
+	}
+}
+
+func TestComputeLayoutQualityOverride(t *testing.T) {
+	// An explicit floor raises the source above what the grid implies.
+	small := computeLayout(80, 24, 0, 0)
+	raised := computeLayout(80, 24, 0, Quality(720))
+	if raised.sourceH < 720 {
+		t.Errorf("quality 720 gave sourceH %d", raised.sourceH)
+	}
+	if raised.sourceH <= small.sourceH {
+		t.Errorf("quality override did not raise resolution: %d vs %d",
+			raised.sourceH, small.sourceH)
+	}
+
+	// A cap must not raise it.
+	capped := computeLayout(300, 60, 0, Quality(240))
+	if capped.sourceH > 720 {
+		t.Errorf("cap 240 gave %dp, want it capped", capped.sourceH)
+	}
+}
+
+func TestComputeLayoutFallbacks(t *testing.T) {
+	// Non-TTY (zero) sizes must not produce a zero-sized grid.
+	l := computeLayout(0, 0, 0, 0)
+	if l.cols <= 0 || l.rows <= 0 {
+		t.Errorf("fallback grid is %dx%d, want positive", l.cols, l.rows)
+	}
+
+	// Absurd terminal sizes are clamped.
+	huge := computeLayout(10000, 10000, 0, 0)
+	if huge.cols > maxCols {
+		t.Errorf("cols = %d, want clamped to %d", huge.cols, maxCols)
+	}
+	if huge.rows > maxRows {
+		t.Errorf("rows = %d, want clamped to %d", huge.rows, maxRows)
+	}
+}
+
+func TestParseArgsQualityAndLayout(t *testing.T) {
+	o, err := parseArgs([]string{"-q", "720", "--aspect", "2.5", "--cols", "120", "lofi"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if o.quality != Quality(720) {
+		t.Errorf("quality = %v, want 720", o.quality)
+	}
+	if o.aspect != 2.5 {
+		t.Errorf("aspect = %v, want 2.5", o.aspect)
+	}
+	if o.cols != 120 {
+		t.Errorf("cols = %d, want 120", o.cols)
+	}
+	if o.query != "lofi" {
+		t.Errorf("query = %q", o.query)
+	}
+
+	// Reject nonsense values instead of silently ignoring them.
+	for _, bad := range [][]string{
+		{"-q", "999"}, {"-q", "abc"}, {"-q"}, {"--aspect", "0"},
+		{"--aspect", "-1"}, {"--cols", "0"}, {"--cols", "5"},
+	} {
+		if _, err := parseArgs(bad); err == nil {
+			t.Errorf("parseArgs(%v) should have errored", bad)
+		}
+	}
+}
+
+func TestPickStreamsPrefersProgressive(t *testing.T) {
+	formats := []ytFormat{
+		{URL: "v720", Height: 720, VCodec: "av01", ACodec: "none", Protocol: "https", TBR: 100},
+		{URL: "a251", ACodec: "opus", VCodec: "none", Protocol: "https", TBR: 140},
+		{URL: "prog", Height: 360, VCodec: "avc1", ACodec: "mp4a", Protocol: "https"},
+	}
+	v, a, err := pickStreams(formats, 480)
+	if err != nil {
+		t.Fatalf("pickStreams: %v", err)
+	}
+	if v != "prog" || a != "prog" {
+		t.Errorf("got (%q,%q), want the progressive stream used for both", v, a)
+	}
+}
+
+func TestPickStreamsPicksSeparateWhenNoProgressive(t *testing.T) {
+	formats := []ytFormat{
+		{URL: "v1080-av1", Height: 1080, VCodec: "av01", ACodec: "none", Protocol: "https", TBR: 200},
+		{URL: "v360-h264", Height: 360, VCodec: "avc1", ACodec: "none", Protocol: "https", TBR: 40},
+		{URL: "v720-vp9", Height: 720, VCodec: "vp09", ACodec: "none", Protocol: "https", TBR: 90},
+		{URL: "a140", ACodec: "mp4a", VCodec: "none", Protocol: "https", TBR: 129},
+		{URL: "a139", ACodec: "mp4a", VCodec: "none", Protocol: "https", TBR: 49},
+	}
+	v, a, err := pickStreams(formats, 720)
+	if err != nil {
+		t.Fatalf("pickStreams: %v", err)
+	}
+	// h264 must win over vp9 and av1 at equal-or-better height, and the 1080p
+	// AV1 stream must be excluded by the 720p cap.
+	if v != "v360-h264" {
+		t.Errorf("video = %q, want the h264 stream (cheapest to decode)", v)
+	}
+	if a != "a140" {
+		t.Errorf("audio = %q, want the highest-bitrate audio", a)
+	}
+}
+
+func TestPickStreamsHonoursHeightCap(t *testing.T) {
+	formats := []ytFormat{
+		{URL: "v1080", Height: 1080, VCodec: "avc1", ACodec: "none", Protocol: "https"},
+		{URL: "v480", Height: 480, VCodec: "avc1", ACodec: "none", Protocol: "https"},
+		{URL: "a", ACodec: "opus", VCodec: "none", Protocol: "https"},
+	}
+	v, _, err := pickStreams(formats, 480)
+	if err != nil {
+		t.Fatalf("pickStreams: %v", err)
+	}
+	if v != "v480" {
+		t.Errorf("video = %q, want v480 (1080p exceeds the cap)", v)
+	}
+}
+
+func TestPickStreamsSkipsM3u8(t *testing.T) {
+	formats := []ytFormat{
+		{URL: "v360-m3u8", Height: 360, VCodec: "avc1", ACodec: "none", Protocol: "m3u8"},
+		{URL: "v240", Height: 240, VCodec: "avc1", ACodec: "none", Protocol: "https"},
+		{URL: "a", ACodec: "opus", VCodec: "none", Protocol: "https"},
+	}
+	v, _, err := pickStreams(formats, 480)
+	if err != nil {
+		t.Fatalf("pickStreams: %v", err)
+	}
+	if v != "v240" {
+		t.Errorf("video = %q, want v240; m3u8 must be skipped", v)
+	}
+}
+
+func TestPickStreamsNoAudioFails(t *testing.T) {
+	formats := []ytFormat{
+		{URL: "v360", Height: 360, VCodec: "avc1", ACodec: "none", Protocol: "https"},
+	}
+	if _, _, err := pickStreams(formats, 480); err == nil {
+		t.Error("want an error when there is no audio format")
+	}
+}
+
+func TestIsH264(t *testing.T) {
+	// "av01" is AV1, not h264, despite the shared prefix.
+	for _, tc := range []struct {
+		vc   string
+		want bool
+	}{
+		{"avc1.640028", true},
+		{"avc1.4d401e", true},
+		{"av01.0.08M.08", false},
+		{"vp09.00.40.08", false},
+		{"vp8", false},
+		{"", false},
+	} {
+		if got := isH264(tc.vc); got != tc.want {
+			t.Errorf("isH264(%q) = %v, want %v", tc.vc, got, tc.want)
+		}
+	}
+}
+
+func TestDiffRendererFirstFramePaintsAll(t *testing.T) {
+	const cols, rows = 8, 3
+	var buf bytes.Buffer
+	d := NewDiffRenderer(&buf, cols, rows)
+	frame := make([]byte, cols*rows)
+	for i := range frame {
+		frame[i] = byte(i * 8)
+	}
+	if err := d.Draw(frame); err != nil {
+		t.Fatalf("Draw: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "\x1b[2J") {
+		t.Error("first frame should clear the screen")
+	}
+	// three cursor-positioned rows
+	if strings.Count(out, "\x1b[") < rows {
+		t.Errorf("expected at least %d cursor moves, got %d", rows, strings.Count(out, "\x1b["))
+	}
+}
+
+func TestDiffRendererSkipsUnchanged(t *testing.T) {
+	const cols, rows = 16, 4
+	var buf bytes.Buffer
+	d := NewDiffRenderer(&buf, cols, rows)
+	frame := make([]byte, cols*rows)
+	for i := range frame {
+		frame[i] = 128
+	}
+	if err := d.Draw(frame); err != nil {
+		t.Fatal(err)
+	}
+	full := buf.Len()
+	buf.Reset()
+
+	// Identical frame: almost nothing should be written.
+	if err := d.Draw(frame); err != nil {
+		t.Fatal(err)
+	}
+	quiet := buf.Len()
+	if quiet > full/10 {
+		t.Errorf("unchanged frame wrote %d bytes vs %d for the first frame; diffing is not working", quiet, full)
+	}
+
+	// One changed cell should cost far less than a full repaint.
+	frame[0] = 255
+	buf.Reset()
+	if err := d.Draw(frame); err != nil {
+		t.Fatal(err)
+	}
+	oneCell := buf.Len()
+	if oneCell > full/2 {
+		t.Errorf("single-cell change wrote %d bytes vs %d full; runs are not limiting output", oneCell, full)
+	}
+}
+
+func TestDiffRendererRunWidening(t *testing.T) {
+	// A one-cell change must still emit output (cursor move + the cell),
+	// even though the run-expansion widens the painted span.
+	const cols, rows = 10, 2
+	var buf bytes.Buffer
+	d := NewDiffRenderer(&buf, cols, rows)
+	frame := make([]byte, cols*rows)
+	for i := range frame {
+		frame[i] = 40
+	}
+	if err := d.Draw(frame); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	frame[5] = 200
+	if err := d.Draw(frame); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() == 0 {
+		t.Error("a changed cell produced no output")
+	}
+	if !strings.Contains(buf.String(), "\x1b[") {
+		t.Error("changed cell should be positioned with a cursor move")
+	}
+}
+
+func TestDiffRendererRejectsShortFrame(t *testing.T) {
+	d := NewDiffRenderer(&bytes.Buffer{}, 8, 4)
+	if err := d.Draw(make([]byte, 4)); err == nil {
+		t.Error("want an error for a frame smaller than the grid")
+	}
+}
+
+func TestLevelForCoversRange(t *testing.T) {
+	// The ramp is ordered by perceived ink density, not codepoint, so the
+	// meaningful checks are coverage and endpoints.
+	if got := levelFor(0); got != ramp[0] {
+		t.Errorf("levelFor(0) = %q, want darkest %q", got, ramp[0])
+	}
+	if got := levelFor(255); got != ramp[len(ramp)-1] {
+		t.Errorf("levelFor(255) = %q, want brightest %q", got, ramp[len(ramp)-1])
+	}
+	// Every byte must map to a character that exists in the ramp, and the
+	// distinct level count must show real tonal resolution (not a tiny ramp).
+	seen := map[byte]bool{}
+	for b := 0; b < 256; b++ {
+		g := levelFor(byte(b))
+		if !strings.ContainsRune(ramp, rune(g)) {
+			t.Fatalf("byte %d mapped to %q which is not in the ramp", b, g)
+		}
+		seen[g] = true
+	}
+	if len(seen) < 32 {
+		t.Errorf("only %d distinct levels used; ramp is too coarse for smooth gradients", len(seen))
+	}
+	// Denser input must never map to a *lower ramp index*.
+	prevIdx := -1
+	for b := 0; b < 256; b++ {
+		idx := strings.IndexByte(ramp, levelFor(byte(b)))
+		if idx < prevIdx {
+			t.Fatalf("ramp index went backwards at byte %d: %d < %d", b, idx, prevIdx)
+		}
+		prevIdx = idx
+	}
+}
+
+func TestFPSForGridScalesDown(t *testing.T) {
+	small := fpsForGrid(80, 21)
+	big := fpsForGrid(200, 57)
+	if big > small {
+		t.Errorf("big grid fps %d should not exceed small grid fps %d", big, small)
+	}
+	if small < 6 {
+		t.Errorf("small grid fps = %d, want at least 6", small)
+	}
+	// Cells-per-second must stay in a band a terminal can absorb. Test the
+	// clamped layout, not the raw helper: computeLayout is what actually runs.
+	for _, tc := range [][2]int{{80, 21}, {120, 40}, {200, 57}, {300, 120}, {400, 200}} {
+		l := computeLayout(tc[0], tc[1], 0, 0)
+		if cps := l.cols * l.rows * l.fps; cps > 150000 {
+			t.Errorf("%dx%d -> grid %dx%d @%dfps = %d cells/sec, too much",
+				tc[0], tc[1], l.cols, l.rows, l.fps, cps)
+		}
+	}
+}
+
+func TestDetectColor(t *testing.T) {
+	cases := []struct {
+		name string
+		env  []string
+		want ColorMode
+	}{
+		{"truecolor via COLORTERM", []string{"TERM=xterm-256color", "COLORTERM=truecolor"}, ColorTrue},
+		{"24bit", []string{"COLORTERM=24bit"}, ColorTrue},
+		{"term advertises truecolor", []string{"TERM=xterm-truecolor"}, ColorTrue},
+		{"plain 256", []string{"TERM=xterm-256color"}, Color256},
+		{"kitty", []string{"TERM=xterm-kitty"}, Color256},
+		{"dumb", []string{"TERM=dumb"}, ColorNone},
+		{"plain xterm", []string{"TERM=xterm"}, ColorNone},
+		{"empty env", nil, ColorNone},
+	}
+	for _, tc := range cases {
+		if got := detectColor(tc.env); got != tc.want {
+			t.Errorf("%s: detectColor(%v) = %v, want %v", tc.name, tc.env, got, tc.want)
+		}
+	}
+}
+
+func TestQuant256GreyRamp(t *testing.T) {
+	// Pure greys must land in the 232-255 grey ramp, not the colour cube, or
+	// monochrome content picks up a colour cast.
+	for _, v := range []byte{0, 10, 64, 128, 200, 255} {
+		idx := quant256(v, v, v)
+		if idx < 232 {
+			t.Errorf("grey %d mapped to %d, want the grey ramp (>=232)", v, idx)
+		}
+	}
+	// Saturated colours must land in the cube (16-231).
+	for _, c := range [][3]byte{{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0}} {
+		idx := quant256(c[0], c[1], c[2])
+		if idx < 16 || idx > 231 {
+			t.Errorf("colour %v mapped to %d, want the colour cube (16-231)", c, idx)
+		}
+	}
+	// Output must be a valid palette index.
+	for r := 0; r < 256; r += 17 {
+		for g := 0; g < 256; g += 17 {
+			for b := 0; b < 256; b += 17 {
+				idx := quant256(byte(r), byte(g), byte(b))
+				if idx < 0 || idx > 255 {
+					t.Fatalf("quant256(%d,%d,%d) = %d, out of palette", r, g, b, idx)
+				}
+			}
+		}
+	}
+}
+
+func TestColorRendererEmitsHalfBlocks(t *testing.T) {
+	const cols, rows = 4, 2
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, cols, rows, ColorTrue)
+	frame := make([]byte, r.cellBytes())
+	for i := 0; i < len(frame); i++ {
+		frame[i] = byte(i * 7 % 256)
+	}
+	if err := r.Draw(frame); err != nil {
+		t.Fatalf("Draw: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, string(halfBlock)) {
+		t.Errorf("expected half-block glyphs in output, got %q", truncateForLog(out))
+	}
+	if !strings.Contains(out, "38;2;") {
+		t.Error("truecolor mode should emit 24-bit SGR sequences")
+	}
+	if !strings.Contains(out, "48;2;") {
+		t.Error("half-block mode needs a background colour for the lower half")
+	}
+}
+
+func TestColorRenderer256UsesPalette(t *testing.T) {
+	const cols, rows = 4, 2
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, cols, rows, Color256)
+	if err := r.Draw(make([]byte, r.cellBytes())); err != nil {
+		t.Fatalf("Draw: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "38;5;") {
+		t.Errorf("256 mode should emit palette indices, got %q", truncateForLog(out))
+	}
+	if strings.Contains(out, "38;2;") {
+		t.Error("256 mode must not emit 24-bit sequences")
+	}
+}
+
+func TestColorRendererSkipsUnchangedCells(t *testing.T) {
+	const cols, rows = 12, 4
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, cols, rows, Color256)
+	frame := make([]byte, r.cellBytes())
+	for i := range frame {
+		frame[i] = 128
+	}
+	if err := r.Draw(frame); err != nil {
+		t.Fatal(err)
+	}
+	first := buf.Len()
+	buf.Reset()
+
+	// Identical frame: only the per-row reset sequences should remain, not a
+	// full repaint of every cell.
+	if err := r.Draw(frame); err != nil {
+		t.Fatal(err)
+	}
+	second := buf.Len()
+	if second > first/2 {
+		t.Errorf("unchanged colour frame wrote %d bytes vs %d for the first frame; diffing is not working",
+			second, first)
+	}
+}
+
+func TestColorRendererRejectsShortFrame(t *testing.T) {
+	r := NewColorDiffRenderer(&bytes.Buffer{}, 8, 4, ColorTrue)
+	if err := r.Draw(make([]byte, 10)); err == nil {
+		t.Error("want an error for a frame smaller than the colour grid")
+	}
+}
+
+func TestColorCellBytesDoublesHeight(t *testing.T) {
+	const cols, rows = 10, 5
+	r := NewColorDiffRenderer(&bytes.Buffer{}, cols, rows, ColorTrue)
+	// Two pixels per cell, three bytes each: the half-block layout.
+	if got, want := r.cellBytes(), cols*rows*2*3; got != want {
+		t.Errorf("cellBytes = %d, want %d", got, want)
+	}
+}
+
+func TestParseArgsColorFlags(t *testing.T) {
+	o, err := parseArgs([]string{"-c", "lofi"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if o.color != ColorTrue {
+		t.Errorf("-c gave colour %v, want ColorTrue", o.color)
+	}
+
+	m, err := parseArgs([]string{"--mono", "lofi"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if m.color != ColorNone {
+		t.Errorf("--mono gave colour %v, want ColorNone", m.color)
+	}
+
+	// No flag must mean "detect", not "off".
+	a, err := parseArgs([]string{"lofi"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if a.color != colorAuto {
+		t.Errorf("default colour = %v, want colorAuto (detect)", a.color)
+	}
+}
+
+func truncateForLog(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "..."
+	}
+	return s
+}
+
+func TestTermSizeOnNonTTY(t *testing.T) {
+	// Reading a non-TTY must return an error, not a fake size: the callers fall
+	// back to defaults on error.
+	f, err := os.CreateTemp("", "notatty")
+	if err != nil {
+		t.Skipf("temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if _, _, err := termSize(f); err == nil {
+		t.Error("termSize on a regular file should error")
+	}
+}
+
+func TestParseArgs(t *testing.T) {
+	o, err := parseArgs([]string{"-m", "lofi", "hip", "hop"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if !o.mute {
+		t.Error("-m not set")
+	}
+	if o.query != "lofi hip hop" {
+		t.Errorf("query = %q", o.query)
+	}
+	if _, err := parseArgs([]string{"-x", "q"}); err == nil {
+		t.Error("want error on unknown flag")
+	}
+	if _, err := parseArgs([]string{"-h"}); err == nil {
+		t.Error("-h should signal help")
+	}
+	o2, _ := parseArgs([]string{"-a", "song"})
+	if !o2.ascii || o2.query != "song" {
+		t.Errorf("got %+v", o2)
+	}
+}
+
+func TestRMSLevel(t *testing.T) {
+	if got := rmsLevel(nil); got != 0 {
+		t.Errorf("empty pcm = %v, want 0", got)
+	}
+	if got := rmsLevel([]byte{1}); got != 0 {
+		t.Errorf("odd byte pcm = %v, want 0", got)
+	}
+	// silence
+	silence := make([]byte, 400)
+	if got := rmsLevel(silence); got != 0 {
+		t.Errorf("silence = %v, want 0", got)
+	}
+	// full-scale square-ish signal should map near the top
+	loud := make([]byte, 400)
+	for i := 0; i < len(loud); i += 2 {
+		binary.LittleEndian.PutUint16(loud[i:], uint16(int16(30000)))
+	}
+	if got := rmsLevel(loud); got < 0.8 {
+		t.Errorf("loud signal = %v, want > 0.8", got)
+	}
+	// a mid-level tone must land strictly between silence and full scale,
+	// which is the whole reason for the dB mapping
+	mid := make([]byte, 400)
+	for i := 0; i < len(mid); i += 2 {
+		binary.LittleEndian.PutUint16(mid[i:], uint16(int16(3000)))
+	}
+	got := rmsLevel(mid)
+	if got <= 0 || got >= 1 {
+		t.Errorf("mid signal = %v, want strictly between 0 and 1", got)
+	}
+}
+
+func TestParseDecision(t *testing.T) {
+	if a, i := parseDecision("q", 10); a != ActionQuit || i != -1 {
+		t.Errorf("q -> (%v,%d), want quit/-1", a, i)
+	}
+	if a, i := parseDecision("3", 10); a != ActionPlay || i != 3 {
+		t.Errorf("3 -> (%v,%d), want play/3", a, i)
+	}
+	if a, _ := parseDecision("", 10); a != ActionQuit {
+		t.Errorf("empty -> %v, want quit", a)
+	}
+	if a, _ := parseDecision("99", 10); a != ActionQuit {
+		t.Errorf("out of range -> %v, want quit", a)
+	}
+}
+
+func TestTMoveClamps(t *testing.T) {
+	tracks := make([]Track, 5)
+	tui := NewTUI(nil, nil, "q", tracks)
+	tui.move(-1)
+	if tui.cursor != 0 {
+		t.Errorf("cursor = %d, want 0", tui.cursor)
+	}
+	tui.move(100)
+	if tui.cursor != 4 {
+		t.Errorf("cursor = %d, want 4", tui.cursor)
+	}
+}
+
+func TestLastURL(t *testing.T) {
+	// Returns the LAST url, not the first: for a merged video+audio selector
+	// yt-dlp can print separate DASH URLs, and taking the first gave us a
+	// video-only stream with no audio.
+	in := "warning line\nhttps://example.com/a\nhttps://example.com/b\n"
+	if got := lastURL(in); got != "https://example.com/b" {
+		t.Errorf("got %q, want the last url", got)
+	}
+	if got := lastURL("no urls here"); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+	if got := lastURL("https://only.example.com/x\n"); got != "https://only.example.com/x" {
+		t.Errorf("single url = %q", got)
+	}
+}
