@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Colour support for the ASCII renderer.
@@ -106,6 +108,7 @@ type ColorDiffRenderer struct {
 	rows      int
 	mode      ColorMode
 	truecolor bool
+	half      bool // GlyphHalf: two pixels per cell, else one
 
 	prevTop []uint32 // packed 0xRRGGBB per cell
 	prevBot []uint32
@@ -116,7 +119,12 @@ type ColorDiffRenderer struct {
 	haveLast       bool
 }
 
-func NewColorDiffRenderer(w io.Writer, cols, rows int, mode ColorMode) *ColorDiffRenderer {
+// newColorRenderer picks the colour renderer with the resolved glyph layout.
+func newColorRenderer(w io.Writer, cols, rows int, mode ColorMode, glyph GlyphMode) *ColorDiffRenderer {
+	return NewColorDiffRenderer(w, cols, rows, mode, glyph)
+}
+
+func NewColorDiffRenderer(w io.Writer, cols, rows int, mode ColorMode, glyph GlyphMode) *ColorDiffRenderer {
 	n := cols * rows
 	return &ColorDiffRenderer{
 		w:         w,
@@ -124,6 +132,7 @@ func NewColorDiffRenderer(w io.Writer, cols, rows int, mode ColorMode) *ColorDif
 		rows:      rows,
 		mode:      mode,
 		truecolor: mode == ColorTrue,
+		half:      glyph == GlyphHalf,
 		prevTop:   make([]uint32, n),
 		prevBot:   make([]uint32, n),
 		first:     true,
@@ -134,8 +143,18 @@ func packRGB(r, g, b byte) uint32 {
 	return uint32(r)<<16 | uint32(g)<<8 | uint32(b)
 }
 
+// pixPerCell is the vertical pixel count each cell holds.
+func (c *ColorDiffRenderer) pixPerCell() int {
+	if c.half {
+		return 2
+	}
+	return 1
+}
+
 // cellBytes is the frame size the colour path needs.
-func (c *ColorDiffRenderer) cellBytes() int { return c.cols * c.rows * 2 * 3 }
+func (c *ColorDiffRenderer) cellBytes() int {
+	return c.cols * c.rows * c.pixPerCell() * 3
+}
 
 func (c *ColorDiffRenderer) Draw(frame []byte) error {
 	if len(frame) < c.cellBytes() {
@@ -163,13 +182,24 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 		}
 	}
 
-	stride := c.cols * 2 * 3 // two pixels per row of cells, 3 bytes each
+	// In one-pixel mode each cell is a space with a background colour: U+0020
+	// is unambiguously one column wide, so the grid cannot drift.
+	perCell := c.pixPerCell()
+	stride := c.cols * perCell * 3
+	glyph := string(halfBlock)
+	if !c.half {
+		glyph = " "
+	}
+
 	for y := 0; y < c.rows; y++ {
 		for x := 0; x < c.cols; x++ {
 			idx := y*c.cols + x
 
 			topOff := y*stride + x*3
-			botOff := topOff + c.cols*3
+			botOff := topOff
+			if perCell == 2 {
+				botOff = topOff + c.cols*3
+			}
 			top := packRGB(frame[topOff], frame[topOff+1], frame[topOff+2])
 			bot := packRGB(frame[botOff], frame[botOff+1], frame[botOff+2])
 
@@ -190,7 +220,7 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 			if err := c.emitColor(top, bot); err != nil {
 				return err
 			}
-			if _, err := io.WriteString(c.w, string(halfBlock)); err != nil {
+			if _, err := io.WriteString(c.w, glyph); err != nil {
 				return err
 			}
 
@@ -207,6 +237,8 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 	}
 	return nil
 }
+
+// newColorRenderer is the shared constructor used by runASCII.
 
 // emitColor writes the SGR sequence for a cell, skipping it when neither colour
 // changed since the previous cell. This is the main bandwidth saving.
@@ -246,3 +278,125 @@ func colorSupported(m ColorMode) bool { return m != ColorNone }
 
 // envSlice builds a lookup-friendly copy of the environment for detection.
 func envSlice() []string { return os.Environ() }
+
+// GlyphMode decides how many pixels each character cell represents.
+type GlyphMode int
+
+const (
+	// GlyphAuto probes the terminal and picks the best layout it supports.
+	GlyphAuto GlyphMode = iota
+	// GlyphHalf uses the half-block (2 vertical pixels per cell).
+	GlyphHalf
+	// GlyphCell uses one pixel per cell, rendered as a space with a background
+	// colour. U+0020 is unambiguously one column wide, so this always lays out
+	// correctly -- at the cost of half the vertical resolution.
+	GlyphCell
+)
+
+// probeHalfBlockNarrow asks the terminal whether U+2580 advances the cursor by
+// one column or two.
+//
+// It prints the glyph, then issues a Device Status Report (CPR) and reads the
+// reported column. A terminal with narrow ambiguous-width reports col = 1+n; one
+// that renders it wide reports 1+2n.
+//
+// This is the only reliable way to find out: U+2580 is East Asian Ambiguous
+// width, and the two behaviours both look completely normal in isolation. The
+// bug is only visible as cascading horizontal drift, because every row overruns
+// the terminal width and wraps (this is exactly what the reported ghosting was).
+//
+// Returns ok=false when the terminal does not answer the report, so the caller
+// can fall back to the always-correct layout.
+func probeHalfBlockNarrow(in *os.File, out *os.File) (narrow bool, ok bool) {
+	const n = 8
+
+	// Home to 1;1 so the reported column is relative to a known origin.
+	fmt.Fprint(out, "\x1b[1;1H")
+	for i := 0; i < n; i++ {
+		fmt.Fprint(out, string(halfBlock))
+	}
+	fmt.Fprint(out, "\x1b[6n")
+
+	type result struct {
+		s   string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b := make([]byte, 1)
+		var acc []byte
+		for i := 0; i < 32; i++ {
+			_, err := in.Read(b)
+			if err != nil {
+				ch <- result{err: err}
+				return
+			}
+			acc = append(acc, b[0])
+			if b[0] == 'R' { // end of a CPR reply
+				break
+			}
+		}
+		ch <- result{s: string(acc)}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return false, false
+		}
+		col := parseCPRColumn(r.s)
+		if col <= 0 {
+			return false, false
+		}
+		switch col {
+		case 1 + n:
+			return true, true
+		case 1 + 2*n:
+			return false, true
+		default:
+			return false, false
+		}
+	case <-time.After(700 * time.Millisecond):
+		// Terminal ignored the report. Assume the safe layout.
+		return false, false
+	}
+}
+
+// parseCPRColumn extracts the column from an "\x1b[<row>;<col>R" reply.
+func parseCPRColumn(s string) int {
+	i := strings.IndexByte(s, ';')
+	if i < 0 {
+		return 0
+	}
+	j := strings.IndexByte(s[i:], 'R')
+	if j < 0 {
+		return 0
+	}
+	col := strings.TrimSpace(s[i+1 : i+j])
+	n, err := strconv.Atoi(col)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// resolveGlyph decides how many pixels per cell to use.
+// half is only chosen when the terminal explicitly proved it is narrow.
+func resolveGlyph(mode GlyphMode, in, out *os.File) GlyphMode {
+	switch mode {
+	case GlyphHalf:
+		return GlyphHalf
+	case GlyphCell:
+		return GlyphCell
+	}
+	if out == nil || in == nil {
+		return GlyphCell
+	}
+	narrow, ok := probeHalfBlockNarrow(in, out)
+	// Clean up the probe output either way.
+	fmt.Fprint(out, "\x1b[2J\x1b[H")
+	if ok && narrow {
+		return GlyphHalf
+	}
+	return GlyphCell
+}

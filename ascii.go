@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // ASCII video + visualizer. No image libraries: ffmpeg emits raw grayscale
@@ -458,7 +459,7 @@ func (s *ASCIIStream) Close() {
 // paced with -re. One process means one clock, so the frames cannot drift from
 // the music. The previous design ran mpv and ffmpeg independently and came out
 // fast-forward and out of sync.
-func runASCII(track Track, in *os.File, out *os.File, mute bool, quality Quality, aspect float64, colsOverride, rowsOverride int, mode ColorMode) error {
+func runASCII(track Track, in *os.File, out *os.File, mute bool, quality Quality, aspect float64, colsOverride, rowsOverride int, mode ColorMode, glyphPref GlyphMode) error {
 	// Terminal size drives the grid. If stdout is not a TTY (piped, CI) fall
 	// back to the defaults rather than rendering nothing.
 	termCols, termRows := 0, 0
@@ -489,7 +490,17 @@ func runASCII(track Track, in *os.File, out *os.File, mute bool, quality Quality
 		return fmt.Errorf("resolve media: %w", err)
 	}
 
-	player, err := startSyncPlayerAt(videoURL, audioURL, l.cols, l.rows, l.fps, mute, 0, mode)
+	// Decide the cell layout before ffmpeg starts, because the frame height
+	// depends on it. The probe asks the terminal directly: U+2580 is
+	// East Asian Ambiguous width and some terminals draw it two columns wide,
+	// which makes every row overrun and wrap (reported as ghosting/double
+	// images). Probing costs one round trip and removes the guess.
+	glyph := GlyphCell
+	if mode != ColorNone {
+		glyph = resolveGlyph(glyphPref, in, out)
+	}
+
+	player, err := startSyncPlayerAt(videoURL, audioURL, l.cols, l.rows, l.fps, mute, 0, mode, glyph)
 	if err != nil {
 		return err
 	}
@@ -501,7 +512,37 @@ func runASCII(track Track, in *os.File, out *os.File, mute bool, quality Quality
 
 	// Buffered writer: one syscall per frame batch instead of many small ones.
 	bw := bufio.NewWriterSize(out, 32*1024)
-	renderer := newRenderer(bw, l.cols, l.rows, mode)
+	renderer := newRenderer(bw, l.cols, l.rows, mode, glyph)
+
+	// Drift correction timing.
+	lastSync := time.Now()
+	const syncCheckInterval = 2 * time.Second
+
+	// Stall handling: suspend both children rather than rebuilding them.
+	//
+	// When the terminal is not being read (window covered, Hyprland workspace
+	// switch, another app focused) the tty stops accepting output. mpv writes
+	// straight to PipeWire and keeps playing regardless, so the streams drift.
+	// Stopping ffmpeg and mpv in the same instant freezes both clocks: sync is
+	// preserved exactly, nothing is respawned, and -- importantly -- nothing is
+	// written to the terminal, which is what was painting ASCII over the desktop.
+	restartAt := func(pos float64) error {
+		player.Close()
+		vURL, aURL, rerr := resolveMediaPair(track, l.sourceH)
+		if rerr != nil {
+			return rerr
+		}
+		np, rerr := startSyncPlayerAt(vURL, aURL, l.cols, l.rows, l.fps, mute, pos, mode, glyph)
+		if rerr != nil {
+			return rerr
+		}
+		player = np
+		audioDone = make(chan error, 1)
+		go func(p *SyncPlayer) { audioDone <- p.WaitAudioEnd() }(player)
+		renderer = newRenderer(bw, l.cols, l.rows, mode, glyph)
+		fmt.Fprint(bw, "\x1b[2J\x1b[H")
+		return nil
+	}
 
 	// SIGWINCH: a resize must refill the screen, not kill playback. The ffmpeg
 	// scale filter is baked into the running process, so a genuine size change
@@ -532,23 +573,12 @@ func runASCII(track Track, in *os.File, out *os.File, mute bool, quality Quality
 				continue // spurious signal, keep playing
 			}
 			pos := player.Seconds()
-			player.Close()
-
+			// Rebuild at the new size, resuming from where we were. The grid
+			// changed, so the ffmpeg scale filter has to change with it.
 			l = computeLayout(c, r, aspect, quality)
-			videoURL, audioURL, rerr := resolveMediaPair(track, l.sourceH)
-			if rerr != nil {
+			if rerr := restartAt(pos); rerr != nil {
 				return nil
 			}
-			player, rerr = startSyncPlayerAt(videoURL, audioURL, l.cols, l.rows, l.fps, mute, pos, mode)
-			if rerr != nil {
-				return nil
-			}
-			audioDone = make(chan error, 1)
-			go func(p *SyncPlayer) {
-				audioDone <- p.WaitAudioEnd()
-			}(player)
-			renderer = newRenderer(bw, l.cols, l.rows, mode)
-			fmt.Fprint(bw, "\x1b[2J\x1b[H")
 			continue
 		default:
 		}
@@ -562,16 +592,56 @@ func runASCII(track Track, in *os.File, out *os.File, mute bool, quality Quality
 		if err := bw.Flush(); err != nil {
 			return nil
 		}
+
+		// If the terminal has stopped accepting output, suspend both children
+		// and wait for it to come back. Checked after the write so the flush
+		// above is what fills the buffer, not the poll.
+		if !fdWritable(out) {
+			player.pauseChildren()
+			if !awaitDrain(out, player, quit, 120*time.Millisecond) {
+				player.resumeChildren()
+				return nil
+			}
+			player.resumeChildren()
+			// The terminal may have been repainted while we were suspended, and
+			// our diff buffer no longer matches what is on screen.
+			renderer.ForceNext()
+			if err := bw.Flush(); err != nil {
+				return nil
+			}
+			// Time passed while suspended, so re-sync before showing more.
+			lastSync = time.Time{}
+		}
+
+		// Drift correction. Sampled periodically rather than every frame: an IPC
+		// round trip per frame is wasteful, and drift develops slowly.
+		if time.Since(lastSync) > syncCheckInterval {
+			lastSync = time.Now()
+			rep, corrected := player.checkSync()
+			if debugSync {
+				tag := "ok"
+				if corrected {
+					tag = "CORRECTED"
+				} else if player.ipc == nil {
+					tag = "no-ipc"
+				} else if e := ipcLastErr(); e != "" {
+					tag = "ERR:" + e
+				}
+				fmt.Fprintf(os.Stderr,
+					"\rsync: video %s audio %s drift %+.3fs %s      ",
+					formatPos(rep.VideoPos), formatPos(rep.AudioPos), rep.Drift, tag)
+			}
+		}
 	}
 }
 
 // newRenderer picks the mono or colour renderer. Both satisfy FrameRenderer so
 // runASCII does not care which is active.
-func newRenderer(w io.Writer, cols, rows int, mode ColorMode) FrameRenderer {
+func newRenderer(w io.Writer, cols, rows int, mode ColorMode, glyph GlyphMode) FrameRenderer {
 	if mode == ColorNone {
 		return NewDiffRenderer(w, cols, rows)
 	}
-	return NewColorDiffRenderer(w, cols, rows, mode)
+	return newColorRenderer(w, cols, rows, mode, glyph)
 }
 
 // renderFrameTo renders a whole frame as lines of characters. Used by tests and

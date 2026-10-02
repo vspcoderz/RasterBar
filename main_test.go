@@ -664,7 +664,7 @@ func TestQuant256GreyRamp(t *testing.T) {
 func TestColorRendererEmitsHalfBlocks(t *testing.T) {
 	const cols, rows = 4, 2
 	var buf bytes.Buffer
-	r := NewColorDiffRenderer(&buf, cols, rows, ColorTrue)
+	r := NewColorDiffRenderer(&buf, cols, rows, ColorTrue, GlyphHalf)
 	frame := make([]byte, r.cellBytes())
 	for i := 0; i < len(frame); i++ {
 		frame[i] = byte(i * 7 % 256)
@@ -687,7 +687,7 @@ func TestColorRendererEmitsHalfBlocks(t *testing.T) {
 func TestColorRenderer256UsesPalette(t *testing.T) {
 	const cols, rows = 4, 2
 	var buf bytes.Buffer
-	r := NewColorDiffRenderer(&buf, cols, rows, Color256)
+	r := NewColorDiffRenderer(&buf, cols, rows, Color256, GlyphHalf)
 	if err := r.Draw(make([]byte, r.cellBytes())); err != nil {
 		t.Fatalf("Draw: %v", err)
 	}
@@ -703,7 +703,7 @@ func TestColorRenderer256UsesPalette(t *testing.T) {
 func TestColorRendererSkipsUnchangedCells(t *testing.T) {
 	const cols, rows = 12, 4
 	var buf bytes.Buffer
-	r := NewColorDiffRenderer(&buf, cols, rows, Color256)
+	r := NewColorDiffRenderer(&buf, cols, rows, Color256, GlyphHalf)
 	frame := make([]byte, r.cellBytes())
 	for i := range frame {
 		frame[i] = 128
@@ -727,7 +727,7 @@ func TestColorRendererSkipsUnchangedCells(t *testing.T) {
 }
 
 func TestColorRendererRejectsShortFrame(t *testing.T) {
-	r := NewColorDiffRenderer(&bytes.Buffer{}, 8, 4, ColorTrue)
+	r := NewColorDiffRenderer(&bytes.Buffer{}, 8, 4, ColorTrue, GlyphHalf)
 	if err := r.Draw(make([]byte, 10)); err == nil {
 		t.Error("want an error for a frame smaller than the colour grid")
 	}
@@ -735,7 +735,7 @@ func TestColorRendererRejectsShortFrame(t *testing.T) {
 
 func TestColorCellBytesDoublesHeight(t *testing.T) {
 	const cols, rows = 10, 5
-	r := NewColorDiffRenderer(&bytes.Buffer{}, cols, rows, ColorTrue)
+	r := NewColorDiffRenderer(&bytes.Buffer{}, cols, rows, ColorTrue, GlyphHalf)
 	// Two pixels per cell, three bytes each: the half-block layout.
 	if got, want := r.cellBytes(), cols*rows*2*3; got != want {
 		t.Errorf("cellBytes = %d, want %d", got, want)
@@ -774,6 +774,230 @@ func truncateForLog(s string) string {
 		return s[:120] + "..."
 	}
 	return s
+}
+
+func TestParseCPRColumn(t *testing.T) {
+	cases := map[string]int{
+		"\x1b[1;9R":  9,
+		"\x1b[1;17R": 17,
+		"\x1b[5;1R":  1,
+		"garbage":    0,
+		"":           0,
+		"\x1b[?R":    0,
+	}
+	for in, want := range cases {
+		if got := parseCPRColumn(in); got != want {
+			t.Errorf("parseCPRColumn(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
+
+func TestProbeHalfBlockNarrowDetectsWideTerminal(t *testing.T) {
+	// Simulate a terminal that reports the cursor advancing 2 columns per
+	// half-block: it must be identified as wide.
+	inR, inW, _ := os.Pipe()
+	outR, outW, _ := os.Pipe()
+	go func() {
+		outR.Read(make([]byte, 512)) // drain the probe output
+	}()
+	go func() {
+		inW.Write([]byte("\x1b[1;17R")) // 1 + 2*8
+		inW.Close()
+	}()
+	narrow, ok := probeHalfBlockNarrow(inR, outW)
+	outW.Close()
+	if !ok {
+		t.Error("a terminal that answered the report should count as ok")
+	}
+	if narrow {
+		t.Error("terminal reported 2 columns per glyph; it must not be treated as narrow")
+	}
+	inR.Close()
+}
+
+func TestProbeHalfBlockNarrowDetectsNarrowTerminal(t *testing.T) {
+	inR, inW, _ := os.Pipe()
+	outR, outW, _ := os.Pipe()
+	go func() {
+		outR.Read(make([]byte, 512))
+	}()
+	go func() {
+		inW.Write([]byte("\x1b[1;9R")) // 1 + 1*8
+		inW.Close()
+	}()
+	narrow, ok := probeHalfBlockNarrow(inR, outW)
+	outW.Close()
+	if !ok || !narrow {
+		t.Errorf("got narrow=%v ok=%v, want true/true for a 1-column report", narrow, ok)
+	}
+	inR.Close()
+}
+
+func TestResolveGlyphFallsBackToCell(t *testing.T) {
+	// A non-answering terminal must get the always-correct one-pixel layout.
+	inR, inW, _ := os.Pipe()
+	outR, outW, _ := os.Pipe()
+	go func() {
+		outR.Read(make([]byte, 2048))
+		inW.Close() // EOF: no reply
+	}()
+	if got := resolveGlyph(GlyphAuto, inR, outW); got != GlyphCell {
+		t.Errorf("resolveGlyph with no reply = %v, want GlyphCell", got)
+	}
+	outW.Close()
+	inR.Close()
+
+	// Explicit flags must override detection entirely.
+	if got := resolveGlyph(GlyphHalf, nil, nil); got != GlyphHalf {
+		t.Errorf("--glyph half must be honoured, got %v", got)
+	}
+	if got := resolveGlyph(GlyphCell, nil, nil); got != GlyphCell {
+		t.Errorf("--glyph cell must be honoured, got %v", got)
+	}
+}
+
+func TestColorCellModeUsesSpaces(t *testing.T) {
+	const cols, rows = 4, 2
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, cols, rows, ColorTrue, GlyphCell)
+	frame := make([]byte, r.cellBytes())
+	for i := range frame {
+		frame[i] = byte(120 + i%40)
+	}
+	if err := r.Draw(frame); err != nil {
+		t.Fatalf("Draw: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, string(halfBlock)) {
+		t.Error("cell mode must not emit the ambiguous-width half-block")
+	}
+	if !strings.Contains(out, "48;2;") {
+		t.Error("cell mode should paint pixels as a background colour")
+	}
+	if strings.Count(out, " ") < cols*rows {
+		t.Errorf("expected at least %d space glyphs, got %d", cols*rows, strings.Count(out, " "))
+	}
+	// One pixel per cell means a frame exactly the size of the grid.
+	if got, want := r.cellBytes(), cols*rows*3; got != want {
+		t.Errorf("cell-mode frame = %d bytes, want %d", got, want)
+	}
+}
+
+func TestColorHalfModeFrameDoubles(t *testing.T) {
+	const cols, rows = 4, 2
+	half := NewColorDiffRenderer(&bytes.Buffer{}, cols, rows, ColorTrue, GlyphHalf)
+	single := NewColorDiffRenderer(&bytes.Buffer{}, cols, rows, ColorTrue, GlyphCell)
+	if half.cellBytes() != single.cellBytes()*2 {
+		t.Errorf("half-block frame %d bytes, want double the cell-mode %d",
+			half.cellBytes(), single.cellBytes())
+	}
+}
+
+func TestParseArgsGlyphFlag(t *testing.T) {
+	for _, tc := range []struct {
+		arg  string
+		want GlyphMode
+	}{
+		{"auto", GlyphAuto},
+		{"half", GlyphHalf},
+		{"cell", GlyphCell},
+	} {
+		o, err := parseArgs([]string{"--glyph", tc.arg, "q"})
+		if err != nil {
+			t.Fatalf("--glyph %s: %v", tc.arg, err)
+		}
+		if o.glyph != tc.want {
+			t.Errorf("--glyph %s = %v, want %v", tc.arg, o.glyph, tc.want)
+		}
+	}
+	if _, err := parseArgs([]string{"--glyph", "bogus"}); err == nil {
+		t.Error("want an error for an unknown --glyph value")
+	}
+	if _, err := parseArgs([]string{"--glyph"}); err == nil {
+		t.Error("--glyph with no value should error")
+	}
+	// Default must stay "detect".
+	o, _ := parseArgs([]string{"q"})
+	if o.glyph != GlyphAuto {
+		t.Errorf("default glyph = %v, want GlyphAuto", o.glyph)
+	}
+}
+
+func TestParseTimePosReply(t *testing.T) {
+	// mpv sets "error":"success" on a SUCCESSFUL reply. Treating any non-empty
+	// error as a failure silently disabled the drift corrector, which showed up
+	// as a permanent desync. This case must be accepted.
+	got, ok, done := parseTimePosReply(
+		[]byte(`{"data":12.5,"error":"success","request_id":7}`), 7)
+	if !done || !ok {
+		t.Fatalf(`error:"success" must be treated as success (ok=%v done=%v)`, ok, done)
+	}
+	if got != 12.5 {
+		t.Errorf("position = %v, want 12.5", got)
+	}
+
+	// A real error must be rejected.
+	_, ok, done = parseTimePosReply(
+		[]byte(`{"error":"property unavailable","request_id":7}`), 7)
+	if !done || ok {
+		t.Errorf("a real error must be rejected (ok=%v done=%v)", ok, done)
+	}
+
+	// An event for another request must be skipped, not treated as our answer.
+	_, ok, done = parseTimePosReply([]byte(`{"event":"playback-restart"}`), 7)
+	if done {
+		t.Error("an event is not a reply to our request")
+	}
+
+	// Null data with success is still not a position.
+	_, ok, done = parseTimePosReply([]byte(`{"data":null,"error":"success","request_id":7}`), 7)
+	if !done || ok {
+		t.Errorf("null data must be rejected (ok=%v done=%v)", ok, done)
+	}
+
+	// Garbage is skipped, not fatal.
+	_, ok, done = parseTimePosReply([]byte(`not json`), 7)
+	if done {
+		t.Error("garbage should not be treated as a completed reply")
+	}
+}
+
+func TestSyncPlayerSeconds(t *testing.T) {
+	s := &SyncPlayer{fps: 10, frames: 50}
+	if got := s.Seconds(); got != 5.0 {
+		t.Errorf("Seconds = %v, want 5", got)
+	}
+	zero := &SyncPlayer{}
+	if got := zero.Seconds(); got != 0 {
+		t.Errorf("zero-fps Seconds = %v, want 0", got)
+	}
+}
+
+func TestAbsFloat(t *testing.T) {
+	if absFloat(-2.5) != 2.5 || absFloat(2.5) != 2.5 || absFloat(0) != 0 {
+		t.Error("absFloat is wrong")
+	}
+}
+
+func TestSyncReportIgnoresEarlyPositions(t *testing.T) {
+	// Before both sides are really running, positions are meaningless and a seek
+	// there would jump the track.
+	s := &SyncPlayer{fps: 10, frames: 2, ipc: nil}
+	rep, corrected := s.checkSync()
+	if corrected {
+		t.Error("must not correct without an ipc connection")
+	}
+	if rep.VideoPos != 0.2 {
+		t.Errorf("video pos = %v, want 0.2", rep.VideoPos)
+	}
+}
+
+func TestDriftThresholdIsSane(t *testing.T) {
+	// Too small and ordinary jitter causes constant audible seeking; too large
+	// and the desync becomes obvious.
+	if driftCorrectThreshold < 0.1 || driftCorrectThreshold > 0.5 {
+		t.Errorf("driftCorrectThreshold = %v, want between 0.1 and 0.5 seconds", driftCorrectThreshold)
+	}
 }
 
 func TestTermSizeOnNonTTY(t *testing.T) {

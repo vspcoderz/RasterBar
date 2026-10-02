@@ -17,8 +17,12 @@ usage:
 options:
   -m, --mute         play audio muted (visualizer still animates)
   -a, --ascii        start ASCII video mode instead of audio
+      --glyph MODE   auto (probe terminal), half (2px/cell), cell (1px/cell)
   -c, --color        force colour (default: auto-detected from the terminal)
       --mono         force plain monochrome ASCII, no colour
+      --glyph MODE   cell layout: auto (probe the terminal), half (2 pixels
+                     per cell, needs narrow U+2580), cell (1 pixel per cell,
+                     always aligns correctly)
   -q, --quality H    cap source resolution: 240, 360, 480, 720, 1080
                      (default: chosen from your terminal size)
       --aspect R     cell height/width ratio, default 2.0. Raise it if the
@@ -59,6 +63,7 @@ type options struct {
 	cols    int // explicit override, 0 = auto
 	rows    int
 	color   ColorMode // colorAuto unless a flag says otherwise
+	glyph   GlyphMode // GlyphAuto unless a flag says otherwise
 }
 
 // colorAuto requests terminal capability detection.
@@ -73,6 +78,21 @@ func parseArgs(args []string) (options, error) {
 			return o, fmt.Errorf("help")
 		case "-m", "--mute":
 			o.mute = true
+		case "--glyph":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--glyph needs a value: auto, half, cell")
+			}
+			i++
+			switch args[i] {
+			case "auto":
+				o.glyph = GlyphAuto
+			case "half", "halfblock":
+				o.glyph = GlyphHalf
+			case "cell", "single":
+				o.glyph = GlyphCell
+			default:
+				return o, fmt.Errorf("--glyph must be auto, half or cell (got %s)", args[i])
+			}
 		case "-c", "--color", "--colour":
 			o.color = ColorTrue
 		case "--mono", "--no-color", "--no-colour":
@@ -180,7 +200,7 @@ func main() {
 
 	if wantASCII {
 		fmt.Fprintf(os.Stderr, "ascii: %s — %s\n", track.Title, track.ChannelText())
-		if err := runASCII(track, os.Stdin, os.Stdout, opts.mute, opts.quality, opts.aspect, opts.cols, opts.rows, colorMode); err != nil {
+		if err := runASCII(track, os.Stdin, os.Stdout, opts.mute, opts.quality, opts.aspect, opts.cols, opts.rows, colorMode, opts.glyph); err != nil {
 			fmt.Fprintf(os.Stderr, "ascii playback failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -198,3 +218,7 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// debugSync enables the A/V drift readout on stderr. Off by default because it
+// writes to the same stream the renderer uses.
+var debugSync = os.Getenv("VSPZ_YT_CLI_DEBUG_SYNC") != ""

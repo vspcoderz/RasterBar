@@ -42,6 +42,9 @@ type SyncPlayer struct {
 	primed    []byte // first frame, read before audio started
 	primedSet bool
 	frames    int
+	paused    bool
+	ipc       *mpvIPC
+	sockPath  string
 	cols      int
 	rows      int
 	fps       int
@@ -57,13 +60,13 @@ type SyncPlayer struct {
 // media position -- ffmpeg reads from the head of the stream and mpv is given
 // --start=<seconds>. Since ffmpeg paces with -re at native frame rate, the frame
 // we render for media time T is displayed at wall-clock T.
-func startSyncPlayer(videoURL, audioURL string, cols, rows, fps int, mute bool, mode ColorMode) (*SyncPlayer, error) {
-	return startSyncPlayerAt(videoURL, audioURL, cols, rows, fps, mute, 0, mode)
+func startSyncPlayer(videoURL, audioURL string, cols, rows, fps int, mute bool, mode ColorMode, glyph GlyphMode) (*SyncPlayer, error) {
+	return startSyncPlayerAt(videoURL, audioURL, cols, rows, fps, mute, 0, mode, glyph)
 }
 
 // startSyncPlayerAt is startSyncPlayer with a resume offset, used after a
 // terminal resize so playback continues instead of restarting.
-func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool, startAt float64, mode ColorMode) (*SyncPlayer, error) {
+func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool, startAt float64, mode ColorMode, glyph GlyphMode) (*SyncPlayer, error) {
 	// scale straight to the character grid with flags=area. Area averaging is a
 	// proper box filter: every source pixel contributes.
 	//
@@ -85,10 +88,17 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 		pixFmt = "gray"
 		frameBytes = cols * rows
 	} else {
+		// Half-block mode gets double height so each cell holds two pixels.
+		// One-pixel mode (used when the terminal renders U+2580 double-width)
+		// matches the grid exactly.
+		outRows := rows
+		if glyph == GlyphHalf {
+			outRows = rows * 2
+		}
 		filter = fmt.Sprintf("fps=%d,scale=%d:%d:flags=area,format=rgb24",
-			fps, cols, rows*2)
+			fps, cols, outRows)
 		pixFmt = "rgb24"
-		frameBytes = cols * rows * 2 * 3
+		frameBytes = cols * outRows * 3
 	}
 
 	// One ffmpeg, ONE output: the grayscale frames on our stdout pipe.
@@ -137,18 +147,29 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 		return nil, fmt.Errorf("read first frame: %w", err)
 	}
 
+	// mpv creates and binds its own IPC socket; we connect to it afterwards.
+	sockPath := ipcSocketPath()
+
 	mpvArgs := []string{"--no-config", "--no-video", fmt.Sprintf("--start=%.3f", startAt)}
 	if mute {
 		mpvArgs = append(mpvArgs, "--mute=yes")
 	}
-	mpvArgs = append(mpvArgs, audioURL)
+	mpvArgs = append(mpvArgs, "--input-ipc-server="+sockPath, "--idle=yes", audioURL)
 	audio := exec.Command("mpv", mpvArgs...)
 	audio.Stdout = io.Discard
 	audio.Stderr = os.Stderr
 	if err := audio.Start(); err != nil {
 		ff.Process.Kill()
 		ff.Wait()
+		os.Remove(sockPath)
 		return nil, fmt.Errorf("mpv start: %w", err)
+	}
+
+	// Connect for drift correction. A failure here is not fatal: playback still
+	// works, it simply cannot be measured or nudged.
+	ipc, err := dialIPC(sockPath, 4*time.Second)
+	if err != nil {
+		ipc = nil
 	}
 
 	return &SyncPlayer{
@@ -156,6 +177,8 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 		vidOut:    vidOut,
 		audio:     audio,
 		frame:     make([]byte, frameBytes),
+		ipc:       ipc,
+		sockPath:  sockPath,
 		primed:    first,
 		primedSet: true,
 		cols:      cols,
@@ -173,6 +196,63 @@ func (s *SyncPlayer) Seconds() float64 {
 		return 0
 	}
 	return float64(s.frames) / float64(s.fps)
+}
+
+// SyncReport describes one drift measurement.
+type SyncReport struct {
+	VideoPos  float64
+	AudioPos  float64
+	Drift     float64 // AudioPos - VideoPos
+	Corrected bool
+}
+
+// driftCorrectThreshold is how far the two streams may diverge before acting.
+// Too small and ordinary jitter causes constant audible seeking; too large and
+// the error becomes noticeable. 250ms is roughly the point where lip-sync
+// error is obvious.
+const driftCorrectThreshold = 0.25
+
+// checkSync compares the video position (frames delivered) against mpv's actual
+// playback position and corrects the audio when they diverge.
+//
+// This is the part that structural sync cannot do. ffmpeg paces video on the
+// system clock while mpv paces audio on the sound card's clock, so the two drift
+// apart over a long track no matter how carefully they are started. Measuring
+// and nudging is the only fix.
+//
+// The audio is corrected rather than the video: video is a live pipe that
+// cannot be seeked cheaply, whereas an mpv seek is cheap. It is rare (only on
+// real drift) and small.
+func (s *SyncPlayer) checkSync() (SyncReport, bool) {
+	v := s.Seconds()
+	if s.paused || s.ipc == nil {
+		return SyncReport{VideoPos: v}, false
+	}
+	a, ok := s.ipc.timePos(400 * time.Millisecond)
+	if !ok {
+		return SyncReport{VideoPos: v}, false
+	}
+	rep := SyncReport{VideoPos: v, AudioPos: a, Drift: a - v}
+	// Ignore nonsense before the track has really started: mpv reports the
+	// position of a stream that is still probing, and seeking there would jump.
+	if v < 0.5 || a < 0.5 {
+		return rep, false
+	}
+	if absFloat(rep.Drift) < driftCorrectThreshold {
+		return rep, false
+	}
+	if err := s.ipc.seek(v); err != nil {
+		return rep, false
+	}
+	rep.Corrected = true
+	return rep, true
+}
+
+func absFloat(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
 }
 
 // Next returns the next frame as raw grayscale bytes, one per character cell.
@@ -216,6 +296,12 @@ func (s *SyncPlayer) Close() {
 	if s.audio != nil && s.audio.Process != nil {
 		s.audio.Process.Kill()
 		s.audio.Wait()
+	}
+	if s.ipc != nil {
+		s.ipc.close()
+	}
+	if s.sockPath != "" {
+		os.Remove(s.sockPath)
 	}
 }
 

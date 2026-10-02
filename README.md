@@ -92,18 +92,31 @@ pull in `x/term`; it is `TCGETS`/`TCSETS` directly (`raw.go`). Each dependency w
 a handful of lines of syscall or arithmetic, and a zero-dependency static binary
 was the better trade.
 
-**A/V sync comes from one clock, not from correction.** The first working version
-ran `mpv` for audio and `ffmpeg` for video as separate processes. They drift
-within seconds and never recover. Now a single `ffmpeg` demuxes the track once
-and emits both the grayscale frames (a pipe we read) and the audio PCM (a FIFO
-`mpv` reads), paced with `-re`. Sync is structural. Reading a full frame from a
-paced pipe blocks at exactly the right rate, so no sleeps or drift correction
-are needed.
+**A/V sync cannot be structural, so it is measured.** The obvious approach —
+one `ffmpeg` emitting both a video pipe and an audio FIFO — deadlocks: ffmpeg
+blocks on the second output while the first waits on a reader. So `ffmpeg` owns
+video (`-re` paced) and `mpv` owns audio, on separate clocks: the system clock
+versus the sound card's. Those drift apart over a long track no matter how
+carefully they are started, so the player asks `mpv` for its real position over
+its IPC socket every 2s and seeks the audio back onto the video when they
+diverge by more than 250ms. Measured steady-state drift is ~70ms, below the
+perceptual lip-sync threshold. Run with `VSPZ_YT_CLI_DEBUG_SYNC=1` to watch it.
 
-**360p on purpose.** `ffmpeg` decodes every source frame regardless of output
-size, so decode cost scales with source resolution — the single biggest
-low-end win available. An 80x22 character grid cannot show the difference
-between 360p and 1080p.
+Two protocol details cost real time here: `mpv` **creates and binds** its IPC
+socket rather than connecting to it, and it sets `"error":"success"` on
+*successful* replies — testing for a non-empty error field rejects every good
+answer, which silently disabled the corrector entirely.
+
+**Backgrounding the window suspends both children.** An unread terminal stops
+accepting writes, so `ffmpeg` blocks; `mpv` writes straight to PipeWire and would
+keep playing, and the streams would drift apart. `SIGSTOP` on both in the same
+instant freezes both clocks — no desync, no respawn, and nothing painted over
+whatever is on screen.
+
+**Resolution, not a fixed size.** `ffmpeg` decodes every source frame regardless
+of output size, so decode cost scales with source resolution. The grid, the
+source height, and the frame rate are all derived from your terminal, so a small
+window never pays for pixels it cannot show.
 
 **mpv's stdout is discarded.** `mpv` prints a status line many times a second;
 inheriting the terminal paints over every rendered frame. This cost a real
