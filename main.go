@@ -31,6 +31,18 @@ options:
       --rows N       force ASCII grid height (default: from terminal height)
   -h, --help         this help
 
+library mode (browse a directory instead of searching):
+  -l, --library DIR  scan DIR for video files, ordered series/season/episode
+      --no-probe     skip the ffprobe pass (instant scan, "--:--" durations)
+      --play         start the first episode without the browse list
+
+  Filenames are parsed for series, season and episode, so "Show S01E02.mkv",
+  "Show - 01x02.mkv", "Show - 07 [1080p].mkv" and "Show Episode 7.mkv" all
+  land in a watchable order. A file with no episode marker is skipped rather
+  than placed arbitrarily.
+
+  requires: ffmpeg, mpv  (yt-dlp and ytfzf are needed only for search)
+
 The ASCII grid and the source resolution both follow your terminal size
 automatically: a small window requests a small video, a large one a larger
 video, so you never pay decode CPU for pixels you cannot see.
@@ -46,9 +58,17 @@ keys (browse):
 keys (ascii playback):
   space            pause / resume
   left / right     seek -10s / +10s
+  , / .            seek -1s / +1s
+  < / >            seek -60s / +60s
+  [ / ]            previous / next chapter
+  :                jump to a timestamp
   n / p            next / previous result
   + / -            volume up / down
   q / ctrl-c       quit
+
+  The jump prompt takes 1:30, 1:02:03, a bare 90 (seconds), 90s / 2m / 1h2m3s,
+  +30 / -1:30 (relative to now), and 50% (of the track). It previews where the
+  jump will land before you commit to it. enter jumps, esc cancels.
 
   When a track finishes the next result starts on its own; playback stops at the
   end of the list.
@@ -62,15 +82,18 @@ requires: yt-dlp, ffmpeg, mpv  (ytfzf optional, used as the primary scraper)
 `
 
 type options struct {
-	query   string
-	mute    bool
-	ascii   bool
-	quality Quality
-	aspect  float64
-	cols    int // explicit override, 0 = auto
-	rows    int
-	color   ColorMode // colorAuto unless a flag says otherwise
-	glyph   GlyphMode // GlyphAuto unless a flag says otherwise
+	query    string
+	mute     bool
+	ascii    bool
+	quality  Quality
+	aspect   float64
+	cols     int // explicit override, 0 = auto
+	rows     int
+	color    ColorMode // colorAuto unless a flag says otherwise
+	glyph    GlyphMode // GlyphAuto unless a flag says otherwise
+	library  string    // directory to browse instead of searching
+	noProbe  bool      // skip ffprobe during a library scan
+	playOnly bool      // play immediately, skip the browse list
 }
 
 // colorAuto requests terminal capability detection.
@@ -151,6 +174,16 @@ func parseArgs(args []string) (options, error) {
 				return o, fmt.Errorf("bad --rows value: %s", args[i])
 			}
 			o.rows = v
+		case "--library", "-l":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--library needs a directory")
+			}
+			i++
+			o.library = args[i]
+		case "--no-probe":
+			o.noProbe = true
+		case "--play", "--now":
+			o.playOnly = true
 		default:
 			if strings.HasPrefix(a, "-") {
 				return o, fmt.Errorf("unknown flag: %s", a)
@@ -175,7 +208,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
 		os.Exit(2)
 	}
-	if opts.query == "" {
+	if opts.query == "" && opts.library == "" {
 		fmt.Print(usage)
 		return
 	}
@@ -186,21 +219,53 @@ func main() {
 		colorMode = detectColor(envSlice())
 	}
 
-	fmt.Fprintf(os.Stderr, "searching: %s\n", opts.query)
-	tracks, err := Search(opts.query)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "search failed: %v\n", err)
-		os.Exit(1)
+	// Two sources, one Track shape: a network search or a directory scan. The
+	// library branch deliberately skips Search entirely rather than both
+	// filling a slice, because there is no query to hand a scraper.
+	var tracks []Track
+	label := opts.query
+	if opts.library != "" {
+		label = opts.library
+		fmt.Fprintf(os.Stderr, "scanning library: %s\n", opts.library)
+		tracks, err = ScanLibrary(opts.library, !opts.noProbe)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "library scan failed: %v\n", err)
+			os.Exit(1)
+		}
+		if len(tracks) == 0 {
+			fmt.Fprintf(os.Stderr, "no playable files with an episode number under %s\n", opts.library)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "%d episodes\n", len(tracks))
+	} else {
+		fmt.Fprintf(os.Stderr, "searching: %s\n", opts.query)
+		tracks, err = Search(opts.query)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "search failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	tui := NewTUI(os.Stdin, os.Stdout, opts.query, tracks)
-	action, idx := tui.Run()
-	if action == ActionQuit || idx < 0 {
-		return
+	// A library scan is already an ordered queue, so --play skips the browse
+	// list: picking one episode by hand is the only thing between the command
+	// and playback, and for a known show you want the first episode.
+	idx := 0
+	action := ActionPlay
+	if !opts.playOnly {
+		tui := NewTUI(os.Stdin, os.Stdout, label, tracks)
+		var sel int
+		action, sel = tui.Run()
+		if action == ActionQuit || sel < 0 {
+			return
+		}
+		idx = sel
 	}
 	track := tracks[idx]
 
-	wantASCII := opts.ascii
+	// --play skips the browse list, so there is no keypress to request ASCII
+	// mode. Default it on: asking for a library episode and getting a spectrum
+	// alone would not be what anyone wanted.
+	wantASCII := opts.ascii || (opts.playOnly && opts.library != "")
 	if action == ActionASCII {
 		wantASCII = true
 	}
@@ -252,7 +317,7 @@ func playQueue(opts options, mode ColorMode, tracks []Track, index int) {
 	// One key reader for the whole queue. Starting one per track left the
 	// previous goroutine blocked in Read after a queue advance, and the two then
 	// raced for stdin — which showed up as the quit key doing nothing.
-	keys := make(chan Cmd, 16)
+	keys := make(chan []byte, 16)
 	go readKeys(po.in, keys)
 	po.keys = keys
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
@@ -189,6 +190,12 @@ func playAudio(track Track) error {
 
 // resolveURL asks yt-dlp for direct media URLs.
 func resolveURL(track Track, format string) (string, error) {
+	// ffmpeg and mpv both open a filesystem path directly, so a library track
+	// resolves to itself. Running yt-dlp here would fail on every seek: it finds
+	// no extractor for a path and the format selector is never consulted.
+	if track.IsLocal() {
+		return track.LocalPath, nil
+	}
 	out, err := runYtdlp(format, track.URL)
 	if err != nil {
 		return "", err
@@ -244,6 +251,22 @@ func resolveMedia(track Track, sourceH int) (mediaPair, error) {
 	if h <= 0 {
 		h = 360
 	}
+
+	// A local file needs no resolving, and yt-dlp cannot resolve one: it is
+	// handed a filesystem path, finds no extractor, and exits non-zero. Its
+	// container already holds both streams, so this is the same shape
+	// pickStreams returns for a progressive format — one ref used twice.
+	if track.IsLocal() {
+		dur, chaps, hasAudio := probeMedia(track.LocalPath)
+		return mediaPair{
+			videoURL: track.LocalPath,
+			audioURL: track.LocalPath,
+			dur:      float64(dur),
+			chapters: chaps,
+			silent:   !hasAudio,
+		}, nil
+	}
+
 	cmd := exec.Command("yt-dlp", "-J", "--no-warnings", "--no-playlist", track.URL)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -260,7 +283,12 @@ func resolveMedia(track Track, sourceH int) (mediaPair, error) {
 	if err != nil {
 		return mediaPair{}, err
 	}
-	return mediaPair{videoURL: videoURL, audioURL: audioURL, dur: info.Duration}, nil
+	return mediaPair{
+		videoURL: videoURL,
+		audioURL: audioURL,
+		dur:      info.Duration,
+		chapters: chaptersFrom(info.Chapters),
+	}, nil
 }
 
 // ytInfo is the subset of `yt-dlp -J` we need.
@@ -269,6 +297,36 @@ type ytInfo struct {
 	// Duration in seconds, for the progress bar. Absent or zero on a live
 	// stream, which is why the HUD falls back to elapsed-only.
 	Duration float64 `json:"duration"`
+	// Chapters come along in the same response, so reading them costs no extra
+	// request. Most uploads have none, which is why an empty list is normal
+	// rather than a failure.
+	Chapters []ytChapter `json:"chapters"`
+}
+
+// ytChapter is one entry of yt-dlp's chapter list.
+type ytChapter struct {
+	StartTime float64 `json:"start_time"`
+	EndTime   float64 `json:"end_time"`
+	Title     string  `json:"title"`
+}
+
+// chaptersFrom converts the wire shape into the player's, dropping entries with
+// no usable start. A chapter that begins at -1 or at NaN is yt-dlp saying
+// "unknown", and letting one through would make `]` seek to a position that does
+// not exist.
+func chaptersFrom(c []ytChapter) []Chapter {
+	if len(c) == 0 {
+		return nil
+	}
+	out := make([]Chapter, 0, len(c))
+	for _, ch := range c {
+		if math.IsNaN(ch.StartTime) || math.IsNaN(ch.EndTime) ||
+			ch.StartTime < 0 || ch.EndTime < ch.StartTime {
+			continue
+		}
+		out = append(out, Chapter{Start: ch.StartTime, End: ch.EndTime, Title: ch.Title})
+	}
+	return out
 }
 
 type ytFormat struct {

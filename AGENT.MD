@@ -39,14 +39,54 @@ own request then fails with 403. One input, one consumer.
 **Never set `mpv --idle`.** It survives end-of-file, so mpv never exits and track
 end is unobservable. The queue hangs on the last frame of every track.
 
+**Never resolve a local path through yt-dlp.** `resolveURL` and `resolveMedia`
+branch on `track.IsLocal()` and hand back the path unchanged. yt-dlp finds no
+extractor for a filesystem path, so every seek would pay a subprocess to be told
+it failed. A local file is also already a progressive container: both refs are the
+same path, which is the same shape `pickStreams` returns for a progressive
+YouTube format, so there is nothing to select.
+
+**ffprobe is safe on a local path and unsafe on a resolved URL.** The reason this
+project avoids probing a googlevideo URL is the single-use grant, not the
+subprocess. `library.go` probes freely, once per file, capped at 8 concurrent.
+
+**Never close the video pipe before killing ffmpeg, and never `Wait` on mpv.**
+Both hang the render loop rather than crashing it, and a hung loop ignores `q`
+because it never reaches a `select` again. Measured at roughly 1 seek run in 6.
+- `vidOut` is an `*os.File` from `StdoutPipe`, and Go's poller makes `Close` on a
+  file with a read in flight *wait* for that read. The read waits on a writer, the
+  writer is ffmpeg blocked on a full pipe, and the only thing draining that pipe
+  is the read being waited on.
+- mpv is already reaped by the goroutine `start` launches to close `s.audio`. A
+  second `Wait` on the same `*exec.Cmd` queues behind a process whose exit we do
+  not control — the observed freeze was `mpv` still in state `T`, SIGSTOPped by
+  the covered-terminal handler. `Close` signals `SIGCONT` before `SIGKILL` and
+  bounds the ffmpeg wait; see `childReapTimeout`.
+
+**Decode keys in the render loop, never in the reader goroutine.** `readKeys` is a
+byte pump. It used to emit `Cmd`, which made the `:` prompt impossible: a `:` and
+the timestamp after it arrive in one read, and the reader had already decided that
+`q` was a quit and `-30` was three volume changes before anything could object.
+`keyRouter` owns the routing so the burst behaviour is unit-testable.
+
+**ffprobe's JSON is not shaped the way you would guess.** `start_time` and
+`end_time` are JSON *strings*, and a chapter title is nested under `tags`.
+Structuring them as numbers and as a top-level field compiles, runs, and fails at
+unmarshal — which `probeMedia` cannot distinguish from "no duration", so the
+library's length column silently goes blank. `TestFfprobeOutputShape` pins the
+real response.
+
 ## Testing
 
-Behaviour is tested at four seams, all runnable without ffmpeg, mpv, or network:
+Behaviour is tested at five seams, all runnable without ffmpeg, mpv, or network:
 
 1. `Player` — transport state machine, against a `fakeMedia` backend
-2. `hud.go` — pure formatting (`formatClock`, `progressBar`, `hud.lines`)
+2. `hud.go` — pure formatting (`formatClock`, `progressBar`, `parseTimestamp`,
+   `hud.lines`)
 3. `Outcome` — why playback stopped
 4. `mpvIPC` — request encoding and reply parsing
+5. `keyRouter` / `prompt` — byte routing, so a `:` and its timestamp in one read
+   is a unit test rather than something you have to press keys to find
 
 Deliberately **not** unit tested, because they need real processes: the SIGSTOP
 pause, the ffmpeg rebuild on seek/resize, the decoder goroutine against a live
@@ -55,6 +95,19 @@ pipe, and anything that writes to a terminal. Verify those by running it.
 Expected values in tests must be worked out by hand or taken from a known-good
 literal. Recomputing them the way the code does makes the test pass by
 construction and proves nothing.
+
+### Asserting on the screen, not on bytes
+
+`screen_test.go` carries a small terminal emulator, and it is the only way to
+catch a stale cell: a renderer that emits the right bytes in the wrong order still
+"writes something". Reconstructing the grid and comparing it to the frame that was
+handed in is the assertion that means anything.
+
+`DiffRenderer` and `ColorDiffRenderer` both keep a diff cache the overlay is
+invisible to, so closing an overlay **must** be followed by `ForceNext` or the
+prompt stays on screen for the rest of the track. The colour path additionally
+tracks cursor position and last-emitted SGR; painting over the grid invalidates
+both, or the next frame resumes mid-row.
 
 ### Driving it without a TTY
 
@@ -68,23 +121,55 @@ Use a real pty. `/tmp/opencode/ptycheck.py` (cases: `seek`, `back`, `pause`,
 - Note that the browse list has a line-mode fallback for non-TTY stdin, so a
   piped run selects with a **line index**, not a bare Enter.
 
+`/tmp/opencode/` holds the current generation, recreate if wiped:
+
+| Script | What it proves |
+|---|---|
+| `termscreen.py` | the terminal emulator every other script asserts with |
+| `ptydrive.py` | drive keys at a live player, print clock/footer after each step |
+| `silentcheck.py` | a video-only local file plays its full length |
+| `hanghunt.py` | repeated seeks never freeze the loop (the `Close` deadlock) |
+| `leakhunt.py` | hunts stale cells in a running player |
+
+Two rules for these, both learned the hard way:
+
+- **Never run two of them at once.** They all spawn and kill ffmpeg and mpv, and
+  one script's cleanup will reap another script's children mid-run.
+- **A synthetic test clip needs an audio stream.** `mpv` exits instantly on a
+  video-only file, which reads as track end and ends the run in about two seconds.
+- **Never override `--rows`.** `computeLayout` already subtracts the three chrome
+  rows, so passing a value double-subtracts and every assertion lands on the wrong
+  row.
+
 ## Architecture
 
 ```
 main.go        arg parsing, then playQueue (owns the queue index)
 search.go      ytfzf/yt-dlp search -> []Track
+library.go     directory scan -> []Track; filename -> series/season/episode
 tui.go         browse list; line-mode fallback when stdin is not a TTY
 session.go     trackSession (media backend), decoder goroutine, render loop
-player.go      Player: transport rules, key decoding
+player.go      Player: transport rules, byte routing, the `:` prompt
 sync.go        SyncPlayer: ffmpeg video pipe + mpv audio, A/V sync
 ipc.go         mpv JSON IPC: time position, seek, properties
-hud.go         title / progress bar / hints
+hud.go         title / progress bar / hints / parseTimestamp
+render.go      mono diff renderer + overlay layout
 color.go       colour renderer, glyph probe, terminal detection
 flow.go        covered-terminal stall handling
 ```
 
 `playQueue` owns the queue index. `playTrack` plays exactly one track and returns
 an `Outcome`; it never mutates the queue.
+
+### Seeking and the prompt
+
+Every position change goes through `Player.seekTo`, which clamps and leaves the
+pre-seek marker for the bar. `keyRouter` turns terminal bytes into `Cmd`s and
+routes them to the `prompt` first while it is open; the render loop owns the
+router and is the only thing that decodes.
+
+The overlay is drawn after the frame, on the bottom two grid rows, and closing it
+forces one full repaint — see Testing above for why both halves of that matter.
 
 ### Sync
 

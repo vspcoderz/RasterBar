@@ -23,6 +23,10 @@ import (
 const (
 	barFilled = "━"
 	barEmpty  = "─"
+	// barMark is the tick left where playback was before the last seek. A heavy
+	// box-drawing vertical, so it reads as a distinct event rather than as more
+	// progress — which is the one thing it must never be mistaken for.
+	barMark = "┃"
 )
 
 // formatClock renders a position as m:ss, or h:mm:ss past an hour.
@@ -46,7 +50,12 @@ func formatClock(sec float64) string {
 // Filled cells are floored, not rounded, so the bar never claims to be ahead of
 // the audio. A player that shows more progress than has played is worse than one
 // that lags by a pixel.
-func progressBar(pos, dur float64, width int) string {
+//
+// markAt, when >= 0, is a position to leave a tick at: where playback was before
+// the last seek. Without it, a jump across forty minutes and a nudge of one second
+// look identical, and the whole point of jumping is not being able to tell where
+// you were before.
+func progressBar(pos, dur float64, width int, markAt float64) string {
 	if width <= 0 || dur <= 0 || math.IsNaN(dur) || math.IsNaN(pos) {
 		return ""
 	}
@@ -57,7 +66,167 @@ func progressBar(pos, dur float64, width int) string {
 	if filled > width {
 		filled = width
 	}
-	return strings.Repeat(barFilled, filled) + strings.Repeat(barEmpty, width-filled)
+	cells := []rune(strings.Repeat(barFilled, filled) + strings.Repeat(barEmpty, width-filled))
+	if markAt >= 0 && !math.IsNaN(markAt) {
+		if i := int(markAt / dur * float64(width)); i >= 0 && i < len(cells) {
+			cells[i] = []rune(barMark)[0]
+		}
+	}
+	return string(cells)
+}
+
+// parseTimestamp resolves what the user typed into a media position.
+//
+// It is the inverse of formatDuration and deliberately shares its shape: a
+// timestamp the player accepts and a timestamp it displays should be written the
+// same way, or the prompt teaches a syntax the clock does not use.
+//
+// Accepted, all of them:
+//
+//	90           bare seconds
+//	1:30         minutes:seconds       1:02:03   hours:minutes:seconds
+//	90s 2m 1h2m3s                      explicit units
+//	+30  -1:30                          relative to where playback is now
+//	50%          fraction of the duration
+//
+// A leading sign means relative, and applies to a percentage too: -50% is "go
+// back half a track", which is a thing you want at the end of one.
+//
+// Fields are deliberately not range-checked. `1:90` is 150 seconds and `90:00` is
+// 90 minutes; both are what the person typing them meant, and clamping to the
+// shape of a wall clock would silently do something else.
+func parseTimestamp(s string, pos, dur float64) (float64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	rel := false
+	sign := 1.0
+	switch s[0] {
+	case '+':
+		rel, s = true, s[1:]
+	case '-':
+		rel, sign, s = true, -1, s[1:]
+	}
+	if s == "" {
+		return 0, false
+	}
+
+	// A percentage is a fraction of the track, so it needs a duration to mean
+	// anything. On a live stream there is none, and the entry is refused rather
+	// than resolved against zero.
+	if pct, isPct := strings.CutSuffix(s, "%"); isPct {
+		f, err := strconv.ParseFloat(strings.TrimSpace(pct), 64)
+		if err != nil || dur <= 0 || f < 0 {
+			return 0, false
+		}
+		if rel {
+			return pos + sign*f/100*dur, true
+		}
+		return f / 100 * dur, true
+	}
+
+	var (
+		secs float64
+		ok   bool
+	)
+	switch {
+	case strings.Contains(s, ":"):
+		secs, ok = parseColonTime(s)
+	case hasTimeUnit(s):
+		secs, ok = parseUnitTime(s)
+	default:
+		var f float64
+		f, err := strconv.ParseFloat(s, 64)
+		secs, ok = f, err == nil
+	}
+	if !ok || secs < 0 || math.IsNaN(secs) || math.IsInf(secs, 0) {
+		return 0, false
+	}
+	if rel {
+		return pos + sign*secs, true
+	}
+	return secs, true
+}
+
+// parseColonTime reads `m:s` or `h:m:s`.
+func parseColonTime(s string) (float64, bool) {
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, false
+	}
+	// Right to left: the rightmost field is always seconds, and the scale of each
+	// field to its left depends on how many fields there are, not on its index.
+	var total, scale = 0.0, 1.0
+	for i := len(parts) - 1; i >= 0; i-- {
+		f, err := strconv.ParseFloat(strings.TrimSpace(parts[i]), 64)
+		if err != nil || f < 0 {
+			return 0, false
+		}
+		total += f * scale
+		scale *= 60
+	}
+	return total, true
+}
+
+// hasTimeUnit reports whether s contains a letter, which is what separates `90s`
+// from a bare `90`. Guessing is not an option: `2m` is two minutes and `2` is two
+// seconds, and only the letter tells them apart.
+func hasTimeUnit(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
+
+// parseUnitTime reads `1h2m3s`, tolerating spaces between the terms.
+//
+// Every number must carry a unit. `1h30` is refused rather than guessed at: the
+// two readings are ninety minutes and ninety seconds, and nothing in the input
+// says which was meant.
+func parseUnitTime(s string) (float64, bool) {
+	s = strings.ReplaceAll(s, " ", "")
+	var total float64
+	i := 0
+	for i < len(s) {
+		start := i
+		for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+			i++
+		}
+		if start == i {
+			return 0, false // a unit with no number in front of it
+		}
+		f, err := strconv.ParseFloat(s[start:i], 64)
+		if err != nil {
+			return 0, false
+		}
+		if i >= len(s) {
+			return 0, false // a number with no unit after it
+		}
+		var scale float64
+		switch lowerASCII(s[i]) {
+		case 'h':
+			scale = 3600
+		case 'm':
+			scale = 60
+		case 's':
+			scale = 1
+		default:
+			return 0, false
+		}
+		total += f * scale
+		i++
+	}
+	return total, i > 0
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
 }
 
 // hudRows renders the chrome block: title, progress, key hints.
@@ -75,6 +244,14 @@ type hud struct {
 	paused  bool
 	queue   int // position in the queue, 1-based; 0 = single track
 	total   int
+	// chapter is the title of the chapter being played, if the track has any.
+	chapter string
+	// mark is where playback was before the last seek. Paired with hasMark
+	// rather than using a negative sentinel, because the zero value of a struct
+	// literal has to mean "no marker" — a bare hud{...} in a test would otherwise
+	// silently grow a tick at the start of the bar.
+	mark    float64
+	hasMark bool
 	// showHints is false once the key hints have faded. They come back on the
 	// next keypress, so a player does not permanently spend a row reminding you
 	// what space does.
@@ -119,7 +296,11 @@ func (h hud) lines(width int) []string {
 			fit(h.footer(), width),
 		}
 	}
-	bar := progressBar(h.pos, h.dur, barWidth)
+	mark := -1.0
+	if h.hasMark {
+		mark = h.mark
+	}
+	bar := progressBar(h.pos, h.dur, barWidth, mark)
 
 	return []string{
 		fit(head, width),
@@ -133,26 +314,34 @@ func (h hud) lines(width int) []string {
 }
 
 // footer is row 3: the pause banner while paused, otherwise the volume state,
-// otherwise the key hints until they fade.
+// otherwise the chapter being played, otherwise the key hints until they fade.
 //
 // The hints fade because a permanent hint row is furniture the eye learns to
 // skip; they come back on the next keypress, which is exactly when someone
 // needs them. Paused is exempt — a banner that vanishes on its own is worse than
 // one that stays.
+//
+// A chapter title takes the row the hints have vacated. It is the one piece of
+// information that is worth a permanent home in the chrome: it is what tells you
+// where you are in something with structure, and it costs nothing while the hints
+// are up because those are the moments you are pressing keys anyway.
 func (h hud) footer() string {
 	if h.paused {
-		return "PAUSED  space play  ←/→ seek  n/p next  +/- vol  q quit"
+		return "PAUSED  space play  ←/→ seek  n/p next  +/- vol  : jump  q quit"
+	}
+	if h.chapter != "" {
+		return "▸ " + h.chapter
 	}
 	if h.muted {
-		return "muted   ←/→ seek  space pause  q quit"
+		return "muted   ←/→ seek  space pause  : jump  q quit"
 	}
 	if h.volume != 100 {
-		return "vol " + strconv.Itoa(h.volume) + "%   ←/→ seek  space pause  q quit"
+		return "vol " + strconv.Itoa(h.volume) + "%   ←/→ seek  space pause  : jump  q quit"
 	}
 	if !h.showHints {
 		return ""
 	}
-	return "space pause  ←/→ seek  n/p next  q quit"
+	return "space pause  ←/→ seek  ,/. fine  </> 60s  : jump  n/p next  q quit"
 }
 
 // pad2 zero-pads to two digits, for the queue counter.

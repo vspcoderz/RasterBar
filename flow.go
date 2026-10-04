@@ -76,7 +76,7 @@ func (s *SyncPlayer) Paused() bool { return s.paused }
 // while the children are suspended the render loop is not selecting: without
 // this the keystrokes that arrive during a stall would sit in the buffer and be
 // replayed as a burst on resume.
-func awaitDrain(out *os.File, player *SyncPlayer, keys <-chan Cmd, poll time.Duration) bool {
+func awaitDrain(out *os.File, player *SyncPlayer, keys <-chan []byte, poll time.Duration) bool {
 	if poll <= 0 {
 		poll = 120 * time.Millisecond
 	}

@@ -296,17 +296,61 @@ func (s *SyncPlayer) Next() ([]byte, error) {
 	return s.frame, nil
 }
 
+// childReapTimeout bounds how long the render loop will wait for a child to be
+// reaped before giving up on it.
+//
+// Long enough that a healthy ffmpeg (killed microseconds earlier) is always
+// reaped inside it, short enough that a child wedged in the kernel cannot freeze
+// the player. What "give up" means is that the wait moves to a goroutine of its
+// own and the loop carries on; the old generation's channels are about to be
+// dropped, so a straggler cannot corrupt the new one.
+const childReapTimeout = 2 * time.Second
+
+// Close retires both children and everything attached to them.
+//
+// Three things here are load-bearing, and each was measured rather than reasoned
+// about. Getting any of them wrong is a hang, not a crash — the render loop parks
+// inside this function and the quit key does nothing, because it never reaches a
+// select again.
+//
+//  1. Kill before closing the pipe. vidOut is an *os.File from StdoutPipe, and Go's
+//     poller makes Close on a file with a read in flight *wait* for that read to
+//     finish. The read waits on a writer; the writer is ffmpeg blocked on a full
+//     pipe; the only thing draining that pipe is the read Close is waiting on.
+//     Two goroutines, one pipe, neither can move.
+//
+//  2. SIGCONT before SIGKILL. flow.go SIGSTOPs both children when the terminal
+//     stops reading, and a rebuild can land while they are stopped. SIGKILL is
+//     normally delivered to a stopped process, but resuming first costs nothing
+//     and removes any doubt about which signal the child actually acts on.
+//
+//  3. Never Wait on mpv here. start() already has a goroutine waiting on it, to
+//     close s.audio. Two Wait calls on one *exec.Cmd is a second waiter queued
+//     behind a process whose exit we do not control, and that is where this froze:
+//     the loop sat in audio.Wait with mpv still in state T. Close kills it; the
+//     goroutine that owns it reaps it.
+//
+// ffmpeg does have to be reaped before the loop moves on, because it holds the
+// pipe — but even that is bounded, for the same reason. Wait closes the parent end
+// of the pipe itself, so there is nothing left for this function to close.
 func (s *SyncPlayer) Close() {
-	if s.vidOut != nil {
-		s.vidOut.Close()
+	for _, cmd := range []*exec.Cmd{s.ff, s.audio} {
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		_ = cmd.Process.Signal(syscall.SIGCONT)
+		_ = cmd.Process.Kill()
 	}
-	if s.ff != nil && s.ff.Process != nil {
-		s.ff.Process.Kill()
-		s.ff.Wait()
-	}
-	if s.audio != nil && s.audio.Process != nil {
-		s.audio.Process.Kill()
-		s.audio.Wait()
+	if s.ff != nil {
+		reaped := make(chan struct{})
+		go func() {
+			_ = s.ff.Wait()
+			close(reaped)
+		}()
+		select {
+		case <-reaped:
+		case <-time.After(childReapTimeout):
+		}
 	}
 	if s.ipc != nil {
 		s.ipc.close()

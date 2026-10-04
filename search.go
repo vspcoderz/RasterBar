@@ -20,6 +20,26 @@ type Track struct {
 	Date     *string `json:"date"`
 	ID       string  `json:"ID"`
 	Thumbs   string  `json:"thumbs"`
+
+	// Series metadata, set only for library tracks. Zero values for anything
+	// that came off the network, so every consumer can treat them as optional.
+	Series    string `json:"series,omitempty"`
+	Season    int    `json:"season,omitempty"`
+	Episode   int    `json:"episode,omitempty"`
+	LocalPath string `json:"local_path,omitempty"`
+}
+
+// IsLocal reports whether this track is a file on disk rather than a remote
+// stream.
+//
+// The distinction is not cosmetic, it decides which resolver runs. yt-dlp is
+// the only way to get a playable URL for a youtube.com link (ffmpeg returns
+// "Invalid data found when processing input" on one), but it is also a
+// guaranteed failure on a local path, and running it just to be told that costs
+// a subprocess on every seek. A file needs no resolving at all: ffmpeg and mpv
+// both open a path directly.
+func (t Track) IsLocal() bool {
+	return t.LocalPath != ""
 }
 
 // YtdlpResult is one line of `yt-dlp --dump-json --flat-playlist` output.
@@ -46,6 +66,15 @@ func (t Track) DurationText() string {
 }
 
 func (t Track) ChannelText() string {
+	// A library file has no channel, and "unknown" in that column reads like a
+	// scraping failure rather than like the truth. The series it belongs to is the
+	// nearest equivalent, and it is the field a viewer would want there.
+	if t.IsLocal() {
+		if t.Series != "" {
+			return t.Series
+		}
+		return "local"
+	}
 	if t.Channel == "" {
 		return "unknown"
 	}

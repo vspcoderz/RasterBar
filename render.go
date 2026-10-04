@@ -119,3 +119,49 @@ func (d *DiffRenderer) Draw(frame []byte) error {
 // ForceNext makes the next Draw repaint everything. Used when the terminal may
 // have been resized or cleared underneath us.
 func (d *DiffRenderer) ForceNext() { d.first = true }
+
+// overlayLine is one positioned row of an overlay.
+type overlayLine struct {
+	row  int    // 1-based, in terminal rows
+	text string // exactly cols wide
+}
+
+// layoutOverlay centres lines on the bottom of the grid.
+//
+// Bottom-anchored rather than centred vertically because the bottom of the frame
+// is the part of a shot people are not looking at, and it is the row nearest the
+// chrome, so the text lands where the eye already is.
+//
+// Every line is padded to the full width on purpose. A partially covered row
+// leaves video visible either side of the text, and reverse video over a moving
+// background is only legible when the background is uniform — the padding is what
+// makes it a bar rather than a stripe.
+func layoutOverlay(cols, rows int, lines []string) []overlayLine {
+	if cols <= 0 || rows <= 0 || len(lines) == 0 {
+		return nil
+	}
+	if len(lines) > rows {
+		lines = lines[len(lines)-rows:]
+	}
+	out := make([]overlayLine, 0, len(lines))
+	for i, s := range lines {
+		r := rows - len(lines) + i + 1
+		out = append(out, overlayLine{row: r, text: fit(s, cols)})
+	}
+	return out
+}
+
+// Overlay paints lines over the bottom of the grid.
+//
+// The caller must follow a close with ForceNext, and that is not optional: the
+// diff cache holds the video values for these cells, so once the overlay is gone
+// the next frame sees no change and skips them. Without the forced repaint the
+// prompt stays on screen for the rest of the track.
+func (d *DiffRenderer) Overlay(lines []string) error {
+	for _, ol := range layoutOverlay(d.cols, d.rows, lines) {
+		if _, err := fmt.Fprintf(d.w, "\x1b[%d;1H%s", ol.row, ol.text); err != nil {
+			return err
+		}
+	}
+	return nil
+}

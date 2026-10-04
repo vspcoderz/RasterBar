@@ -53,6 +53,47 @@ looks stretched.
   large grids smooth.
 - **Tuned for low-end machines**: resolution and frame rate both scale with your
   terminal and grid size.
+- **Library mode** — point it at a directory and your own anime and series
+  browse as a catalog, ordered by series/season/episode, with the queue
+  auto-advancing to the next episode. See below.
+
+## Library mode
+
+```
+vspz-yt-cli --library ~/Videos/Anime
+vspz-yt-cli -l ~/Videos/Anime --play          # start the first episode, no list
+vspz-yt-cli -l ~/Videos/Anime --no-probe       # instant scan, durations shown as --:--
+```
+
+Filenames are parsed into series, season and episode, so a messy tree lands in a
+watchable order instead of a lexical one:
+
+| Filename | Becomes |
+|---|---|
+| `Cowboy Bebop S01E02 - Stray Dog Strut.mkv` | `S01E02` Cowboy Bebop — Stray Dog Strut |
+| `Cowboy Bebop - 07 - Session 3 [SubsPlease].mkv` | `E07` Cowboy Bebop — Session 3 |
+| `Show Name 01x05.mkv` | `S01E05` Show Name |
+| `Show Name - 100.mkv` | `E100` Show Name |
+| `Show Name (2019) - 03.mkv` | `E03` Show Name — the year is not an episode |
+| `Random Home Video.mkv` | skipped, no episode marker |
+
+Rules that matter:
+
+- **Season comes from the directory** when the filename has none, so
+  `Show/Season 2/Show - 01.mkv` files as `S02E01`.
+- **Episode order is numeric.** A lexical sort plays episode 10 before episode 2.
+- **A title year is never an episode number.** Four digits cannot match the
+  one-to-three digit rule, so `Show (2019)` files as `Show`.
+- **A file with no episode marker is skipped**, not placed arbitrarily.
+- **An unreadable subdirectory is skipped**, not fatal.
+- Episode 1 playing through advances the queue to episode 2 on its own.
+
+Local files need no resolving: `ffmpeg` and `mpv` both open a path directly, so
+`yt-dlp` is never invoked in library mode. `--no-probe` skips the `ffprobe` pass
+that fills in durations — worth it on a large library over a network share.
+
+`ffmpeg`, `ffprobe` and `mpv` are required for library mode. `yt-dlp` and `ytfzf`
+are only needed for search.
 
 ## Requirements
 
@@ -84,6 +125,10 @@ audio · `a` ASCII video · `q` quit
 |---|---|
 | `space` | pause / resume |
 | `←` `→` | seek -10s / +10s |
+| `,` `.` | seek -1s / +1s |
+| `<` `>` | seek -60s / +60s |
+| `[` `]` | previous / next chapter |
+| `:` | jump to a timestamp |
 | `n` `p` | next / previous result |
 | `+` `-` | volume up / down |
 | `q` `ctrl-c` | quit |
@@ -94,7 +139,39 @@ rather than wrapping — nothing in a search result set is ordered like a
 playlist.
 
 The bar shows position and duration; the top line shows the track and its
-`04/19` place in the queue.
+`04/19` place in the queue. After a seek the bar keeps a `┃` where playback was,
+for a few seconds, so a jump across forty minutes and a nudge of one second do
+not look the same. When a track has chapters, the one playing takes the hint row
+once the hints have faded.
+
+### `:` — jump to a timestamp
+
+Ten seconds per keypress is 240 presses to reach the credits of a long video, and
+no way at all to reach the part you can only describe as "around twelve minutes
+in". `:` opens a field over the video:
+
+```
+ jump to █ 1:30
+ → 1:30 / 3:20   ·   enter jump  ·   esc cancel
+```
+
+| You type | It means |
+|---|---|
+| `90` | 90 seconds |
+| `1:30` | minutes:seconds |
+| `1:02:03` | hours:minutes:seconds |
+| `90s` `2m` `1h2m3s` | explicit units |
+| `+30` `-1:30` | relative to where you are now |
+| `50%` | that fraction of the track |
+
+The second line previews where the jump will land, from the same parser the HUD
+clock is built from, so what you type and what you see are the same format.
+`enter` jumps, `esc` cancels, and `ctrl-u` clears the line. Everything typed while
+the field is open is text — including `q`, `n` and `-`.
+
+Fields are not range-checked: `1:90` is 150 seconds and `90:00` is 90 minutes,
+because both are what the person typing them meant.
+
 
 ## Design notes
 

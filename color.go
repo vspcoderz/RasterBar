@@ -266,11 +266,42 @@ func (c *ColorDiffRenderer) emitColor(top, bot uint32) error {
 // ForceNext makes the next Draw repaint everything.
 func (c *ColorDiffRenderer) ForceNext() { c.first = true; c.haveLast = false }
 
-// FrameRenderer is the interface runASCII draws through, so the mono and colour
-// paths are interchangeable.
+// Overlay paints lines over the bottom of the grid in reverse video.
+//
+// Reverse video rather than an explicit background because the pixels underneath
+// are unknown and moving: the video's own colours are whatever the shot is, and
+// any fixed pair would be unreadable over part of it. Swapping fg and bg is
+// legible over anything, and it costs no colour of our own.
+//
+// The cursor and colour bookkeeping is invalidated afterwards, and it has to be.
+// Draw skips the cursor move when a cell follows the last one written and skips
+// the SGR when the colour is unchanged; after an overlay the cursor is in the
+// middle of the grid with a background colour no cell has. Leaving the state
+// alone makes the next frame resume mid-row and carry one overlay cell's colour
+// into the rest of the line.
+func (c *ColorDiffRenderer) Overlay(lines []string) error {
+	if _, err := io.WriteString(c.w, "\x1b[0m\x1b[7m"); err != nil {
+		return err
+	}
+	for _, ol := range layoutOverlay(c.cols, c.rows, lines) {
+		if _, err := fmt.Fprintf(c.w, "\x1b[%d;1H%s", ol.row, ol.text); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(c.w, "\x1b[0m"); err != nil {
+		return err
+	}
+	c.haveLast = false
+	return nil
+}
+
+// FrameRenderer is the interface the render loop draws through, so the mono and
+// colour paths are interchangeable.
 type FrameRenderer interface {
 	Draw(frame []byte) error
 	ForceNext()
+	// Overlay draws text over the grid. See layoutOverlay for where it lands.
+	Overlay(lines []string) error
 }
 
 // colorSupported reports whether any colour mode is active.

@@ -1152,7 +1152,7 @@ func TestProgressBarFillsProportionally(t *testing.T) {
 		{25, 100, 10, "━━────────"}, // floor, not round
 	}
 	for _, c := range cases {
-		got := progressBar(c.pos, c.dur, c.width)
+		got := progressBar(c.pos, c.dur, c.width, -1)
 		if got != c.want {
 			t.Errorf("progressBar(%v,%v,%d) = %q, want %q", c.pos, c.dur, c.width, got, c.want)
 		}
@@ -1162,17 +1162,17 @@ func TestProgressBarFillsProportionally(t *testing.T) {
 func TestProgressBarClampsOutOfRange(t *testing.T) {
 	// A position past the end (drift, or a bad duration) must not overflow the
 	// bar: the line has a fixed cell budget and would wrap.
-	if got := progressBar(150, 100, 4); got != "━━━━" {
+	if got := progressBar(150, 100, 4, -1); got != "━━━━" {
 		t.Errorf("pos>dur = %q, want full bar", got)
 	}
-	if got := progressBar(-5, 100, 4); got != "────" {
+	if got := progressBar(-5, 100, 4, -1); got != "────" {
 		t.Errorf("negative pos = %q, want empty bar", got)
 	}
 }
 
 func TestProgressBarWidthIsExact(t *testing.T) {
 	for _, width := range []int{1, 3, 20, 80} {
-		got := progressBar(37, 90, width)
+		got := progressBar(37, 90, width, -1)
 		if n := len([]rune(got)); n != width {
 			t.Errorf("progressBar width %d produced %d cells: %q", width, n, got)
 		}
@@ -1182,10 +1182,10 @@ func TestProgressBarWidthIsExact(t *testing.T) {
 func TestProgressBarNoDurationDrawsNothing(t *testing.T) {
 	// Live streams have no duration. An empty string is what makes the caller
 	// fall back to elapsed-only instead of painting a permanently empty bar.
-	if got := progressBar(30, 0, 10); got != "" {
+	if got := progressBar(30, 0, 10, -1); got != "" {
 		t.Errorf("dur=0 = %q, want empty", got)
 	}
-	if got := progressBar(30, 90, 0); got != "" {
+	if got := progressBar(30, 90, 0, -1); got != "" {
 		t.Errorf("width=0 = %q, want empty", got)
 	}
 }
@@ -1277,6 +1277,7 @@ type fakeMedia struct {
 	seeks    []float64
 	closed   bool
 	pauseErr error
+	chapters []Chapter
 }
 
 func (f *fakeMedia) Position() float64 { return f.pos }
@@ -1292,6 +1293,7 @@ func (f *fakeMedia) Seek(sec float64) error {
 }
 func (f *fakeMedia) SetVolume(v int) error { f.volume = v; return nil }
 func (f *fakeMedia) Close() error          { f.closed = true; return nil }
+func (f *fakeMedia) Chapters() []Chapter   { return f.chapters }
 
 func newTestPlayer(m *fakeMedia, queue ...Track) *Player {
 	return NewPlayer(queue, m)

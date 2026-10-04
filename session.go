@@ -30,6 +30,15 @@ type mediaPair struct {
 	videoURL string
 	audioURL string
 	dur      float64
+	// chapters comes from the same response as the URLs and the duration, so
+	// chapter navigation costs no extra request on either path.
+	chapters []Chapter
+	// silent is true when the source has no audio stream at all.
+	//
+	// Only ever set on the local path, where the probe already knows. YouTube
+	// always has audio, so the zero value is the right default and the network
+	// path needs no extra request to learn it.
+	silent bool
 }
 
 // videoFrame is one decoded frame plus the media position it was decoded at.
@@ -129,16 +138,24 @@ func (s *trackSession) start(pos float64) error {
 	// on every select evaluation, so swapping the fields is what hands it the new
 	// ones without a second loop or a lock.
 	s.frames = make(chan videoFrame, frameQueueDepth)
-	s.audio = make(chan struct{})
 	s.stop = make(chan struct{})
 
+	// s.audio stays nil for a source with no audio stream, and a nil channel in a
+	// select blocks forever — which is the point. `mpv --no-video` on a video-only
+	// file exits immediately having played nothing, and the loop would read that
+	// as the end of the track: a silent video stopped about two seconds in. With
+	// nothing to listen to, the video pipe is the only clock there is, and the
+	// grace timer after it closes is what ends the track.
 	go s.decode(p, s.frames, s.stop)
-	go func(a *exec.Cmd, done chan struct{}) {
-		if a != nil {
-			_ = a.Wait()
-		}
-		close(done)
-	}(p.audio, s.audio)
+	if !s.pair.silent {
+		s.audio = make(chan struct{})
+		go func(a *exec.Cmd, done chan struct{}) {
+			if a != nil {
+				_ = a.Wait()
+			}
+			close(done)
+		}(p.audio, s.audio)
+	}
 	return nil
 }
 
@@ -201,6 +218,25 @@ func (s *trackSession) Position() float64 {
 }
 
 func (s *trackSession) Duration() float64 { return s.pair.dur }
+
+// Chapters returns the track's chapter list, resolved with the streams.
+func (s *trackSession) Chapters() []Chapter { return s.pair.chapters }
+
+// currentChapter is the title of the chapter containing pos, or "".
+//
+// Strictly `Start <= pos`, with no tolerance. A tenth of a second before a
+// boundary you are still in the chapter you have been watching for ninety
+// seconds, and the footer should say so.
+func currentChapter(chaps []Chapter, pos float64) string {
+	title := ""
+	for _, c := range chaps {
+		if c.Start > pos {
+			break
+		}
+		title = c.Title
+	}
+	return title
+}
 
 // SetPaused freezes or resumes both children.
 //
@@ -291,12 +327,15 @@ type playOpts struct {
 	mode       ColorMode
 	glyphPref  GlyphMode
 
-	// keys is the transport key stream. It is owned by the caller, not by
+	// keys is the raw terminal byte stream. It is owned by the caller, not by
 	// playTrack, because the key reader outlives a single track: one reader per
 	// track would leave the previous one blocked in Read forever after a queue
 	// advance, and the two would then compete for stdin — silently eating
 	// keystrokes, including the one that quits.
-	keys <-chan Cmd
+	//
+	// Bytes and not commands, because the render loop is the only thing that
+	// knows whether a prompt is open. See readKeys.
+	keys <-chan []byte
 }
 
 // playTrack plays one track and reports why it stopped.
@@ -355,7 +394,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	if keys == nil {
 		// Only reachable if a caller forgets to supply one. Owning it here keeps
 		// the transport alive rather than deadlocking on a nil channel.
-		own := make(chan Cmd, 16)
+		own := make(chan []byte, 16)
 		go readKeys(o.in, own)
 		keys = own
 	}
@@ -366,6 +405,14 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	// lastKey drives the hint fade: the row shows itself on every keypress and
 	// then gets out of the way.
 	lastKey := time.Now()
+
+	// markAt is when the pre-seek tick was painted, so it can be taken away again.
+	markAt := time.Time{}
+
+	// The jump-to-time field and the bytes of an escape sequence that has started
+	// but not finished. Both live here rather than in the reader goroutine: this is
+	// the only place that knows what the bytes are allowed to mean.
+	var router keyRouter
 
 	// The last HUD painted, so an unchanged repaint is skipped instead of
 	// written ten times a second for nothing.
@@ -382,6 +429,9 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			paused:    st.Paused,
 			queue:     st.Index + 1,
 			total:     st.Queue,
+			chapter:   currentChapter(pl.Chapters(), st.Pos),
+			mark:      st.Mark,
+			hasMark:   st.HasMark,
 			showHints: time.Since(lastKey) < hintLinger,
 		}.lines(l.cols)
 		joined := lines[0] + "\n" + lines[1] + "\n" + lines[2]
@@ -402,6 +452,37 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			fmt.Fprintf(bw, "\x1b[%d;1H%s", l.rows+1+i, line)
 		}
 		_ = bw.Flush()
+	}
+
+	// paintOverlay draws the prompt over the bottom of the grid. Called after every
+	// frame while it is open, because the frame is what paints over it.
+	paintOverlay := func() {
+		if !router.pr.open {
+			return
+		}
+		st := pl.State()
+		if err := renderer.Overlay([]string{router.pr.line(), router.pr.status(st.Pos, st.Dur)}); err == nil {
+			_ = bw.Flush()
+		}
+	}
+
+	// closeOverlay takes the prompt down and forces the next frame to repaint the
+	// cells it covered.
+	//
+	// The ForceNext is not an optimisation, it is the fix. The diff caches hold the
+	// video values for those cells, so a frame drawn after the overlay is gone sees
+	// no change and skips them — the prompt would stay on screen for the rest of
+	// the track. One full repaint is the price of not shipping that.
+	//
+	// Deliberately unconditional. The field has already closed itself by the time
+	// this is called — prompt.consume closes it before reporting — so guarding on
+	// "was it open" skips the repaint exactly when it is needed, which is always.
+	// That bug shipped in the first draft of this and only a real terminal showed
+	// it: the unit test called ForceNext itself, so it tested the intent rather
+	// than the code.
+	closeOverlay := func() {
+		router.pr.stop()
+		renderer.ForceNext()
 	}
 
 	resized := make(chan os.Signal, 1)
@@ -425,6 +506,70 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		return OutcomeEnded
 	}
 
+	// applyCmd runs one decoded transport command and reports whether playback
+	// should stop. Split out of the select so feedKeys can drive it while a
+	// prompt is closing and the bytes after the closing key still count.
+	applyCmd := func(cmd Cmd) Outcome {
+		switch cmd {
+		case CmdNone:
+			return OutcomePlaying
+		case CmdQuit:
+			return OutcomeQuit
+		case CmdTogglePause:
+			userPaused = !userPaused
+			pl.Do(cmd)
+		default:
+			pl.Do(cmd)
+			if st := pl.State(); st.Outcome != OutcomePlaying {
+				return st.Outcome
+			}
+		}
+		// A keypress the user just made failed. Say so rather than letting it look
+		// like a broken key.
+		//
+		// The SGR reset is not decoration. The colour renderer leaves the last
+		// cell's colour in force, so without it this line is drawn in a colour
+		// sampled from the video — which on a dark scene is dark on dark.
+		if st := pl.State(); st.LastErr != nil {
+			fmt.Fprintf(bw, "\x1b[0m\x1b[%d;1H%s", l.rows+3,
+				fit("transport: "+st.LastErr.Error(), l.cols))
+			_ = bw.Flush()
+			pl.ClearErr()
+			lastKey = time.Now()
+		}
+		return OutcomePlaying
+	}
+
+	// feedKeys applies one chunk of terminal bytes. The routing itself lives in
+	// keyRouter so it can be tested without a terminal; this is the adapter that
+	// turns its answer into transport calls and repaints.
+	feedKeys := func(chunk []byte) Outcome {
+		st := pl.State()
+		res := router.feed(chunk, st.Pos, st.Dur)
+		for _, c := range res.cmds {
+			if out := applyCmd(c); out != OutcomePlaying {
+				return out
+			}
+		}
+		switch {
+		case res.submit:
+			// Closed before the seek, so the overlay's cells are already marked for
+			// repaint by the time the jump rebuilds the decoder.
+			closeOverlay()
+			if res.valid {
+				pl.JumpTo(res.target)
+				markAt = time.Now()
+			}
+		case res.cancel:
+			closeOverlay()
+		}
+		if res.open {
+			paintOverlay()
+		}
+		paintHUD(true)
+		return OutcomePlaying
+	}
+
 	runtime.GC()
 	for {
 		// Rebuild before selecting, so the select below always watches the
@@ -444,38 +589,20 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			if userPaused {
 				_ = sess.SetPaused(true)
 			}
+			// The rebuild cleared the screen the overlay was on, and the new
+			// renderer has never drawn it.
+			paintOverlay()
 		}
 
 		select {
-		case cmd, ok := <-keys:
+		case chunk, ok := <-keys:
 			if !ok {
 				return OutcomeQuit
 			}
 			lastKey = time.Now()
-			switch cmd {
-			case CmdNone:
-				continue
-			case CmdQuit:
-				return OutcomeQuit
-			case CmdTogglePause:
-				userPaused = !userPaused
-				pl.Do(cmd)
-			default:
-				pl.Do(cmd)
-				if st := pl.State(); st.Outcome != OutcomePlaying {
-					return st.Outcome
-				}
+			if out := feedKeys(chunk); out != OutcomePlaying {
+				return out
 			}
-			// A keypress the user just made failed. Say so rather than letting
-			// it look like a broken key.
-			if st := pl.State(); st.LastErr != nil {
-				fmt.Fprintf(bw, "\x1b[%d;1H%s", l.rows+3,
-					fit("transport: "+st.LastErr.Error(), l.cols))
-				_ = bw.Flush()
-				pl.ClearErr()
-				lastKey = time.Now()
-			}
-			paintHUD(true)
 
 		case <-resized:
 			// Drain: a drag emits a burst of these.
@@ -536,8 +663,20 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 
 			if time.Since(lastHUD) > hudInterval {
 				lastHUD = time.Now()
+				// The pre-seek tick has been up long enough to be read. Leaving it
+				// would make a bar that is never entirely clean, which reads as a
+				// rendering fault rather than as information.
+				if !markAt.IsZero() && time.Since(markAt) > markLinger {
+					pl.ClearMark()
+					markAt = time.Time{}
+				}
 				paintHUD(false)
 			}
+
+			// After the HUD, because the HUD is chrome outside the grid and the
+			// overlay is inside it. Drawing it first would have the frame's own
+			// cells win, which is the same as not drawing it.
+			paintOverlay()
 
 			if time.Since(lastSync) > syncCheckInterval {
 				lastSync = time.Now()
@@ -581,6 +720,11 @@ const hudInterval = 100 * time.Millisecond
 // hintLinger is how long the key hints stay up after a keypress. Long enough to
 // read at a glance, short enough that they are not permanent furniture.
 const hintLinger = 4 * time.Second
+
+// markLinger is how long the pre-seek tick stays on the bar. Long enough to
+// catch in peripheral vision, short enough that the bar looks like a bar again
+// before the next keypress.
+const markLinger = 6 * time.Second
 
 // newBufWriter is the batched writer behind every repaint.
 func newBufWriter(w io.Writer) *bufio.Writer { return bufio.NewWriterSize(w, 32*1024) }
