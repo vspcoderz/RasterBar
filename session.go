@@ -523,7 +523,14 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				if !userPaused {
 					_ = sess.SetPaused(false)
 				}
+				// ForceNext makes the next Draw clear the screen and repaint the
+				// grid. That clear takes the chrome with it, so the HUD's
+				// "unchanged, skip" cache has to be invalidated too —
+				// otherwise paintHUD decides there is nothing to do and the
+				// title, clock and hints stay blank until the clock ticks
+				// over a second or a key is pressed.
 				renderer.ForceNext()
+				hudText = ""
 				lastSync = time.Time{}
 			}
 

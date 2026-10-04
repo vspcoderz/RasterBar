@@ -1743,3 +1743,106 @@ func TestHUDTitleShowsChannel(t *testing.T) {
 		t.Errorf("row 0 = %q, want title and channel", rows[0])
 	}
 }
+
+// --- black cells and the colour diff ----------------------------------------
+//
+// A pixel that is true black must still be painted. Skipping it would leave
+// whatever the terminal had in that cell showing through, which reads as "black
+// pixels leak" — so these pin that the diff treats black as a real colour.
+
+func TestBlackCellsArePaintedOnFirstFrame(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, 4, 2, ColorTrue, GlyphCell)
+	if err := r.Draw(solidRGB(4, 2, 0, 0, 0)); err != nil {
+		t.Fatalf("Draw: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "48;2;0;0;0") {
+		t.Errorf("no black background emitted; output=%q", out)
+	}
+	if n := strings.Count(out, " "); n < 8 {
+		t.Errorf("emitted %d glyphs for 8 cells: %q", n, out)
+	}
+}
+
+func TestCellTurningBlackIsRepainted(t *testing.T) {
+	// Four grey cells, then the middle two go black. The two changed cells must
+	// be painted; the two unchanged ones must not be.
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, 4, 1, ColorTrue, GlyphCell)
+	if err := r.Draw(solidRGB(4, 1, 200, 200, 200)); err != nil {
+		t.Fatalf("Draw grey: %v", err)
+	}
+	buf.Reset()
+
+	f := solidRGB(4, 1, 200, 200, 200)
+	for x := 1; x < 3; x++ {
+		f[x*3], f[x*3+1], f[x*3+2] = 0, 0, 0
+	}
+	if err := r.Draw(f); err != nil {
+		t.Fatalf("Draw black: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "48;2;0;0;0") {
+		t.Errorf("cells that turned black were not painted; output=%q", out)
+	}
+	if strings.Contains(out, "\x1b[1;1H") {
+		t.Errorf("unchanged cell was repainted; output=%q", out)
+	}
+	// The changed pair is contiguous, so it is one cursor move and two glyphs.
+	if !strings.Contains(out, "\x1b[1;2H") {
+		t.Errorf("changed cells not positioned; output=%q", out)
+	}
+	if n := strings.Count(out, " "); n != 2 {
+		t.Errorf("emitted %d glyphs, want exactly the 2 changed cells: %q", n, out)
+	}
+}
+
+func TestBlackTopPixelInHalfModeIsPainted(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, 2, 1, ColorTrue, GlyphHalf)
+	f := make([]byte, 2*1*2*3)
+	for i := range f {
+		f[i] = 180
+	}
+	if err := r.Draw(f); err != nil {
+		t.Fatalf("Draw grey: %v", err)
+	}
+	buf.Reset()
+	for x := 0; x < 2; x++ { // top row black, bottom stays grey
+		f[x*3], f[x*3+1], f[x*3+2] = 0, 0, 0
+	}
+	if err := r.Draw(f); err != nil {
+		t.Fatalf("Draw black top: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "38;2;0;0;0") {
+		t.Errorf("black top pixel not emitted as foreground; output=%q", out)
+	}
+	if !strings.Contains(out, "▀") {
+		t.Errorf("half-block glyph missing; output=%q", out)
+	}
+}
+
+func TestQuant256KeepsBlacksOnTheNeutralRamp(t *testing.T) {
+	// True black maps to 232 (#080808), not the cube's 16 (#000000). That looks
+	// wrong in isolation and is deliberate: keeping every neutral on the same
+	// ramp is what stops greys picking up a colour cast on some palettes, and
+	// TestQuant256GreyRamp pins the whole ramp. Not to be "fixed" to 16 without
+	// measuring the cast it was traded against.
+	if got := quant256(0, 0, 0); got != 232 {
+		t.Errorf("quant256(0,0,0) = %d, want 232 (the ramp's black)", got)
+	}
+	if got := quant256(255, 255, 255); got != 255 {
+		t.Errorf("quant256(255,255,255) = %d, want 255", got)
+	}
+}
+
+// solidRGB builds a cols*rows rgb24 frame (one pixel per cell) of one colour.
+func solidRGB(cols, rows int, r, g, b byte) []byte {
+	f := make([]byte, cols*rows*3)
+	for i := 0; i < cols*rows; i++ {
+		f[i*3], f[i*3+1], f[i*3+2] = r, g, b
+	}
+	return f
+}
