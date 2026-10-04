@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestParseYtdlpFlatPlaylist(t *testing.T) {
@@ -1845,4 +1848,144 @@ func solidRGB(cols, rows int, r, g, b byte) []byte {
 		f[i*3], f[i*3+1], f[i*3+2] = r, g, b
 	}
 	return f
+}
+
+// The renderer's offset arithmetic, checked by replaying its output the way a
+// terminal does: maintain the current colours, apply an SGR when one appears, and
+// otherwise carry the previous colour forward. A cell whose SGR is skipped is not
+// a bug — skipping it is the whole point of the bandwidth optimisation — so the
+// check has to model that rather than counting sequences.
+//
+// ffmpeg is told scale=cols:rows*2, so the frame is INTERLEAVED: per cell row, a
+// full row of top pixels then a full row of bottom pixels. Every pixel encodes
+// its own (cell row, column) so a mis-mapped offset cannot go unnoticed.
+
+var sgrRe = regexp.MustCompile(`\x1b\[38;2;(\d+);(\d+);(\d+);48;2;(\d+);(\d+);(\d+)m`)
+
+// cell paints from the renderer output: the i-th glyph and the colour in force
+// when it was written.
+type paint struct {
+	fgR, fgG int
+	bgR, bgG int
+}
+
+// replay walks the stream, tracking cursor moves, SGR changes and glyphs, and
+// returns the colour in force for each cell in write order.
+func replay(t *testing.T, out string, cells int) []paint {
+	t.Helper()
+	res := make([]paint, 0, cells)
+	i := 0
+	var cur paint
+	have := false
+	for i < len(out) {
+		switch {
+		case out[i] == 0x1b:
+			m := sgrRe.FindStringSubmatchIndex(out[i:])
+			if m != nil {
+				g := sgrRe.FindStringSubmatch(out[i:])
+				cur.fgR, _ = strconv.Atoi(g[1])
+				cur.fgG, _ = strconv.Atoi(g[2])
+				cur.bgR, _ = strconv.Atoi(g[4])
+				cur.bgG, _ = strconv.Atoi(g[5])
+				have = true
+				i += m[1]
+				continue
+			}
+			// Any other sequence (cursor move, reset) — skip it.
+			j := i + 1
+			for j < len(out) && !(out[j] >= 0x40 && out[j] <= 0x7e) {
+				j++
+			}
+			if j < len(out) {
+				if out[j] == 'm' {
+					cur = paint{}
+				}
+				i = j + 1
+				continue
+			}
+			i = len(out)
+		case out[i] == '\r' || out[i] == '\n':
+			i++
+		case out[i] >= ' ':
+			if have {
+				res = append(res, cur)
+			}
+			// Advance by the whole rune: U+2580 is three bytes and counting bytes
+			// would report three glyphs per cell.
+			_, size := utf8.DecodeRuneInString(out[i:])
+			i += size
+		default:
+			i++
+		}
+	}
+	return res
+}
+
+func coordFrameHalf(cols, rows int) []byte {
+	f := make([]byte, cols*rows*2*3)
+	set := func(px int, r, g byte) {
+		f[px*3], f[px*3+1], f[px*3+2] = r, g, 0
+	}
+	// Interleaved, because that is what `scale=cols:rows*2` produces: frame row
+	// 2y is the top of cell row y, row 2y+1 is its bottom. Encoding it planar
+	// instead (both halves adjacent) makes consecutive cell rows overwrite each
+	// other, which looks like an off-by-N in the renderer when the test is wrong.
+	for y := 0; y < rows; y++ {
+		for x := 0; x < cols; x++ {
+			set((2*y)*cols+x, byte(10+y), byte(x))
+			set((2*y+1)*cols+x, byte(200+y), byte(x))
+		}
+	}
+	return f
+}
+
+func TestHalfBlockMapsTopAndBottomRowsCorrectly(t *testing.T) {
+	const cols, rows = 6, 4
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, cols, rows, ColorTrue, GlyphHalf)
+	if err := r.Draw(coordFrameHalf(cols, rows)); err != nil {
+		t.Fatalf("Draw: %v", err)
+	}
+	got := replay(t, buf.String(), cols*rows)
+	if len(got) != cols*rows {
+		t.Fatalf("got %d painted cells, want %d", len(got), cols*rows)
+	}
+	for i, p := range got {
+		y, x := i/cols, i%cols
+		if p.fgR != 10+y || p.fgG != x {
+			t.Errorf("cell (x=%d,y=%d) fg = %d,%d want %d,%d",
+				x, y, p.fgR, p.fgG, 10+y, x)
+		}
+		if p.bgR != 200+y || p.bgG != x {
+			t.Errorf("cell (x=%d,y=%d) bg = %d,%d want %d,%d",
+				x, y, p.bgR, p.bgG, 200+y, x)
+		}
+	}
+}
+
+func TestCellModeMapsRowsCorrectly(t *testing.T) {
+	const cols, rows = 6, 4
+	var buf bytes.Buffer
+	r := NewColorDiffRenderer(&buf, cols, rows, ColorTrue, GlyphCell)
+	f := make([]byte, cols*rows*3)
+	for y := 0; y < rows; y++ {
+		for x := 0; x < cols; x++ {
+			i := y*cols + x
+			f[i*3], f[i*3+1], f[i*3+2] = byte(10+y), byte(x), 0
+		}
+	}
+	if err := r.Draw(f); err != nil {
+		t.Fatalf("Draw: %v", err)
+	}
+	got := replay(t, buf.String(), cols*rows)
+	if len(got) != cols*rows {
+		t.Fatalf("got %d painted cells, want %d", len(got), cols*rows)
+	}
+	for i, p := range got {
+		y, x := i/cols, i%cols
+		if p.fgR != 10+y || p.fgG != x {
+			t.Errorf("cell (x=%d,y=%d) = %d,%d want %d,%d",
+				x, y, p.fgR, p.fgG, 10+y, x)
+		}
+	}
 }
