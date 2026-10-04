@@ -186,5 +186,96 @@ func (i *mpvIPC) close() {
 	}
 }
 
+// marshalCommand encodes one IPC command as a single JSON line.
+//
+// Shared by every request so the request_id handling and the newline framing
+// live in one place. The caller must not append a newline: framing is part of
+// the contract, and two call sites doing it by hand is how one of them ends up
+// concatenating two requests into one unreadable line.
+func marshalCommand(name string, args []interface{}, id int) ([]byte, error) {
+	b, err := json.Marshal(ipcRequest{
+		Command:   append([]interface{}{name}, args...),
+		RequestID: id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
+// clampVolume holds a volume to the 0-100 mpv accepts.
+func clampVolume(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+// parsePropReply checks the reply to a property command. ok=false means "this
+// line is not ours" and the caller should keep reading.
+//
+// The success trap applies here too: mpv always includes "error", set to the
+// literal string "success" when the call worked.
+func parsePropReply(line []byte, wantID int) (err error, ok bool) {
+	var rep ipcReply
+	if err := json.Unmarshal(line, &rep); err != nil {
+		return nil, false // not JSON: an event or noise, keep reading
+	}
+	if rep.RequestID != wantID {
+		return nil, false
+	}
+	if rep.Error != "" && rep.Error != "success" {
+		return fmt.Errorf("mpv: %s", rep.Error), true
+	}
+	return nil, true
+}
+
+// setProperty issues one set_property command and waits for its acknowledgement.
+//
+// Used for the transport keys that mpv owns: pause, volume, mute. Seeking the
+// video side is not one of these — that stream is an ffmpeg pipe and cannot be
+// seeked, so the caller rebuilds the process instead.
+func (i *mpvIPC) setProperty(name string, value interface{}, timeout time.Duration) error {
+	if i == nil || i.conn == nil {
+		setIpcErr("no connection")
+		return fmt.Errorf("no ipc connection")
+	}
+	i.next++
+	id := i.next
+	req, err := marshalCommand("set_property", []interface{}{name, value}, id)
+	if err != nil {
+		return err
+	}
+	if _, err := i.conn.Write(req); err != nil {
+		setIpcErr("write: %v", err)
+		return err
+	}
+	if err := i.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		setIpcErr("deadline: %v", err)
+		return err
+	}
+	for {
+		line, rerr := i.r.ReadBytes('\n')
+		if rerr != nil {
+			// A transport key is user-initiated: say so rather than pretending
+			// it worked. The drift corrector, by contrast, stays silent because
+			// a missed nudge is not worth interrupting playback for.
+			return fmt.Errorf("set %s: %w", name, rerr)
+		}
+		if perr, ok := parsePropReply(line, id); ok {
+			setIpcErr("")
+			return perr
+		}
+	}
+}
+
+// setVolume sets playback volume, 0-100.
+func (i *mpvIPC) setVolume(v int) error {
+	return i.setProperty("volume", clampVolume(v), seekTimeout)
+}
+
 // formatPos is used in log lines; kept separate so the rounding is consistent.
 func formatPos(f float64) string { return strconv.FormatFloat(f, 'f', 2, 64) }

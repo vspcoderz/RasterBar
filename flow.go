@@ -68,19 +68,26 @@ func (s *SyncPlayer) resumeChildren() {
 // Paused reports whether the children are currently suspended.
 func (s *SyncPlayer) Paused() bool { return s.paused }
 
-// awaitDrain blocks until the terminal accepts output again, or until done is
-// closed (the user quit). Returns false if we gave up.
+// awaitDrain blocks until the terminal accepts output again, or until the key
+// channel closes (the user quit, or stdin reached EOF). Returns false if we gave
+// up.
 //
-// Polled rather than parked on the fd so quit still works: while suspended,
-// nothing is reading stdin into the render loop.
-func awaitDrain(out *os.File, player *SyncPlayer, done <-chan struct{}, poll time.Duration) bool {
+// Polled rather than parked on the fd, and it consumes keys as it goes, because
+// while the children are suspended the render loop is not selecting: without
+// this the keystrokes that arrive during a stall would sit in the buffer and be
+// replayed as a burst on resume.
+func awaitDrain(out *os.File, player *SyncPlayer, keys <-chan Cmd, poll time.Duration) bool {
 	if poll <= 0 {
 		poll = 120 * time.Millisecond
 	}
 	for {
 		select {
-		case <-done:
-			return false
+		case _, ok := <-keys:
+			if !ok {
+				return false
+			}
+			// Any other keypress while suspended is dropped: acting on it now
+			// would mean seeking a decoder that is stopped.
 		default:
 		}
 		if fdWritable(out) {

@@ -29,20 +29,34 @@ const (
 	ioctlWriteTermios = 0x5402 // TCSETS
 	echoBit           = 0x00000008
 	icanonBit         = 0x00000002
+	vmin              = 6 // termios CC index
+	vtime             = 5
 )
 
 // makeRaw disables canonical mode and echo so keys arrive one at a time
 // without Enter. Returns a restore func and an error if stdin is not a TTY
 // (e.g. piped input), in which case the caller should keep line mode.
 func makeRaw(f *os.File) (func(), error) {
+	return makeRawVT(f, 1, 0)
+}
+
+// makeRawVT is makeRaw with explicit VMIN/VTIME.
+//
+// The transport keys need VTIME != 0. An arrow key arrives as three bytes
+// (ESC [ D), so the reader has to be able to ask "is there more of this
+// sequence?" and get an answer instead of blocking forever on a key the user
+// pressed alone. VMIN=0/VTIME=n returns whatever arrived, or 0 bytes after n
+// tenths of a second, which is exactly that. The browse list keeps the blocking
+// variant because it only ever wants one byte at a time.
+func makeRawVT(f *os.File, min, timeout uint8) (func(), error) {
 	var old termios
 	if err := ioctl(f.Fd(), ioctlReadTermios, unsafe.Pointer(&old)); err != nil {
 		return nil, err
 	}
 	raw := old
 	raw.Lflag &^= echoBit | icanonBit
-	raw.Cc[6] = 1 // VMIN: one byte is enough to return
-	raw.Cc[5] = 0 // VTIME: no read timeout, blocking
+	raw.Cc[vmin] = min
+	raw.Cc[vtime] = timeout
 	if err := ioctl(f.Fd(), ioctlWriteTermios, unsafe.Pointer(&raw)); err != nil {
 		return nil, err
 	}

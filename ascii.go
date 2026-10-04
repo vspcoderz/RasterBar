@@ -7,11 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
-	"runtime"
 	"strings"
-	"syscall"
-	"time"
 )
 
 // ASCII video + visualizer. No image libraries: ffmpeg emits raw grayscale
@@ -224,7 +220,7 @@ func resolveAudioURL(track Track) (string, error) {
 	return resolveURL(track, "bestaudio")
 }
 
-// resolveMediaPair returns the video and audio URLs for a track.
+// resolveMedia returns the video and audio URLs for a track, plus its duration.
 //
 // They are two SEPARATE URLs: `yt-dlp -g` never muxes, no matter what
 // --merge-output-format says -- it only simulates the merge (verified: it
@@ -236,7 +232,14 @@ func resolveAudioURL(track Track) (string, error) {
 // effectively single-use, so probing burned the grant and ffmpeg's later
 // request came back "403 Forbidden (access denied)" (verified). Reading codec
 // info from yt-dlp's own JSON touches the media URL zero times and is faster.
-func resolveMediaPair(track Track, sourceH int) (videoURL, audioURL string, err error) {
+// resolveMedia returns the video and audio URLs plus the track duration, from a
+// single yt-dlp call.
+//
+// Duration rides along in the -J response that already carries every format's
+// codec metadata, so the progress bar costs no extra request. Getting it any
+// other way would mean ffprobe against a resolved URL, and probing a
+// googlevideo URL burns its grant (see below).
+func resolveMedia(track Track, sourceH int) (mediaPair, error) {
 	h := sourceH
 	if h <= 0 {
 		h = 360
@@ -246,19 +249,26 @@ func resolveMediaPair(track Track, sourceH int) (videoURL, audioURL string, err 
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", "", fmt.Errorf("yt-dlp -J: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return mediaPair{}, fmt.Errorf("yt-dlp -J: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
 	var info ytInfo
 	if err := json.Unmarshal(out, &info); err != nil {
-		return "", "", fmt.Errorf("parse yt-dlp -J: %w", err)
+		return mediaPair{}, fmt.Errorf("parse yt-dlp -J: %w", err)
 	}
-	return pickStreams(info.Formats, h)
+	videoURL, audioURL, err := pickStreams(info.Formats, h)
+	if err != nil {
+		return mediaPair{}, err
+	}
+	return mediaPair{videoURL: videoURL, audioURL: audioURL, dur: info.Duration}, nil
 }
 
 // ytInfo is the subset of `yt-dlp -J` we need.
 type ytInfo struct {
 	Formats []ytFormat `json:"formats"`
+	// Duration in seconds, for the progress bar. Absent or zero on a live
+	// stream, which is why the HUD falls back to elapsed-only.
+	Duration float64 `json:"duration"`
 }
 
 type ytFormat struct {
@@ -452,191 +462,8 @@ func (s *ASCIIStream) Close() {
 	}
 }
 
-// runASCII plays a track as ASCII video with audio in sync.
-//
-// Sync model: a single ffmpeg process demuxes the track once and emits BOTH the
-// grayscale video frames (our stdout pipe) and the audio PCM (a FIFO mpv reads),
-// paced with -re. One process means one clock, so the frames cannot drift from
-// the music. The previous design ran mpv and ffmpeg independently and came out
-// fast-forward and out of sync.
-func runASCII(track Track, in *os.File, out *os.File, mute bool, quality Quality, aspect float64, colsOverride, rowsOverride int, mode ColorMode, glyphPref GlyphMode) error {
-	// Terminal size drives the grid. If stdout is not a TTY (piped, CI) fall
-	// back to the defaults rather than rendering nothing.
-	termCols, termRows := 0, 0
-	if c, r, err := termSize(out); err == nil {
-		termCols, termRows = c, r
-	}
-	// Explicit overrides win over detection.
-	if colsOverride > 0 {
-		termCols = colsOverride
-	}
-	if rowsOverride > 0 {
-		termRows = rowsOverride
-	}
-	restore, err := makeRaw(in)
-	if err == nil {
-		defer restore()
-	}
-	fmt.Fprint(out, "\x1b[?25l")
-	defer fmt.Fprint(out, "\x1b[?25h\x1b[2J\x1b[H")
-
-	// The grid follows the terminal; video resolution follows the grid.
-	l := computeLayout(termCols, termRows, aspect, quality)
-
-	// yt-dlp hands back separate video and audio URLs; both go into one ffmpeg
-	// so they cannot drift apart.
-	videoURL, audioURL, err := resolveMediaPair(track, l.sourceH)
-	if err != nil {
-		return fmt.Errorf("resolve media: %w", err)
-	}
-
-	// Decide the cell layout before ffmpeg starts, because the frame height
-	// depends on it. The probe asks the terminal directly: U+2580 is
-	// East Asian Ambiguous width and some terminals draw it two columns wide,
-	// which makes every row overrun and wrap (reported as ghosting/double
-	// images). Probing costs one round trip and removes the guess.
-	glyph := GlyphCell
-	if mode != ColorNone {
-		glyph = resolveGlyph(glyphPref, in, out)
-	}
-
-	player, err := startSyncPlayerAt(videoURL, audioURL, l.cols, l.rows, l.fps, mute, 0, mode, glyph)
-	if err != nil {
-		return err
-	}
-	defer player.Close()
-
-	quit := watchQuit(in)
-	audioDone := make(chan error, 1)
-	go func() { audioDone <- player.WaitAudioEnd() }()
-
-	// Buffered writer: one syscall per frame batch instead of many small ones.
-	bw := bufio.NewWriterSize(out, 32*1024)
-	renderer := newRenderer(bw, l.cols, l.rows, mode, glyph)
-
-	// Drift correction timing.
-	lastSync := time.Now()
-	const syncCheckInterval = 2 * time.Second
-
-	// Stall handling: suspend both children rather than rebuilding them.
-	//
-	// When the terminal is not being read (window covered, Hyprland workspace
-	// switch, another app focused) the tty stops accepting output. mpv writes
-	// straight to PipeWire and keeps playing regardless, so the streams drift.
-	// Stopping ffmpeg and mpv in the same instant freezes both clocks: sync is
-	// preserved exactly, nothing is respawned, and -- importantly -- nothing is
-	// written to the terminal, which is what was painting ASCII over the desktop.
-	restartAt := func(pos float64) error {
-		player.Close()
-		vURL, aURL, rerr := resolveMediaPair(track, l.sourceH)
-		if rerr != nil {
-			return rerr
-		}
-		np, rerr := startSyncPlayerAt(vURL, aURL, l.cols, l.rows, l.fps, mute, pos, mode, glyph)
-		if rerr != nil {
-			return rerr
-		}
-		player = np
-		audioDone = make(chan error, 1)
-		go func(p *SyncPlayer) { audioDone <- p.WaitAudioEnd() }(player)
-		renderer = newRenderer(bw, l.cols, l.rows, mode, glyph)
-		fmt.Fprint(bw, "\x1b[2J\x1b[H")
-		return nil
-	}
-
-	// SIGWINCH: a resize must refill the screen, not kill playback. The ffmpeg
-	// scale filter is baked into the running process, so a genuine size change
-	// means rebuilding the player. Rebuilding is only cheap if we know the
-	// current position, which ffmpeg can tell us.
-	resized := make(chan os.Signal, 1)
-	signal.Notify(resized, syscall.SIGWINCH)
-	defer signal.Stop(resized)
-
-	runtime.GC() // settle before the steady-state loop
-	for {
-		select {
-		case <-quit:
-			return nil
-		case err := <-audioDone:
-			return err
-		case <-resized:
-			// Drain: a drag can emit many SIGWINCHs.
-			for drained := false; !drained; {
-				select {
-				case <-resized:
-				default:
-					drained = true
-				}
-			}
-			c, r, err := termSize(out)
-			if err != nil || (c == l.cols && r == l.termRows) {
-				continue // spurious signal, keep playing
-			}
-			pos := player.Seconds()
-			// Rebuild at the new size, resuming from where we were. The grid
-			// changed, so the ffmpeg scale filter has to change with it.
-			l = computeLayout(c, r, aspect, quality)
-			if rerr := restartAt(pos); rerr != nil {
-				return nil
-			}
-			continue
-		default:
-		}
-		frame, err := player.Next()
-		if err != nil {
-			return nil
-		}
-		if err := renderer.Draw(frame); err != nil {
-			return nil
-		}
-		if err := bw.Flush(); err != nil {
-			return nil
-		}
-
-		// If the terminal has stopped accepting output, suspend both children
-		// and wait for it to come back. Checked after the write so the flush
-		// above is what fills the buffer, not the poll.
-		if !fdWritable(out) {
-			player.pauseChildren()
-			if !awaitDrain(out, player, quit, 120*time.Millisecond) {
-				player.resumeChildren()
-				return nil
-			}
-			player.resumeChildren()
-			// The terminal may have been repainted while we were suspended, and
-			// our diff buffer no longer matches what is on screen.
-			renderer.ForceNext()
-			if err := bw.Flush(); err != nil {
-				return nil
-			}
-			// Time passed while suspended, so re-sync before showing more.
-			lastSync = time.Time{}
-		}
-
-		// Drift correction. Sampled periodically rather than every frame: an IPC
-		// round trip per frame is wasteful, and drift develops slowly.
-		if time.Since(lastSync) > syncCheckInterval {
-			lastSync = time.Now()
-			rep, corrected := player.checkSync()
-			if debugSync {
-				tag := "ok"
-				if corrected {
-					tag = "CORRECTED"
-				} else if player.ipc == nil {
-					tag = "no-ipc"
-				} else if e := ipcLastErr(); e != "" {
-					tag = "ERR:" + e
-				}
-				fmt.Fprintf(os.Stderr,
-					"\rsync: video %s audio %s drift %+.3fs %s      ",
-					formatPos(rep.VideoPos), formatPos(rep.AudioPos), rep.Drift, tag)
-			}
-		}
-	}
-}
-
-// newRenderer picks the mono or colour renderer. Both satisfy FrameRenderer so
-// runASCII does not care which is active.
+// newRenderer picks the mono or colour renderer. Both satisfy FrameRenderer, so
+// the render loop does not care which is active.
 func newRenderer(w io.Writer, cols, rows int, mode ColorMode, glyph GlyphMode) FrameRenderer {
 	if mode == ColorNone {
 		return NewDiffRenderer(w, cols, rows)

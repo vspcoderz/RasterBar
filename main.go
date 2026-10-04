@@ -43,8 +43,15 @@ keys (browse):
   a                play ASCII video
   q                quit
 
-keys (playback):
-  q / ctrl-c       stop and exit
+keys (ascii playback):
+  space            pause / resume
+  left / right     seek -10s / +10s
+  n / p            next / previous result
+  + / -            volume up / down
+  q / ctrl-c       quit
+
+  When a track finishes the next result starts on its own; playback stops at the
+  end of the list.
 
 tuned for low-end machines: ASCII mode requests a 360p h264 source because
 ffmpeg decode cost scales with resolution, and an 80x22 character grid cannot
@@ -199,11 +206,7 @@ func main() {
 	}
 
 	if wantASCII {
-		fmt.Fprintf(os.Stderr, "ascii: %s — %s\n", track.Title, track.ChannelText())
-		if err := runASCII(track, os.Stdin, os.Stdout, opts.mute, opts.quality, opts.aspect, opts.cols, opts.rows, colorMode, opts.glyph); err != nil {
-			fmt.Fprintf(os.Stderr, "ascii playback failed: %v\n", err)
-			os.Exit(1)
-		}
+		playQueue(opts, colorMode, tracks, idx)
 		return
 	}
 
@@ -216,6 +219,61 @@ func main() {
 	if err := runVisualAudio(track, os.Stdin, os.Stdout, audioURL, opts.mute); err != nil {
 		fmt.Fprintf(os.Stderr, "playback failed: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// playQueue plays the selected result and then keeps going through the rest of
+// the search results.
+//
+// This is what makes it a queue rather than a single track: a search returns ten
+// results and previously one was played and the process exited, throwing the
+// other nine away. Stopping at the end of the list is deliberate — wrapping back
+// to the top of a search result set is disorienting, and nothing in a search
+// result is ordered as a playlist.
+//
+// Navigation keys (n/p) return an outcome rather than changing the queue here, so
+// the loop stays the single owner of the index.
+func playQueue(opts options, mode ColorMode, tracks []Track, index int) {
+	po := playOpts{
+		in:        os.Stdin,
+		out:       os.Stdout,
+		mute:      opts.mute,
+		quality:   opts.quality,
+		aspect:    opts.aspect,
+		cols:      opts.cols,
+		rows:      opts.rows,
+		mode:      mode,
+		glyphPref: opts.glyph,
+	}
+	if po.aspect <= 0 {
+		po.aspect = defaultAspect
+	}
+
+	// One key reader for the whole queue. Starting one per track left the
+	// previous goroutine blocked in Read after a queue advance, and the two then
+	// raced for stdin — which showed up as the quit key doing nothing.
+	keys := make(chan Cmd, 16)
+	go readKeys(po.in, keys)
+	po.keys = keys
+
+	for index >= 0 && index < len(tracks) {
+		fmt.Fprintf(os.Stderr, "playing %d/%d: %s — %s\n",
+			index+1, len(tracks), tracks[index].Title, tracks[index].ChannelText())
+
+		outcome := playTrack(po, tracks, index)
+		switch outcome {
+		case OutcomeQuit, OutcomeError:
+			return
+		case OutcomeEnded:
+			// End of the queue.
+			return
+		case OutcomeNext:
+			index++
+		case OutcomePrev:
+			index--
+		default:
+			return
+		}
 	}
 }
 

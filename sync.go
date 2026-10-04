@@ -48,6 +48,7 @@ type SyncPlayer struct {
 	cols      int
 	rows      int
 	fps       int
+	startAt   float64 // media offset this player was rebuilt at
 }
 
 // startSyncPlayer plays video (ffmpeg, -re paced) and audio (mpv) with a shared
@@ -101,26 +102,29 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 		frameBytes = cols * outRows * 3
 	}
 
-	// One ffmpeg, ONE output: the grayscale frames on our stdout pipe.
+	// One ffmpeg, ONE output: the video frames on our stdout pipe.
 	//
 	// Writing audio from this same process deadlocks: ffmpeg blocks on the
 	// second output while the first pipe is blocked waiting for us, and nothing
 	// ever arrives (verified: 0 bytes). Audio therefore belongs to mpv, which
 	// gets its own URL. Sync comes from --start below, not from one process.
+	//
+	// The audio URL is deliberately NOT passed to ffmpeg as an input. It is
+	// never mapped or decoded here, but ffmpeg still opens it at startup, and a
+	// googlevideo URL is effectively single-use: opening it twice spends the
+	// grant and mpv's own request comes back "403 Forbidden (access denied)".
+	// That is exactly how it failed — ffmpeg held the only good copy of the
+	// audio stream and threw it away. One input, one consumer.
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostdin",
 	}
 	if startAt > 0 {
-		// Fast seek on both inputs so video and audio resume at the same media
-		// position after a resize.
-		ss := fmt.Sprintf("%.3f", startAt)
-		args = append(args, "-ss", ss, "-re", "-i", videoURL, "-ss", ss, "-i", audioURL)
-	} else {
-		args = append(args,
-			"-re", // pace to native frame rate; without it ASCII races ahead
-			"-i", videoURL)
-		args = append(args, "-i", audioURL)
+		// Fast seek on the video input; mpv gets the same offset via --start.
+		args = append(args, "-ss", fmt.Sprintf("%.3f", startAt))
 	}
+	args = append(args,
+		"-re", // pace to native frame rate; without it ASCII races ahead
+		"-i", videoURL)
 	args = append(args,
 		"-map", "0:v:0",
 		"-vf", filter,
@@ -154,7 +158,15 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 	if mute {
 		mpvArgs = append(mpvArgs, "--mute=yes")
 	}
-	mpvArgs = append(mpvArgs, "--input-ipc-server="+sockPath, "--idle=yes", audioURL)
+	// --idle is deliberately NOT set.
+	//
+	// mpv --idle=yes survives the end of a file and waits for another one, so it
+	// never exits, so the mpv process never signals that a track ended. The old
+	// render loop got away with it because ffmpeg's EOF ended playback instead,
+	// but a player that listens for the audio ending in order to advance a queue
+	// then hangs on the last frame of every track. Track end has to be
+	// observable, so mpv has to exit.
+	mpvArgs = append(mpvArgs, "--input-ipc-server="+sockPath, audioURL)
 	audio := exec.Command("mpv", mpvArgs...)
 	audio.Stdout = io.Discard
 	audio.Stderr = os.Stderr
@@ -184,18 +196,25 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 		cols:      cols,
 		rows:      rows,
 		fps:       fps,
+		startAt:   startAt,
 	}, nil
 }
 
 // Seconds reports the media position reached so far, tracked from the frame
 // count. Because ffmpeg is paced by -re at native frame rate, frames rendered
 // divided by fps is an accurate position -- no probing needed, which matters
-// because probing a googlevideo URL burns it (see resolveMediaPair).
+// because probing a googlevideo URL burns it (see resolveMedia).
+//
+// startAt is added because a rebuilt player starts decoding mid-stream at
+// -ss <startAt>: its frame counter begins at zero while the media it is
+// decoding is at 300s. Without the offset this reported 0, checkSync read that
+// as 300s of drift against mpv, and seeked the audio back to the beginning --
+// so every terminal resize rewound the track. The same applied to every seek.
 func (s *SyncPlayer) Seconds() float64 {
 	if s.fps <= 0 {
-		return 0
+		return s.startAt
 	}
-	return float64(s.frames) / float64(s.fps)
+	return s.startAt + float64(s.frames)/float64(s.fps)
 }
 
 // SyncReport describes one drift measurement.
@@ -275,14 +294,6 @@ func (s *SyncPlayer) Next() ([]byte, error) {
 	}
 	s.frames++
 	return s.frame, nil
-}
-
-// WaitAudioEnd blocks until mpv finishes, i.e. the track ended.
-func (s *SyncPlayer) WaitAudioEnd() error {
-	if s.audio == nil {
-		return nil
-	}
-	return s.audio.Wait()
 }
 
 func (s *SyncPlayer) Close() {

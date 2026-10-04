@@ -78,7 +78,23 @@ go build -ldflags="-s -w" -o vspz-yt-cli .
 **Browse:** `j`/`k`/arrows move · `g`/`G` top/bottom · `1`-`9` jump · `enter` play
 audio · `a` ASCII video · `q` quit
 
-**Playback:** `q` or `ctrl-c` stop
+**ASCII playback:**
+
+| Key | Action |
+|---|---|
+| `space` | pause / resume |
+| `←` `→` | seek -10s / +10s |
+| `n` `p` | next / previous result |
+| `+` `-` | volume up / down |
+| `q` `ctrl-c` | quit |
+
+A track that finishes starts the next result on its own, so a search is a
+playlist for as long as you want it. Playback stops at the end of the list
+rather than wrapping — nothing in a search result set is ordered like a
+playlist.
+
+The bar shows position and duration; the top line shows the track and its
+`04/19` place in the queue.
 
 ## Design notes
 
@@ -124,6 +140,11 @@ debugging session (0 frames visible).
 
 ## Known limitations
 
+- **Transport keys are ASCII-only.** The spectrum/audio view still plays one
+  track and exits; no pause, seek, or queue advance there.
+- **Seek rebuilds both processes**, so it costs a frame or two of latency. Media
+  URLs are resolved once per track and reused across seeks; they are re-resolved
+  only if ffmpeg rejects one.
 - ASCII is luminance-only: colour is lost, and dark or low-contrast video
   renders mostly blank. (`--mono` is the fallback path; colour is default.)
 - The half-block glyph `▀` is East Asian Ambiguous width, so a terminal that

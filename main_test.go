@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"os"
 	"strings"
@@ -1110,5 +1111,635 @@ func TestLastURL(t *testing.T) {
 	}
 	if got := lastURL("https://only.example.com/x\n"); got != "https://only.example.com/x" {
 		t.Errorf("single url = %q", got)
+	}
+}
+
+// --- HUD (S2) ---------------------------------------------------------------
+//
+// The clock delegates to formatDuration, which the browse list already uses, so
+// a duration reads identically in the list and on the progress bar.
+
+func TestFormatClockUsesTUIShape(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{0, "0:00"},
+		{83, "1:23"},
+		{83.4, "1:23"},
+		{3723, "1:02:03"},
+		{-5, "0:00"}, // a negative position is meaningless; show zero
+	}
+	for _, c := range cases {
+		if got := formatClock(c.in); got != c.want {
+			t.Errorf("formatClock(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestProgressBarFillsProportionally(t *testing.T) {
+	cases := []struct {
+		pos, dur float64
+		width    int
+		want     string
+	}{
+		{0, 100, 10, "──────────"},
+		{100, 100, 10, "━━━━━━━━━━"},
+		{50, 100, 10, "━━━━━─────"},
+		{25, 100, 10, "━━────────"}, // floor, not round
+	}
+	for _, c := range cases {
+		got := progressBar(c.pos, c.dur, c.width)
+		if got != c.want {
+			t.Errorf("progressBar(%v,%v,%d) = %q, want %q", c.pos, c.dur, c.width, got, c.want)
+		}
+	}
+}
+
+func TestProgressBarClampsOutOfRange(t *testing.T) {
+	// A position past the end (drift, or a bad duration) must not overflow the
+	// bar: the line has a fixed cell budget and would wrap.
+	if got := progressBar(150, 100, 4); got != "━━━━" {
+		t.Errorf("pos>dur = %q, want full bar", got)
+	}
+	if got := progressBar(-5, 100, 4); got != "────" {
+		t.Errorf("negative pos = %q, want empty bar", got)
+	}
+}
+
+func TestProgressBarWidthIsExact(t *testing.T) {
+	for _, width := range []int{1, 3, 20, 80} {
+		got := progressBar(37, 90, width)
+		if n := len([]rune(got)); n != width {
+			t.Errorf("progressBar width %d produced %d cells: %q", width, n, got)
+		}
+	}
+}
+
+func TestProgressBarNoDurationDrawsNothing(t *testing.T) {
+	// Live streams have no duration. An empty string is what makes the caller
+	// fall back to elapsed-only instead of painting a permanently empty bar.
+	if got := progressBar(30, 0, 10); got != "" {
+		t.Errorf("dur=0 = %q, want empty", got)
+	}
+	if got := progressBar(30, 90, 0); got != "" {
+		t.Errorf("width=0 = %q, want empty", got)
+	}
+}
+
+func TestHUDRowsAreExactlyWidth(t *testing.T) {
+	// Every row must fill the line. A short row leaves the tail of the previous,
+	// longer row on screen, because both renderers diff against what they last
+	// painted and nothing clears the remainder.
+	for _, width := range []int{20, 40, 80, 120} {
+		h := hud{title: "Lofi Girl - 1 A.M. Study Session", pos: 83, dur: 3674, volume: 80}
+		for i, row := range h.lines(width) {
+			if n := len([]rune(row)); n != width {
+				t.Errorf("width %d row %d = %d cells: %q", width, i, n, row)
+			}
+		}
+	}
+}
+
+func TestHUDShowsBarAndClock(t *testing.T) {
+	rows := hud{title: "T", pos: 50, dur: 100}.lines(40)
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	// 40 - (len("0:50 / 1:40") + 2) = 27 bar cells, half filled, then "  0:50 / 1:40".
+	if !strings.Contains(rows[1], "0:50 / 1:40") {
+		t.Errorf("row 1 = %q, want the clock", rows[1])
+	}
+	bar := strings.TrimRight(strings.SplitN(rows[1], "  0", 2)[0], " ")
+	if got := len([]rune(bar)); got != 27 {
+		t.Errorf("bar = %d cells (%q), want 27", got, bar)
+	}
+	if strings.Count(bar, barFilled) != 13 { // floor(0.5 * 27)
+		t.Errorf("bar filled = %d cells, want 13", strings.Count(bar, barFilled))
+	}
+}
+
+func TestHUDLiveStreamHasNoBar(t *testing.T) {
+	// A live stream has no duration, so there is no progress to show. The row
+	// falls back to elapsed only rather than a bar stuck at zero.
+	rows := hud{title: "T", pos: 30, dur: 0}.lines(40)
+	if strings.ContainsRune(rows[1], '━') || strings.ContainsRune(rows[1], '─') {
+		t.Errorf("row 1 = %q, want no bar glyphs for unknown duration", rows[1])
+	}
+	if !strings.Contains(rows[1], "0:30") {
+		t.Errorf("row 1 = %q, want elapsed clock", rows[1])
+	}
+}
+
+func TestHUDQueueCounterAndPausedHints(t *testing.T) {
+	rows := hud{title: "T", pos: 0, dur: 10, queue: 3, total: 12, paused: true}.lines(60)
+	if !strings.HasPrefix(rows[0], "03/12") {
+		t.Errorf("row 0 = %q, want the 03/12 queue counter", rows[0])
+	}
+	if !strings.HasPrefix(rows[2], "PAUSED") {
+		t.Errorf("row 2 = %q, want pause hints", rows[2])
+	}
+}
+
+func TestHUDSingleTrackHasNoQueueCounter(t *testing.T) {
+	// One track is not a queue. A "1/1" prefix is noise.
+	rows := hud{title: "T", pos: 0, dur: 10, queue: 1, total: 1}.lines(60)
+	if strings.HasPrefix(rows[0], "01/01") {
+		t.Errorf("row 0 = %q, want no queue counter for a single track", rows[0])
+	}
+}
+
+func TestHUDSurvivesATinyTerminal(t *testing.T) {
+	// Below the bar's minimum the clock still has to render. An empty or
+	// panicking HUD on a 20-column window is worse than no bar.
+	for _, width := range []int{1, 8, 12} {
+		rows := hud{title: "Long Title Here", pos: 83, dur: 3674, volume: 100}.lines(width)
+		if len(rows) != 3 {
+			t.Fatalf("width %d: got %d rows, want 3", width, len(rows))
+		}
+	}
+}
+
+// --- Transport state machine (S1) -------------------------------------------
+//
+// The player is tested against a fake media backend, so every case here runs
+// with no ffmpeg, no mpv and no network. These are transport semantics — the
+// rules a user feels — not process plumbing.
+
+type fakeMedia struct {
+	pos      float64
+	dur      float64
+	paused   bool
+	volume   int
+	seeks    []float64
+	closed   bool
+	pauseErr error
+}
+
+func (f *fakeMedia) Position() float64 { return f.pos }
+func (f *fakeMedia) Duration() float64 { return f.dur }
+func (f *fakeMedia) SetPaused(p bool) error {
+	f.paused = p
+	return f.pauseErr
+}
+func (f *fakeMedia) Seek(sec float64) error {
+	f.seeks = append(f.seeks, sec)
+	f.pos = sec
+	return nil
+}
+func (f *fakeMedia) SetVolume(v int) error { f.volume = v; return nil }
+func (f *fakeMedia) Close() error          { f.closed = true; return nil }
+
+func newTestPlayer(m *fakeMedia, queue ...Track) *Player {
+	return NewPlayer(queue, m)
+}
+
+func TestPlayerSeekClampsToTrack(t *testing.T) {
+	m := &fakeMedia{dur: 100}
+	p := newTestPlayer(m, Track{ID: "a"})
+
+	p.Tick(90)
+	p.Do(CmdSeekFwd) // +10 would be 100 exactly
+	if got := p.State().Pos; got != 100 {
+		t.Errorf("seek to end = %v, want 100", got)
+	}
+	p.Do(CmdSeekFwd) // past the end must clamp, not wrap or overflow
+	if got := p.State().Pos; got != 100 {
+		t.Errorf("seek past end = %v, want 100", got)
+	}
+	// 100 back to 0 is 10 presses; one more must clamp rather than go negative.
+	for i := 0; i < 11; i++ {
+		p.Do(CmdSeekBack)
+	}
+	if got := p.State().Pos; got != 0 {
+		t.Errorf("seek before start = %v, want 0", got)
+	}
+	if len(m.seeks) == 0 {
+		t.Error("media was never told to seek")
+	}
+}
+
+func TestPlayerPauseSurvivesSeek(t *testing.T) {
+	// The bug this pins: a seek rebuilds ffmpeg, and a naive implementation
+	// leaves the player thinking it is playing while nothing is moving. Pause
+	// must be a state, not a side effect of a signal.
+	m := &fakeMedia{dur: 100}
+	p := newTestPlayer(m, Track{ID: "a"})
+
+	p.Do(CmdTogglePause)
+	p.Do(CmdSeekFwd)
+	if !p.State().Paused {
+		t.Error("seek while paused left the player playing")
+	}
+	p.Do(CmdSeekFwd)
+	if !p.State().Paused {
+		t.Error("second seek while paused left the player playing")
+	}
+	p.Do(CmdTogglePause)
+	if p.State().Paused {
+		t.Error("toggle did not resume")
+	}
+}
+
+func TestPlayerPauseReachesMedia(t *testing.T) {
+	m := &fakeMedia{dur: 100}
+	p := newTestPlayer(m, Track{ID: "a"})
+	p.Do(CmdTogglePause)
+	if !m.paused {
+		t.Error("media was not paused")
+	}
+	p.Do(CmdTogglePause)
+	if m.paused {
+		t.Error("media was not resumed")
+	}
+}
+
+func TestPlayerVolumeClamps(t *testing.T) {
+	m := &fakeMedia{}
+	p := newTestPlayer(m, Track{ID: "a"})
+	p.Do(CmdVolUp) // from 100 default
+	p.Do(CmdVolUp)
+	if got := p.State().Volume; got != 100 {
+		t.Errorf("vol up at max = %d, want 100", got)
+	}
+	for i := 0; i < 40; i++ {
+		p.Do(CmdVolDown)
+	}
+	if got := p.State().Volume; got != 0 {
+		t.Errorf("vol down past min = %d, want 0", got)
+	}
+	if m.volume != 0 {
+		t.Errorf("media volume = %d, want 0", m.volume)
+	}
+}
+
+func TestPlayerNextAdvancesQueue(t *testing.T) {
+	m := &fakeMedia{}
+	q := []Track{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	p := newTestPlayer(m, q...)
+
+	p.Do(CmdNext)
+	if got := p.State().Index; got != 1 {
+		t.Errorf("index = %d, want 1", got)
+	}
+	if got := p.State().Outcome; got != OutcomeNext {
+		t.Errorf("outcome = %v, want OutcomeNext", got)
+	}
+}
+
+func TestPlayerNextOnLastTrackEnds(t *testing.T) {
+	// There is nothing after the last result. Stopping is the honest answer;
+	// wrapping or silently doing nothing both read as a broken key.
+	m := &fakeMedia{}
+	q := []Track{{ID: "a"}, {ID: "b"}}
+	p := newTestPlayer(m, q...)
+	p.Do(CmdNext) // -> index 1, the last track
+	p.Do(CmdNext)
+	if got := p.State().Outcome; got != OutcomeEnded {
+		t.Errorf("outcome = %v, want OutcomeEnded", got)
+	}
+}
+
+func TestPlayerPrevStepsBackAndRestartsAtStart(t *testing.T) {
+	m := &fakeMedia{dur: 100}
+	q := []Track{{ID: "a"}, {ID: "b"}}
+	p := newTestPlayer(m, q...)
+
+	p.Do(CmdNext) // index 1
+	p.Do(CmdPrev)
+	if got := p.State().Index; got != 0 {
+		t.Errorf("prev index = %d, want 0", got)
+	}
+	// Already on the first track: prev restarts it rather than doing nothing,
+	// which is what every other player does.
+	p.Tick(42)
+	p.Do(CmdPrev)
+	if got := p.State().Index; got != 0 {
+		t.Errorf("prev at first track moved to index %d, want 0", got)
+	}
+	if got := p.State().Pos; got != 0 {
+		t.Errorf("prev at first track = %v, want a restart to 0", got)
+	}
+}
+
+func TestPlayerQuitStops(t *testing.T) {
+	p := newTestPlayer(&fakeMedia{}, Track{ID: "a"})
+	p.Do(CmdQuit)
+	if got := p.State().Outcome; got != OutcomeQuit {
+		t.Errorf("outcome = %v, want OutcomeQuit", got)
+	}
+}
+
+func TestPlayerExposesDurationForHUD(t *testing.T) {
+	// The progress bar needs the duration, and the media backend is the only
+	// thing that knows it.
+	p := newTestPlayer(&fakeMedia{dur: 3674}, Track{ID: "a"})
+	if got := p.State().Dur; got != 3674 {
+		t.Errorf("dur = %v, want 3674", got)
+	}
+}
+
+// Seconds must include the resume offset. A player rebuilt at -ss 300 reports
+// media time 300, not 0 — and getting this wrong made every terminal resize
+// rewind the audio to the start, because checkSync read a 300s "drift" and
+// seeked mpv back onto the (wrongly believed) video position.
+func TestSyncPlayerSecondsIncludesResumeOffset(t *testing.T) {
+	resumed := &SyncPlayer{frames: 30, fps: 10, startAt: 300}
+	if got := resumed.Seconds(); got != 303 {
+		t.Errorf("resumed Seconds() = %v, want 303", got)
+	}
+	fresh := &SyncPlayer{frames: 30, fps: 10}
+	if got := fresh.Seconds(); got != 3 {
+		t.Errorf("fresh Seconds() = %v, want 3", got)
+	}
+}
+
+func TestPlayerTickFollowsMediaClock(t *testing.T) {
+	// The media clock is authoritative: position is reported, not predicted.
+	p := newTestPlayer(&fakeMedia{dur: 100}, Track{ID: "a"})
+	p.Tick(42)
+	if got := p.State().Pos; got != 42 {
+		t.Errorf("pos = %v, want 42", got)
+	}
+}
+
+func TestPlayerTickIsNotConfusedBySeek(t *testing.T) {
+	// Frames decoded before a seek cannot arrive after it, because a seek
+	// replaces the decoder and its channel outright rather than sharing them.
+	// The player therefore takes the clock at face value — and the real
+	// guarantee is that SyncPlayer.Seconds() counts from the seek target.
+	p := newTestPlayer(&fakeMedia{dur: 100}, Track{ID: "a"})
+	p.Do(CmdSeekFwd) // seek to 10 from 0
+	p.Tick(10 + 3)   // first tick after the rebuilt decoder starts
+	if got := p.State().Pos; got != 13 {
+		t.Errorf("pos = %v, want 13", got)
+	}
+}
+
+// --- mpv IPC properties (S4) -----------------------------------------------
+
+func TestParsePropReplyAcceptsSuccess(t *testing.T) {
+	// Same trap as parseTimePosReply: mpv sets "error":"success" on a GOOD
+	// reply, so rejecting any non-empty error field rejects every working call.
+	err, ok := parsePropReply([]byte(`{"data":null,"error":"success","request_id":7}`), 7)
+	if !ok {
+		t.Fatal("success reply was not recognised as ours")
+	}
+	if err != nil {
+		t.Errorf("success reply rejected: %v", err)
+	}
+}
+
+func TestParsePropReplyReportsFailure(t *testing.T) {
+	err, ok := parsePropReply([]byte(`{"error":"property not found","request_id":7}`), 7)
+	if !ok {
+		t.Fatal("failure was not recognised as our reply")
+	}
+	if err == nil {
+		t.Fatal("failing reply accepted")
+	}
+	if !strings.Contains(err.Error(), "property not found") {
+		t.Errorf("error = %v, want mpv's reason", err)
+	}
+}
+
+func TestParsePropReplyIgnoresOtherIDs(t *testing.T) {
+	// Events and replies to earlier requests share the socket; only ours counts.
+	if _, ok := parsePropReply([]byte(`{"error":"success","request_id":8}`), 7); ok {
+		t.Error("reply for another request treated as ours")
+	}
+	if _, ok := parsePropReply([]byte(`{"event":"playback-restart"}`), 7); ok {
+		t.Error("event treated as a reply")
+	}
+}
+
+func TestPropertyRequestEncodesNameAndValue(t *testing.T) {
+	// Pause and volume are one property each. A malformed command here fails
+	// silently at runtime, so the encoding is worth pinning.
+	b, err := marshalCommand("set_property", []interface{}{"volume", 40}, 3)
+	if err != nil {
+		t.Fatalf("marshalCommand: %v", err)
+	}
+	// Trailing newline included: the newline is the frame delimiter, so a caller
+	// that forgot it would leave mpv waiting for the rest of the line.
+	want := "{\"command\":[\"set_property\",\"volume\",40],\"request_id\":3}\n"
+	if string(b) != want {
+		t.Errorf("request = %s, want %s", b, want)
+	}
+}
+
+func TestVolumeCommandClampsBeforeSending(t *testing.T) {
+	// mpv accepts 0-100 for volume. Sending 120 is rejected at the socket with an
+	// opaque error, so the clamp belongs on our side of it.
+	if got := clampVolume(140); got != 100 {
+		t.Errorf("clampVolume(140) = %d, want 100", got)
+	}
+	if got := clampVolume(-4); got != 0 {
+		t.Errorf("clampVolume(-4) = %d, want 0", got)
+	}
+	if got := clampVolume(65); got != 65 {
+		t.Errorf("clampVolume(65) = %d, want 65", got)
+	}
+}
+
+// --- Key decoding -----------------------------------------------------------
+//
+// Pure function so escape sequences can be tested without a terminal. Arrows
+// arrive as ESC [ <final>, which is the only multi-byte sequence handled.
+
+func TestDecodeKeysMapsTransportKeys(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []Cmd
+	}{
+		{" ", []Cmd{CmdTogglePause}},
+		{"q", []Cmd{CmdQuit}},
+		{"Q", []Cmd{CmdQuit}},
+		{"\x03", []Cmd{CmdQuit}}, // ctrl-c, still delivered as a byte in raw mode
+		{"n", []Cmd{CmdNext}},
+		{"p", []Cmd{CmdPrev}},
+		{"+", []Cmd{CmdVolUp}},
+		{"=", []Cmd{CmdVolUp}}, // the unshifted key on most layouts
+		{"-", []Cmd{CmdVolDown}},
+		{"_", []Cmd{CmdVolDown}},
+	}
+	for _, c := range cases {
+		got := decodeKeys([]byte(c.in))
+		if len(got) != len(c.want) || (len(got) == 1 && got[0] != c.want[0]) {
+			t.Errorf("decodeKeys(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDecodeKeysArrows(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Cmd
+	}{
+		{"\x1b[C", CmdSeekFwd},  // right
+		{"\x1b[D", CmdSeekBack}, // left
+		{"\x1b[D", CmdSeekBack},
+		{"\x1b[A", CmdNone}, // up: not a transport key
+		{"\x1b[B", CmdNone}, // down
+	}
+	for _, c := range cases {
+		got := decodeKeys([]byte(c.in))
+		if len(got) != 1 || got[0] != c.want {
+			t.Errorf("decodeKeys(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDecodeKeysHandlesBursts(t *testing.T) {
+	// Held arrow key: the terminal sends the sequence repeatedly, and several
+	// can land in one read. All of them must be queued, not just the first.
+	got := decodeKeys([]byte("\x1b[C\x1b[C\x1b[C"))
+	if len(got) != 3 {
+		t.Fatalf("burst produced %v, want 3 seeks", got)
+	}
+	for i, c := range got {
+		if c != CmdSeekFwd {
+			t.Errorf("cmd %d = %v, want CmdSeekFwd", i, c)
+		}
+	}
+}
+
+func TestDecodeKeysIgnoresUnknownBytes(t *testing.T) {
+	// A mouse report, a bracketed-paste marker, a function key: all arrive as
+	// bytes we do not handle. They must be swallowed, not turned into seeks.
+	for _, in := range []string{"\x1b[200~", "\x1bOP", "z", "\x00", "\x1b"} {
+		for _, c := range decodeKeys([]byte(in)) {
+			if c != CmdNone {
+				t.Errorf("decodeKeys(%q) produced %v, want CmdNone only", in, c)
+			}
+		}
+	}
+}
+
+func TestDecodeStreamKeepsIncompleteSequences(t *testing.T) {
+	// The bug this pins: a terminal can split ESC [ C across reads. Decoding each
+	// read independently threw the arrow away, so seek did nothing and it looked
+	// like keys were not being delivered at all.
+	cmds, used := decodeStream([]byte("\x1b"))
+	if len(cmds) != 0 || used != 0 {
+		t.Errorf("lone ESC consumed %d bytes -> %v, want it held", used, cmds)
+	}
+	cmds, used = decodeStream([]byte("\x1b["))
+	if len(cmds) != 0 || used != 0 {
+		t.Errorf("ESC [ consumed %d bytes -> %v, want it held", used, cmds)
+	}
+	// The rest arrives: now the sequence completes.
+	cmds, used = decodeStream([]byte("\x1b[C"))
+	if len(cmds) != 1 || cmds[0] != CmdSeekFwd {
+		t.Errorf("completed split = %v, want CmdSeekFwd", cmds)
+	}
+	if used != 3 {
+		t.Errorf("consumed %d bytes, want 3", used)
+	}
+}
+
+func TestDecodeStreamHandlesPartialThenMore(t *testing.T) {
+	// A real burst: keys before the sequence, the sequence itself, keys after.
+	pending := []byte("n\x1b[D ")
+	cmds, used := decodeStream(pending)
+	want := []Cmd{CmdNext, CmdSeekBack, CmdTogglePause}
+	if len(cmds) != len(want) {
+		t.Fatalf("got %v, want %v", cmds, want)
+	}
+	for i := range want {
+		if cmds[i] != want[i] {
+			t.Errorf("cmd %d = %v, want %v", i, cmds[i], want[i])
+		}
+	}
+	if used != len(pending) {
+		t.Errorf("consumed %d of %d bytes", used, len(pending))
+	}
+}
+
+func TestDecodeStreamDropsEscapeNotFollowedByBracket(t *testing.T) {
+	// ESC then a normal key: the ESC is not a sequence, so it is discarded and
+	// the key after it still works. Holding it would swallow the key.
+	cmds, used := decodeStream([]byte("\x1bq"))
+	if len(cmds) != 1 || cmds[0] != CmdQuit {
+		t.Errorf("got %v, want CmdQuit", cmds)
+	}
+	if used != 2 {
+		t.Errorf("consumed %d bytes, want 2", used)
+	}
+}
+
+func TestPlayerRecordsTransportFailures(t *testing.T) {
+	// A keypress the user just made must not fail silently: a seek that did not
+	// happen or a volume change mpv rejected both read as a broken program.
+	m := &fakeMedia{dur: 100, pauseErr: fmt.Errorf("mpv: property not found")}
+	p := newTestPlayer(m, Track{ID: "a"})
+	p.Do(CmdTogglePause)
+	err := p.State().LastErr
+	if err == nil {
+		t.Fatal("failing pause was swallowed")
+	}
+	if !strings.Contains(err.Error(), "property not found") {
+		t.Errorf("error = %v, want mpv's reason", err)
+	}
+	p.ClearErr()
+	if p.State().LastErr != nil {
+		t.Error("ClearErr did not clear the error")
+	}
+}
+
+func TestHUDRowWidthHoldsWithUnknownDuration(t *testing.T) {
+	// The bar row skips fit(), so its width has to come out of the arithmetic.
+	// Checked for the unknown-duration case (no bar at all) and for an hour-plus
+	// clock, where the timestamp is two characters wider than at the start.
+	for _, width := range []int{20, 40, 80} {
+		for _, dur := range []float64{0, 12, 3674, 36000, 45296} {
+			rows := hud{title: "Title", pos: 3, dur: dur, showHints: true}.lines(width)
+			for i, row := range rows {
+				if n := len([]rune(row)); n != width {
+					t.Errorf("width %d dur %v: row %d = %d cells: %q",
+						width, dur, i, n, row)
+				}
+			}
+		}
+	}
+}
+
+func TestHUDFooterShowsMutedNotVolume(t *testing.T) {
+	// Under -m the volume is not in effect, so printing "vol 100%" is a lie.
+	rows := hud{title: "T", pos: 0, dur: 10, volume: 100, muted: true, showHints: true}.lines(60)
+	if !strings.Contains(rows[2], "muted") {
+		t.Errorf("row 2 = %q, want the muted label", rows[2])
+	}
+	if strings.Contains(rows[2], "100%") {
+		t.Errorf("row 2 = %q, must not claim a volume while muted", rows[2])
+	}
+}
+
+func TestHUDFooterShowsVolumeAfterChange(t *testing.T) {
+	rows := hud{title: "T", pos: 0, dur: 10, volume: 40, showHints: true}.lines(60)
+	if !strings.Contains(rows[2], "40%") {
+		t.Errorf("row 2 = %q, want the volume", rows[2])
+	}
+}
+
+func TestHUDFooterFadesHints(t *testing.T) {
+	// A permanent hint row is furniture the eye learns to skip.
+	faded := hud{title: "T", pos: 0, dur: 10, volume: 100, showHints: false}.lines(60)
+	if strings.TrimSpace(faded[2]) != "" {
+		t.Errorf("row 2 = %q, want it empty once hints have faded", faded[2])
+	}
+	// Paused is exempt: a banner that vanishes on its own is worse than one that
+	// stays, because it is the only thing telling you playback is stopped.
+	paused := hud{title: "T", pos: 0, dur: 10, paused: true, showHints: false}.lines(60)
+	if !strings.HasPrefix(paused[2], "PAUSED") {
+		t.Errorf("row 2 = %q, want the pause banner to persist", paused[2])
+	}
+}
+
+func TestHUDTitleShowsChannel(t *testing.T) {
+	rows := hud{title: "Song", channel: "Some Channel", pos: 0, dur: 10,
+		queue: 1, total: 10}.lines(60)
+	if !strings.HasPrefix(rows[0], "01/10  Song — Some Channel") {
+		t.Errorf("row 0 = %q, want title and channel", rows[0])
 	}
 }
