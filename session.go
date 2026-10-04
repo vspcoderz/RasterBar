@@ -389,6 +389,15 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			return
 		}
 		hudText = joined
+		// Reset SGR before the chrome.
+		//
+		// The colour renderer sets a foreground and background per cell and never
+		// resets at the end of a frame, so whatever colour the last cell painted
+		// is still active here. Plain HUD text then inherits a colour sampled
+		// from the video, and on a dark scene the whole HUD renders near-black on
+		// near-black: emitted correctly, invisible on screen. Only colour mode is
+		// affected, which is why a mono run never showed it.
+		fmt.Fprint(bw, "\x1b[0m")
 		for i, line := range lines {
 			fmt.Fprintf(bw, "\x1b[%d;1H%s", l.rows+1+i, line)
 		}
