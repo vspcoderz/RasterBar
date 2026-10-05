@@ -48,6 +48,16 @@ func newScreen(cols, rows int) *screen {
 	return s
 }
 
+// scrollUp shifts every row up by one and blanks the bottom row, which is what
+// a terminal does when LF lands on the last row.
+func (s *screen) scrollUp() {
+	copy(s.cells, s.cells[s.cols:])
+	blank := screenCell{r: ' '}
+	for i := (s.rows - 1) * s.cols; i < len(s.cells); i++ {
+		s.cells[i] = blank
+	}
+}
+
 func (s *screen) clear() {
 	s.cells = make([]screenCell, s.cols*s.rows)
 	for i := range s.cells {
@@ -101,6 +111,16 @@ func (s *screen) feed(p []byte) {
 			case '\n':
 				s.curY++
 				s.pendingWrap = false
+				if s.curY >= s.rows {
+					// LF while on the last row scrolls the screen. Ignoring
+					// this let a renderer emit a scrolling sequence and still
+					// pass every screen assertion: the cursor went off-screen,
+					// put dropped the rest of the frame, and the assertion
+					// compared the *pre-scroll* cells against the frame. That
+					// is the difference between a test double and a terminal.
+					s.curY = s.rows - 1
+					s.scrollUp()
+				}
 			default:
 				r, size := decodeRune(str[i:])
 				s.put(r)

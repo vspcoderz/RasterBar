@@ -242,12 +242,19 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 			c.lastX, c.lastY = x, y
 			c.haveLast = true
 		}
-		// Each glyph is one column wide, but some terminals render U+2580 as
-		// ambiguous-width. A newline after the last cell avoids leaving the
-		// cursor mid-row; the cursor is repositioned explicitly anyway.
-		if _, err := io.WriteString(c.w, "\r\n"); err != nil {
-			return err
-		}
+		// No newline here, deliberately. A terminal on the last row turns LF
+		// into a scroll, and a scroll moves every cell the diff cache believes
+		// is still where it left it -- after that the cache and the terminal
+		// disagree permanently, so every unchanged cell is skipped and keeps
+		// showing what scrolled into its place. That is a ghost that no later
+		// frame can clear.
+		//
+		// The cursor does not need the newline: haveLast is cleared below, so
+		// the first cell of the next row emits an absolute CUP, and a run that
+		// ends mid-row is repositioned by the same check. The old comment
+		// claimed the newline avoided leaving the cursor mid-row, but it also
+		// admitted the cursor is repositioned explicitly anyway -- it was risk
+		// with no owner.
 		c.haveLast = false
 	}
 	return nil

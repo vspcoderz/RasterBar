@@ -227,6 +227,14 @@ once read a colour. It is implemented now, and it immediately exposed that
 `quant256` was mapping pure black onto grey-ramp index 232 — which is `#080808`, not
 black — so every "black" cell on a 256-colour terminal was a faint grey smudge.
 
+It also used to **treat LF at the last row as a cursor move rather than a scroll**,
+which is the same class of lie: the cursor went off-screen, `put` dropped the rest
+of the frame, and the assertion compared pre-scroll cells against the frame. That
+let `ColorDiffRenderer.Draw` ship an unconditional `\r\n` per row — a real scroll on
+a terminal — while every screen test passed. The emulator scrolls now, and the
+emulator being *kinder than reality* is the failure mode to distrust: a test double
+that is more forgiving than the machine will agree with your bug.
+
 `assertScreenMatches` also has to know the colour mode, or a 256-colour screen is
 compared against a 24-bit expectation and every non-exact colour reads as a failure.
 Quantisation is not a leak, and treating the two as the same thing is how a real leak

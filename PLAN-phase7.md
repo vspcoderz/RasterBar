@@ -368,6 +368,37 @@ other direction.
     carrying a +44.2dB offset — which is why `agcGateDb`'s "dBFS" claim never meant
     what it said, and why `levelDbfs` is measured off the input samples instead.
 
+18. **`ColorDiffRenderer.Draw` ended every row with an unconditional `\r\n`.**
+
+    LF while the cursor sits on the terminal's last row is a *scroll*: the whole
+    screen shifts up one row. The diff cache is untouched by that, so from the
+    next frame the cache and the terminal disagree permanently — every cell the
+    cache thinks is unchanged gets skipped, and it keeps showing whatever row
+    scrolled into its place. New frame draws, old frame slides up underneath,
+    ghost that no later frame can clear. Exactly the reported symptom.
+
+    Normal geometry should not reach it: `computeLayout` reserves
+    `chromeRows >= 3`, so the grid's last row sits three rows above the bottom.
+    It becomes reachable when the renderer's row count is stale — a resize-down
+    is handled in its own `select` arm, so frames drawn before SIGWINCH is
+    processed still CUP past the new bottom, clamp to the last row, and then hit
+    that `\r\n`.
+
+    It is removed rather than guarded, because it had no job: `haveLast` is
+    cleared at the end of each row, so the first cell of the next row emits an
+    absolute CUP, and a mid-row run is repositioned by the same check. The old
+    comment even admitted "the cursor is repositioned explicitly anyway".
+
+    **Why it survived every test:** `screen_test.go`'s emulator did
+    `case '\n': s.curY++` and let `put` drop off-screen writes. The cursor
+    wandered past the last row, the rest of the frame was silently discarded, and
+    the assertion still compared the *pre-scroll* cells against the frame. The
+    emulator now scrolls — `scrollUp()` — and with it honest,
+    `TestColorRendererScreenMatchesLastFrame` fails on all four colour/glyph
+    combinations (`cell (17,0): bg ffffff want 000000` — row 0 showing row 1's
+    content) and passes only after the `\r\n` is gone. Mono never failed, because
+    `DiffRenderer` never emitted a newline.
+
 ## Verification
 
 1. `go vet ./...`
