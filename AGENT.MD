@@ -79,6 +79,24 @@ YouTube format, so there is nothing to select.
 project avoids probing a googlevideo URL is the single-use grant, not the
 subprocess. `library.go` probes freely, once per file, capped at 8 concurrent.
 
+**The spectrum's dB window adapts, per spectrum and not per band.** A fixed
+`-70..-10dB` mapping is calibrated for a quiet home recording; a commercial master
+sits 10-15dB hotter and pins every band at 1.0, so the visualiser draws a solid
+block. Measured on a T-Series pop track: `band[0]=1.000 band[last]=0.950`.
+
+Per band is the tempting version and it is **wrong**: normalising each band against
+its own peak makes a loud band and an empty one both read as full scale, so an 86Hz
+tone lit the lowest band and the highest equally. The floor is one value for the
+whole spectrum. `TestSpectrumAnalyzerBands` catches the per-band version, and its
+assertion is about *which* band is loudest rather than comparing band 0 to band 31
+-- the latter only passed by accident of the old calibration.
+
+**Resample bands to the drawn column count on the way in, not on the way out.** The
+smoother is sized to the grid and `Push` writes as many entries as the analyser
+produced, so without this the tail columns keep their zero initial value forever: on
+an 80-column terminal the analyser's 48 bands fill 48 columns and the right-hand
+third is permanently blank.
+
 `probeMedia` must pass `-show_streams`. Without it ffprobe returns format and
 chapters but no `streams` key, so `hasAudio` is always false and every local file is
 classified silent. In video mode that silently downgrades track-end detection to the
@@ -231,6 +249,11 @@ Four rules for these, all learned the hard way:
   video-only file, which reads as track end and ends the run in about two seconds.
 - **Never override `--rows`.** `computeLayout` already subtracts the chrome rows,
   so passing a value double-subtracts and every assertion lands on the wrong row.
+- **A copied terminal screenshot shows you nothing.** In colour mode the glyph is a
+  space or a half-block and all the ink is in the background, so selecting and
+  copying 1600 cells of visualiser yields a wall of blank lines. It looks exactly
+  like "the visualiser is not drawing". Dump cell attributes instead — see
+  `termscreen.py`'s `lit()` — and remember the fix may not be about drawing at all.
 - **Locate HUD rows by content, never by index.** The chrome height changes when
   the spectrum strip is toggled, so every fixed index is wrong the moment `s` is
   pressed. That reads as "the strip toggle broke the HUD".

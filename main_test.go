@@ -237,15 +237,48 @@ func TestSpectrumAnalyzerBands(t *testing.T) {
 		t.Errorf("silence produced energy: sum=%v", sum)
 	}
 
-	// a loud low tone must move the lowest band more than the highest
+	// A loud low tone must light the low end, not the high end.
+	//
+	// Asserted as "the loudest band is in the bottom quarter and beats the top band"
+	// rather than "band 0 beats band 31", because the second version is coupled to
+	// the absolute calibration. With 32 log-spaced bands from 30Hz, band 0 covers
+	// 30-35Hz and an 86Hz tone is in band 6; the old assertion only passed because
+	// the fixed -70..-10dB window happened to put a little window leakage in band 0
+	// and nothing at all in band 31. Change the gain calibration and it broke,
+	// which says the assertion was measuring the wrong thing.
 	low := make([]float64, fftSize)
 	for i := range low {
 		ang := 2 * math.Pi * 8 * float64(i) / float64(fftSize) // ~86 Hz
 		low[i] = math.Cos(ang)
 	}
-	m2 := NewSpectrumAnalyzer(11025, 32).Analyze(low)
-	if m2[0] <= m2[len(m2)-1] {
-		t.Errorf("low tone did not favour low band: first=%v last=%v", m2[0], m2[len(m2)-1])
+	// Analysed several times, not once: the display smoothing has a 0.6 attack
+	// coefficient, so a single analysis of a fresh analyser can never exceed 0.6
+	// however loud the input is. Letting it settle also checks that the automatic
+	// gain converges rather than drifting.
+	s2 := NewSpectrumAnalyzer(11025, 32)
+	var m2 []float64
+	for i := 0; i < 6; i++ {
+		m2 = s2.Analyze(low)
+	}
+
+	peak := 0
+	for i, v := range m2 {
+		if v > m2[peak] {
+			peak = i
+		}
+	}
+	if m2[peak] < 0.8 {
+		t.Errorf("loudest band %d only reached %v; a full-scale tone should be near "+
+			"the top of the range", peak, m2[peak])
+	}
+	if peak > len(m2)/4 {
+		t.Errorf("86Hz peaked in band %d of %d; the frequency axis is not monotonic",
+			peak, len(m2))
+	}
+	top := m2[len(m2)-1]
+	if m2[peak] <= top {
+		t.Errorf("low tone did not favour the low end: peak band %d = %v, top band = %v",
+			peak, m2[peak], top)
 	}
 }
 

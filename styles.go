@@ -158,14 +158,29 @@ func (b *barsViz) Reset() {
 	b.viz = Visualizer{level: make([]float64, b.n), peak: make([]float64, b.n)}
 }
 
-func (b *barsViz) Push(f *AudioFrame) { b.viz.Push(f.Bands) }
+// Push resamples the analyser's bands up to one per column, then feeds the
+// smoother.
+//
+// The resample has to happen here and not in Paint. The Visualizer is sized to the
+// drawn column count, Push writes as many entries as the analyser produced, and
+// without this the tail columns keep their zero initial value forever: on an
+// 80-column terminal the analyser fills 48 of them and the right-hand third of the
+// screen is permanently blank.
+//
+// Doing it on the way in rather than on the way out also means the attack, the
+// release and the peak hold are computed per real band. Resampling afterwards
+// would smear one band's hold across the two columns that share it, and the caps
+// would stop lining up with the bars.
+func (b *barsViz) Push(f *AudioFrame) {
+	resampleBands(f.Bands, b.n, b.scratch)
+	b.viz.Push(b.scratch)
+}
 
 func (b *barsViz) Paint(g *VizGrid) {
 	if b.n == 0 || b.cols == 0 || b.rows == 0 {
 		return
 	}
-	resampleBands(b.viz.Level(), b.n, b.scratch)
-	levels := b.scratch
+	levels := b.viz.Level()
 
 	// Cells available for a bar's height. One row is reserved so the peak cap
 	// always has somewhere to sit above the level, which is the whole point of
@@ -348,7 +363,12 @@ func (m *mirrorViz) Reset() {
 	m.viz = Visualizer{level: make([]float64, m.n), peak: make([]float64, m.n)}
 }
 
-func (m *mirrorViz) Push(f *AudioFrame) { m.viz.Push(f.Bands) }
+// Push resamples the analyser's bands up to one per column. See barsViz.Push for
+// why this belongs on the way in.
+func (m *mirrorViz) Push(f *AudioFrame) {
+	resampleBands(f.Bands, m.n, m.scratch)
+	m.viz.Push(m.scratch)
+}
 
 func (m *mirrorViz) Paint(g *VizGrid) {
 	if m.n == 0 || m.rows == 0 {
@@ -358,7 +378,7 @@ func (m *mirrorViz) Paint(g *VizGrid) {
 	if half < 1 {
 		return
 	}
-	resampleBands(m.viz.Level(), m.n, m.scratch)
+	levels := m.viz.Level()
 
 	for x := 0; x < m.cols; x++ {
 		// Kaleidoscope fold: reflect the left half onto the right so the shape
@@ -371,7 +391,7 @@ func (m *mirrorViz) Paint(g *VizGrid) {
 		if bi >= m.n {
 			bi = m.n - 1
 		}
-		lv := clamp01(m.scratch[bi])
+		lv := clamp01(levels[bi])
 		h := int(lv * float64(half))
 		band := bandPos(bi, m.n)
 		for y := 0; y < h; y++ {
@@ -402,6 +422,7 @@ type waterfallViz struct {
 	cols, rows int
 	n          int
 	viz        Visualizer
+	scratch    []float64 // one band per column; see Push
 	row        []float64 // the row about to be written
 	hist       []float64 // rows*cols scroll history, owned here; see Paint
 	dirty      bool      // a row has been captured since the last Paint
@@ -419,6 +440,7 @@ func (w *waterfallViz) Resize(cols, rows int) {
 	w.viz.Resize(w.n)
 	if len(w.row) != w.n {
 		w.row = make([]float64, w.n)
+		w.scratch = make([]float64, w.n)
 		w.dirty = false
 	}
 	// The history is resized, not resampled. A scroll buffer of the wrong height
@@ -436,12 +458,13 @@ func (w *waterfallViz) Reset() {
 }
 
 func (w *waterfallViz) Push(f *AudioFrame) {
-	w.viz.Push(f.Bands)
+	resampleBands(f.Bands, w.n, w.scratch)
+	w.viz.Push(w.scratch)
 	// The row is captured on Push, not on Paint: Push happens once per analysis
 	// (audio rate, ~11/s) while Paint may run at 30/s. Capturing on Paint would
 	// scroll two identical rows for every real one and the history would move at
 	// twice the speed of the music.
-	resampleBands(w.viz.Level(), w.n, w.row)
+	copy(w.row, w.viz.Level())
 	w.dirty = true
 }
 
@@ -549,7 +572,12 @@ func (r *radialViz) Reset() {
 	r.viz = Visualizer{level: make([]float64, r.n), peak: make([]float64, r.n)}
 }
 
-func (r *radialViz) Push(f *AudioFrame) { r.viz.Push(f.Bands) }
+// Push resamples the analyser's bands to the spoke count. See barsViz.Push for
+// why this belongs on the way in.
+func (r *radialViz) Push(f *AudioFrame) {
+	resampleBands(f.Bands, r.n, r.scratch)
+	r.viz.Push(r.scratch)
+}
 
 func (r *radialViz) Paint(g *VizGrid) {
 	if r.cols == 0 || r.rows == 0 {
@@ -563,9 +591,7 @@ func (r *radialViz) Paint(g *VizGrid) {
 	if maxR < 1 {
 		return
 	}
-	resampleBands(r.viz.Level(), r.n, r.scratch)
-
-	for i, lv := range r.scratch {
+	for i, lv := range r.viz.Level() {
 		lv := clamp01(lv)
 		if lv <= 0.01 {
 			continue

@@ -16,6 +16,28 @@ const (
 	bands      = 48
 )
 
+// agcSpanDb is how many dB of dynamic range each band is shown across.
+//
+// 42dB is a little less than the usual 60dB of a spectrum analyser, because the top
+// of a band is rarely occupied and showing all 60 leaves the picture squashed into
+// the bottom two thirds of every bar.
+const agcSpanDb = 42.0
+
+// agcFallDb is how fast a band's tracked peak falls, in dB per analysis.
+//
+// 1.2dB per analysis is about 13dB per second at spectrumRate, so a note holds its
+// place for roughly three seconds and then hands the top of the range back. Faster
+// and the picture flickers with the treble; slower and a decaying bass never comes
+// back down.
+const agcFallDb = 1.2
+
+// infDb is the floor for the gain's high-water mark before any signal arrives.
+//
+// -140 rather than zero: a peak of 0dB would mean "already as loud as possible",
+// pinning the whole spectrum at full scale until it had fallen by 140dB, which at
+// agcFallDb is over two minutes of solid block.
+const infDb = -140.0
+
 type FFT struct {
 	cos, sin []float64
 	rev      []int
@@ -105,6 +127,9 @@ type SpectrumAnalyzer struct {
 	mags   []float64
 	raw    []float64 // pre-smoothing magnitudes; see Raw
 	smooth []float64
+	// peakDb is the high-water mark for the automatic gain, in dB. One value for
+	// the whole spectrum, not one per band; see Analyze.
+	peakDb float64
 	rate   int
 	bands  int
 	window []float64
@@ -118,6 +143,7 @@ func NewSpectrumAnalyzer(rate, nBands int) *SpectrumAnalyzer {
 		rate = spectrumHz
 	}
 	s := &SpectrumAnalyzer{
+		peakDb: infDb,
 		fft:    NewFFT(fftSize),
 		re:     make([]float64, fftSize),
 		im:     make([]float64, fftSize),
@@ -177,11 +203,42 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 			sum += mag * mag
 		}
 		rms := math.Sqrt(sum / float64(hi-lo))
-		// dB, then map -70..-10 dB onto 0..1. Absolute FFT magnitudes are tiny
-		// and vary wildly with content, so a fixed linear scale is useless.
 		db := 20 * math.Log10(rms+1e-12)
-		v := (db + 70.0) / 60.0
+		s.raw[b] = db
+		if db > s.peakDb {
+			s.peakDb = db
+		}
+	}
+
+	// One automatic gain for the whole spectrum, applied after every band's level
+	// is known.
+	//
+	// Global, not per band, and the reason is worth recording: per-band gain was the
+	// first attempt and it destroys the only thing a spectrum is for. Normalising
+	// each band against its own recent peak makes a loud band and an empty one both
+	// read as full scale, so a 86Hz tone lit the lowest band *and* the highest
+	// equally. TestSpectrumAnalyzerBands caught it -- "a loud low tone must move
+	// the lowest band more than the highest" stopped being true the moment the
+	// bands stopped being comparable.
+	//
+	// A single floor under all 48 bands keeps the frequency axis meaningful while
+	// still adapting to how loud the material happens to be. What it buys: a modern
+	// commercial master, which sits 10-15dB hotter than the -70..-10dB window this
+	// used to assume, no longer pins every band at 1.0 and draws a solid block.
+	// Measured on a T-Series pop track before the fix: band[0]=1.000,
+	// band[last]=0.950, i.e. no spectrum at all.
+	//
+	// It is not an absolute level meter and nothing claims it is.
+	if s.peakDb > -infDb {
+		s.peakDb -= agcFallDb
+	}
+	floor := s.peakDb - agcSpanDb
+
+	for b := 0; b < s.bands; b++ {
+		v := (s.raw[b] - floor) / agcSpanDb
 		switch {
+		case v != v: // NaN
+			v = 0
 		case v < 0:
 			v = 0
 		case v > 1:

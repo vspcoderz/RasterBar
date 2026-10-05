@@ -851,32 +851,53 @@ func topRowSnapshot(g *VizGrid) string {
 	return sb.String()
 }
 
-// TestRadalCorrectsForCellAspect is the one that would have looked like a bug.
+// TestRadialCorrectsForCellAspect is the one that would have looked like a bug.
 //
 // A character cell is about twice as tall as it is wide. Without dividing the
 // vertical offset by the aspect ratio the spokes come out an ellipse stretched to
 // twice its intended height, and a circle is the single shape every viewer
-// recognises -- so the error is immediately visible as "the renderer is broken"
-// rather than as "the maths is slightly off".
+// recognises -- so the error reads as "the renderer is broken" rather than as "the
+// maths is slightly off".
+//
+// The assertion is stated in pixels, not cells, because that is where the property
+// lives: a round shape is round in pixels and stretched in cells. Two earlier
+// versions of this test were both wrong. One lit a single band, so it measured the
+// slope of one line. The other lit a ramp and compared cell counts directly, which
+// asks a fan to be twice as tall as it is wide -- true of neither a circle nor a
+// fan.
+//
+// Every band is lit, and the drawn extent is converted to pixels: a column is 1px,
+// a row is 2px.
+//
+// The expected ratio is 0.5, not 1.0, and the reason is the shape: the fan sweeps
+// from -90 to +90 degrees off vertical, so it is a half-disc -- twice as wide as it
+// is tall, with the arc round. A half-disc is the right answer for a fan; asking
+// for width == height would be asking for a quarter-disc.
+//
+// It discriminates, but only with headroom, and getting that wrong cost three
+// attempts. maxR is already derived from the aspect (min(cx, cy*aspect)), so at
+// full scale the corrected and uncorrected shapes are identical: the corrected one
+// reaches exactly the top of the grid, and the uncorrected one overflows it and is
+// clamped back to the same place. Two errors cancelling is a real property of the
+// code, not a test artefact -- but it means a full-scale spectrum cannot tell them
+// apart. So the bands sit at half scale, where the broken version's extra reach is
+// visible instead of clipped.
 func TestRadialCorrectsForCellAspect(t *testing.T) {
 	const cols, rows = 60, 30
 	v := &radialViz{}
 	v.Resize(cols, rows)
 
-	// One band at full level, so exactly one spoke is drawn.
-	f := make([]float64, bands)
-	for i := range f {
-		f[i] = 0
+	// Half scale, so the vertical extent stays clear of the top of the grid. See
+	// the note above: at full scale the aspect correction is unobservable.
+	half := make([]float64, bands)
+	for i := range half {
+		half[i] = 0.5
 	}
-	f[bands/2] = 1
-	v.Push(&AudioFrame{Bands: f})
+	v.Push(&AudioFrame{Bands: half})
 	g := NewVizGrid(cols, rows, false, 1)
 	g.Clear()
 	v.Paint(g)
 
-	// Find the drawn cells and compare their extent on each axis. With the aspect
-	// correction the two should be within a cell of each other; without it the
-	// vertical extent would be about twice the horizontal.
 	minX, maxX, minY, maxY := cols, -1, rows, -1
 	for y := 0; y < rows; y++ {
 		for x := 0; x < cols; x++ {
@@ -898,18 +919,21 @@ func TestRadialCorrectsForCellAspect(t *testing.T) {
 		}
 	}
 	if maxY < 0 {
-		t.Fatal("radial drew nothing for a full-level band")
+		t.Fatal("radial drew nothing for a fully lit spectrum")
 	}
-	w := float64(maxX - minX)
-	h := float64(maxY - minY)
-	if w == 0 {
-		t.Fatalf("radial drew a vertical line: x extent 0, y extent %v", h)
+
+	const cellPx = 2 // rows are twice as tall as columns; that is the premise
+	widthPx := maxX - minX
+	heightPx := (maxY - minY) * cellPx
+	if widthPx == 0 || heightPx == 0 {
+		t.Fatalf("degenerate shape: %dpx wide, %dpx tall", widthPx, heightPx)
 	}
-	// Cells are ~2x tall, so a shape that is round on screen spans about twice as
-	// many rows as columns. Allow generous slack for the integer rounding.
-	ratio := h / w
-	if ratio < 1.4 || ratio > 2.6 {
-		t.Errorf("radial extent ratio h/w = %.2f, want about 2.0 (cells are twice as tall as wide)", ratio)
+	ratio := float64(heightPx) / float64(widthPx)
+	if ratio < 0.40 || ratio > 0.62 {
+		t.Errorf("radial is %.2f as tall as it is wide in pixels (%dpx vs %dpx); "+
+			"want about 0.5 for a half-disc. A ratio near 1.0 means the aspect "+
+			"correction is missing and the fan is stretched vertically.",
+			ratio, heightPx, widthPx)
 	}
 }
 
