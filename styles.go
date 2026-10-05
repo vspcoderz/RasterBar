@@ -101,6 +101,14 @@ func rampFor(v float64) byte {
 // rampBright is the heaviest ramp character, for peaks and cores.
 var rampBright = byte(len(ramp) - 1)
 
+// baselineInk is how much ink the axis line under the bars lays down.
+//
+// 0.10 is above the grid's background and well below anything a bar draws. The
+// point is for it to be visible as a line without being readable as a value --
+// there is a whole column of "this band is silent" underneath the spectrum and
+// that is information, but it is not the information being displayed.
+const baselineInk = 0.10
+
 // bandPos is x/n as a 0..1 position across the spectrum, for palettes.
 //
 // The divisor is forced to at least 1 so a one-column grid cannot divide by zero
@@ -198,6 +206,15 @@ func (b *barsViz) Paint(g *VizGrid) {
 			h = height
 		}
 		band := bandPos(x, b.n)
+
+		// The axis, drawn before the bar so the bar overwrites it.
+		//
+		// A faint tick under every band gives the picture a floor and a reference.
+		// Without one, a silent band is indistinguishable from a column that was
+		// never drawn at all, so a quiet passage reads as a broken renderer rather
+		// than as quiet music. One row of the lowest-contrast ink available, so it
+		// looks like a line and not like data.
+		g.Set(x, b.rows-1, rampFor(baselineInk), g.Color(band, baselineInk, 0))
 
 		for y := 0; y < h; y++ {
 			// Row 0 is the top of the grid, so the gradient runs from bright at the

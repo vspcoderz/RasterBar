@@ -91,6 +91,10 @@ type VizGrid struct {
 	// style so that switching palettes is one assignment instead of six, and so a
 	// new style cannot forget to be told about it.
 	pal palette
+	// bg and bgRamp are what Clear() fills with, so that an unlit cell is a
+	// deliberate dark panel rather than black-on-black nothing. See palette.bg.
+	bg     uint32
+	bgRamp byte
 }
 
 // NewVizGrid allocates a grid. pixPerCell is 2 for the half-block layout and 1
@@ -116,16 +120,21 @@ func NewVizGrid(cols, rows int, color bool, pixPerCell int) *VizGrid {
 	}
 }
 
-// Clear empties the grid to background.
+// Clear empties the grid to its background.
 //
 // Every cell, on every frame. Not "whatever the style overwrites" -- styles are
 // allowed to paint nothing at all this frame (a waterfall between scrolls, a
-// radial whose rings all fell below the threshold), and a partial paint means
-// the previous frame shows through, which reads as the visualizer being stuck.
+// radial whose rings all fell below the threshold), and a partial paint means the
+// previous frame shows through, which reads as the visualizer being stuck.
+//
+// "Empties" is the background colour, not black. A sparse style on a black
+// terminal otherwise produced scattered glyphs floating in nothing, with no way to
+// see where the picture ended.
 func (g *VizGrid) Clear() {
+	gray, rgbv := g.bgRamp, g.bg
 	for i := range g.gray {
-		g.gray[i] = 0
-		g.rgb[i] = 0
+		g.gray[i] = gray
+		g.rgb[i] = rgbv
 	}
 }
 
@@ -160,7 +169,18 @@ func (g *VizGrid) Color(band, val, beat float64) uint32 {
 }
 
 // SetPalette switches the grid's colour scheme. Called when the user presses `c`.
-func (g *VizGrid) SetPalette(p palette) { g.pal = p }
+//
+// The background is cached into the grid rather than read from the palette per
+// cell, because Clear touches every cell and a palette lookup per cell per frame is
+// a function call in the hottest loop in the program.
+func (g *VizGrid) SetPalette(p palette) {
+	g.pal = p
+	g.bg = p.bgColor()
+	// The mono ramp has no colour, so the background has to be a glyph. Index 1 is
+	// the second-darkest character in the ramp -- just enough to be visible against
+	// a black terminal without reading as content.
+	g.bgRamp = 1
+}
 
 // At returns a cell's ramp index.
 func (g *VizGrid) At(x, y int) byte {

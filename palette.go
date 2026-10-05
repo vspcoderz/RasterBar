@@ -29,6 +29,17 @@ type palette struct {
 	// by how tall a cell is, so that the eye reads "how loud" instead of "which
 	// frequency", and its endpoints are identical by design.
 	byBand bool
+	// bg is the colour an *unlit* cell gets. Not black.
+	//
+	// Pure black looked like nothing at all: the grid became a black rectangle on
+	// a black terminal, and a sparse style read as scattered debris rather than as
+	// a picture with a floor. A very dark tint of the palette's own hue makes the
+	// visualiser a panel you can see the extent of, and it costs nothing -- these
+	// cells were being painted anyway, they were just being painted black.
+	//
+	// Kept dark on purpose. This is a background for content, so it has to sit
+	// below everything the palette draws without competing with it.
+	bg [3]float64
 	// fn returns 0xRRGGBB. band is 0..1 across the spectrum, val is 0..1 across
 	// the cell's own range, and beat is the onset envelope 0..1.
 	fn func(band, val, beat float64) uint32
@@ -47,11 +58,16 @@ type palette struct {
 // restart. It is last so reaching it takes deliberate presses rather than being
 // where you land.
 var palettes = []palette{
-	{name: "spectrum", byBand: true, fn: spectrumHue},
-	{name: "height", fn: heightHue},
-	{name: "ocean", byBand: true, fn: oceanHue},
-	{name: "ember", byBand: true, fn: emberHue},
-	{name: "mono", mono: true},
+	{name: "spectrum", byBand: true, bg: [3]float64{0.10, 0.03, 0.12}, fn: spectrumHue},
+	{name: "height", bg: [3]float64{0.11, 0.04, 0.04}, fn: heightHue},
+	{name: "ocean", byBand: true, bg: [3]float64{0.02, 0.06, 0.10}, fn: oceanHue},
+	{name: "ember", byBand: true, bg: [3]float64{0.12, 0.05, 0.02}, fn: emberHue},
+	{name: "mono", mono: true, bg: [3]float64{0.09, 0.09, 0.09}},
+}
+
+// bgColor is the packed background for an unlit cell.
+func (p palette) bgColor() uint32 {
+	return rgb(p.bg[0], p.bg[1], p.bg[2])
 }
 
 // paletteMonoName is the entry that draws no colour.

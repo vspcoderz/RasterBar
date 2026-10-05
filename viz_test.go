@@ -682,7 +682,7 @@ func TestEveryStyleFillsItsGridAndSurvivesResize(t *testing.T) {
 			g := NewVizGrid(s.cols, s.rows, true, 2)
 			g.Clear()
 			v.Paint(g)
-			if lit := litCells(g); lit == 0 {
+			if lit := cellsAboveBg(g); lit == 0 {
 				t.Errorf("%s at %dx%d painted nothing at all", v.Name(), s.cols, s.rows)
 			}
 			// Shrinking after a paint is the case that finds stale state.
@@ -711,12 +711,12 @@ func TestStylesOnlyDrawFromTheirOwnInput(t *testing.T) {
 		g.Clear()
 		v.Paint(g)
 		if v.Name() == "scope" {
-			if litCells(g) != 0 {
+			if cellsAboveBg(g) != 0 {
 				t.Error("scope drew something from bands alone; it must use the waveform")
 			}
 			continue
 		}
-		if litCells(g) == 0 {
+		if cellsAboveBg(g) == 0 {
 			t.Errorf("%s drew nothing from bands alone", v.Name())
 		}
 	}
@@ -797,19 +797,98 @@ func TestBarsCapIsSuppressedAtFullScale(t *testing.T) {
 	}
 }
 
-// TestBarsLeavesSilenceBlank is what stops the spectrum being a permanent block
-// during a quiet passage.
-func TestBarsLeavesSilenceBlank(t *testing.T) {
+// TestBarsDrawsOnlyTheAxisForSilence pins what a quiet passage looks like, and it
+// used to assert the opposite.
+//
+// It wanted an empty grid. That was a reasonable thing to want at the time and it
+// produced a black rectangle: no floor, no reference, and a silent band was
+// indistinguishable from a column that was never drawn. Now silence is the grid's
+// background plus one row of axis, and the test says so.
+//
+// The distinction that matters is height, not ink: silence must not draw anything
+// *above* the axis, because that would be a bar pretending to be zero.
+func TestBarsDrawsOnlyTheAxisForSilence(t *testing.T) {
+	const cols, rows = 40, 10
 	v := &barsViz{}
-	v.Resize(40, 10)
-	g := NewVizGrid(40, 10, false, 1)
+	v.Resize(cols, rows)
+	g := NewVizGrid(cols, rows, false, 1)
 	for i := 0; i < 20; i++ {
 		v.Push(&AudioFrame{Bands: make([]float64, bands)})
 	}
 	g.Clear()
 	v.Paint(g)
-	if lit := litCells(g); lit != 0 {
-		t.Errorf("%d cells drawn for silence; the grid should be empty", lit)
+
+	// Every column has its axis tick.
+	for x := 0; x < cols; x++ {
+		if g.At(x, rows-1) == 0 {
+			t.Fatalf("column %d has no axis tick at the bottom row", x)
+		}
+	}
+	// And nothing above it.
+	for y := 0; y < rows-1; y++ {
+		for x := 0; x < cols; x++ {
+			if c := g.At(x, y); c != 0 && c != g.At(0, rows-1) {
+				t.Errorf("cell (%d,%d) drawn for silence at %d, which is not the axis ink",
+					x, y, c)
+			}
+		}
+	}
+}
+
+// TestGridBackgroundIsNotBlack is the regression for the whole reason this change
+// exists.
+//
+// An unlit cell was rgb 0, i.e. #000000, which on a black terminal is not "empty"
+// so much as "the same colour as the terminal". The visualizer then looked like
+// scattered debris floating in nothing, and a sparse style gave no sense of how big
+// the picture was.
+func TestGridBackgroundIsNotBlack(t *testing.T) {
+	for _, name := range paletteNames() {
+		p := paletteByName(name)
+		g := NewVizGrid(8, 4, true, 1)
+		g.SetPalette(p)
+		g.Clear()
+		bg := g.bg
+		if bg == 0 {
+			t.Errorf("palette %q has a black background; the grid will be invisible "+
+				"on a black terminal", name)
+		}
+		// And it must actually be dark -- this is a background for content.
+		r, gg, b := float64(bg>>16)/255, float64((bg>>8)&0xff)/255, float64(bg&0xff)/255
+		lum := 0.2126*r + 0.7152*gg + 0.0722*b
+		if lum > 0.20 {
+			t.Errorf("palette %q background is %.2f luminance; too bright to sit "+
+				"under content", name, lum)
+		}
+		// Every cell must have it, not just the ones a style happened to touch.
+		for i := range g.rgb {
+			if g.rgb[i] != bg {
+				t.Fatalf("cell %d is %06x, want the background %06x", i, g.rgb[i], bg)
+			}
+		}
+	}
+}
+
+func paletteNames() []string {
+	out := make([]string, 0, len(palettes))
+	for _, p := range palettes {
+		out = append(out, p.name)
+	}
+	return out
+}
+
+// TestBaselineIsAboveTheBackground pins the axis at the contrast it claims.
+//
+// baselineInk is documented as "above the background, well below anything a bar
+// draws". If it ever drops to the background's own value the axis disappears, which
+// is the bug this was added to fix.
+func TestBaselineIsAboveTheBackground(t *testing.T) {
+	g := NewVizGrid(8, 4, true, 1)
+	g.SetPalette(paletteAt(0))
+	g.Clear()
+	if rampFor(baselineInk) <= g.bgRamp {
+		t.Errorf("baseline ramp index %d is not above the background index %d",
+			rampFor(baselineInk), g.bgRamp)
 	}
 }
 
@@ -1387,6 +1466,22 @@ func rampWave(n int) []float64 {
 		out[i] = math.Sin(float64(i) * 0.05)
 	}
 	return out
+}
+
+// cellsAboveBg counts cells carrying ink *beyond the background*.
+//
+// litCells counts anything non-zero, which used to be the same thing and now is
+// not: the grid paints a background into every cell on Clear, so litCells is the
+// full grid on every frame and every "did this style draw anything" assertion built
+// on it became vacuous.
+func cellsAboveBg(g *VizGrid) int {
+	n := 0
+	for i, v := range g.gray {
+		if v != g.bgRamp || g.rgb[i] != g.bg {
+			n++
+		}
+	}
+	return n
 }
 
 func litCells(g *VizGrid) int {

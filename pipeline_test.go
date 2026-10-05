@@ -137,8 +137,9 @@ func TestParticleFieldStaysAliveAcrossAWholeTrack(t *testing.T) {
 		// through: 25 particles were alive and every one of them had drifted off
 		// the grid, so the field rendered as an empty screen for the whole track.
 		g.Clear()
+		g.SetPalette(paletteAt(0))
 		v.Paint(g)
-		drawn = append(drawn, litCells(g))
+		drawn = append(drawn, cellsAboveBg(g))
 	}
 
 	t.Logf("alive:  %v", alive)
@@ -189,7 +190,7 @@ func TestEveryStyleSurvivesRealAudio(t *testing.T) {
 		}
 		g.Clear()
 		v.Paint(g)
-		if lit := litCells(g); lit == 0 {
+		if lit := cellsAboveBg(g); lit == 0 {
 			t.Errorf("%s drew nothing at the end of real audio", v.Name())
 		}
 	}
