@@ -8,7 +8,7 @@ Run the full check **once**, at the end, as one chained command. Do not re-run
 build/vet/test after every small edit — it is slow and it is not the bottleneck.
 
 ```sh
-go vet ./... && go test ./... && go build -ldflags="-s -w" -o rasterbar .
+go vet ./... && go test ./... && go build -ldflags="-s -w" -o rasterbar ./src
 ```
 
 Single test file: `go test -run TestComputeLayout ./...`

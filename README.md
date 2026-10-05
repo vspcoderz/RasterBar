@@ -29,6 +29,18 @@ binary with **zero third-party Go modules**.
 
 ---
 
+<p align="center">
+  <img src="docs/video-mode.png" width="86%" alt="video mode: colour ASCII of Never Gonna Give You Up">
+</p>
+
+<p align="center"><sub>
+  <strong>Video mode</strong> (<code>-a</code>) — the picture rendered into the cell grid in
+  colour, with the HUD and key hints below it. The visualiser screenshots above are
+  <strong>music mode</strong>, which has no video at all.
+</sub></p>
+
+---
+
 ## What it is
 
 You point it at a search, a URL, or a folder. It plays the audio through `mpv`
@@ -78,16 +90,21 @@ luminance ramp instead of a flat fill.
 
 ## Install
 
+All the code lives in `src/`, so the installable package path is the module path
+plus `src` — and Go names the binary after the last element, so this one calls
+itself `src`:
+
 ```sh
-go install github.com/vspcoderz/rasterbar@latest
+go install github.com/vspcoderz/rasterbar/src@latest
 ```
 
-Or build it yourself:
+Building it yourself is the better route if you want the binary called
+`rasterbar`, and it is what the release notes use:
 
 ```sh
-git clone https://github.com/vspcoderz/rasterbar
-cd rasterbar
-go build -ldflags="-s -w" -o rasterbar .
+git clone https://github.com/vspcoderz/RasterBar
+cd RasterBar
+go build -ldflags="-s -w" -o rasterbar ./src
 ```
 
 **Requires** `ffmpeg` and `mpv` on `$PATH`. Searching YouTube additionally wants
