@@ -31,7 +31,11 @@
 // of it to satisfy the compiler and would buy navigability that splitting the
 // files by seam already provides.
 //
-// Within the package, the seams are:
+// One subsystem is already a package of its own: internal/term, which
+// knows nothing about tracks, frames, keys or colour. The rest is still
+// one package, deliberately -- see above.
+//
+// The seams within it are:
 //
 //	session.go   trackSession, the decoder goroutine, the render loop
 //	player.go    transport state machine, key table, the : prompt
@@ -48,7 +52,10 @@
 //	visual.go    LevelTap (PCM tap) and the display smoother
 //	library.go   directory scan; search.go   yt-dlp/ytfzf search
 //	tui.go       browse list; flow.go   covered-terminal stall handling
-//	pty.go       pty plumbing; raw.go   termios / TIOCGWINSZ
+//
+//	internal/term
+//	            raw-terminal layer: termios, TIOCGWINSZ, and a pty for
+//	            subprocesses that insist on having one
 //
 // AGENT.MD is the rulebook: the conventions, the dead ends not to retry, and
 // the units. It is written for the next person to change this, which is usually
