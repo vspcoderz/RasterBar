@@ -1227,13 +1227,31 @@ func TestMiniBarsEmptySourceIsBlankNotPanicking(t *testing.T) {
 
 func TestMiniBarsIsMonotonic(t *testing.T) {
 	// Quiet must lay down less ink than loud, or the strip is noise.
+	//
+	// Compared as ramp indices, never as bytes. The ramp is deliberately not
+	// monotonic in codepoint order ('^' is 0x5E, '`' is 0x60) because ink density
+	// is a property of the font, not the encoding -- see the note on `ramp` in
+	// render.go. Comparing bytes therefore compares nothing.
+	//
+	// This test passed for years by accident: miniBars emitted ramp *indices*,
+	// and indices are ordered numbers, so the byte comparison was really
+	// comparing two integers and agreed with itself. The moment miniBars emitted
+	// real glyphs it failed on '$' < 'i', which is the ramp working as designed
+	// and the test measuring the wrong property. It is here because the fix for
+	// the newline bug is what exposed it.
+	idx := func(g byte) int { return strings.IndexByte(ramp, g) }
 	quiet := []float64{0.05, 0.05, 0.05, 0.05}
 	loud := []float64{0.95, 0.95, 0.95, 0.95}
 	q := miniBars(quiet, 4, nil)
 	l := miniBars(loud, 4, nil)
 	for i := range q {
-		if q[i] >= l[i] {
-			t.Errorf("cell %d: quiet %q is not lighter than loud %q", i, rune(q[i]), rune(l[i]))
+		qi, li := idx(q[i]), idx(l[i])
+		if qi < 0 || li < 0 {
+			t.Fatalf("cell %d: %q / %q is not in the ramp", i, rune(q[i]), rune(l[i]))
+		}
+		if qi >= li {
+			t.Errorf("cell %d: quiet %q (ramp %d) is not lighter than loud %q (ramp %d)",
+				i, rune(q[i]), qi, rune(l[i]), li)
 		}
 	}
 }
@@ -1252,6 +1270,65 @@ func TestHudStripAddsARow(t *testing.T) {
 	withStrip.strip = strings.Repeat("=", 80)
 	if got := len(withStrip.lines(80)); got != hudStripRows+1 {
 		t.Errorf("with a strip: %d rows, want %d", got, hudStripRows+1)
+	}
+}
+
+// TestHudLinesCarryNoControlCharacters is the regression test for the bug that
+// shipped the whole phase as "the visualizer ghosts".
+//
+// miniBars writes a string rather than a grid, so it has to index the ramp
+// itself -- rampFor returns an index. It did not, and every ramp index below 32
+// went out as a control character: index 10 is LF. The strip row then wrote ~192
+// newlines at row 46, the bottom of the terminal, which scrolled the whole screen
+// away several times a second. The diff cache cannot see a scroll, so it skipped
+// every cell that had moved and the grid lost both its content and its background.
+//
+// Widths are swept because the ramp index that a given level maps to depends on
+// the value, so a single level would only ever expose one control character.
+func TestHudLinesCarryNoControlCharacters(t *testing.T) {
+	for _, width := range []int{20, 80, 192} {
+		for _, level := range []float64{0, 0.15, 0.5, 0.85, 1} {
+			for _, peak := range []float64{0, 1} {
+				h := hud{
+					title: "Track", channel: "Ch", pos: 10, dur: 100,
+					queue: 1, total: 3,
+					strip: miniBars([]float64{level}, width, []float64{peak}),
+				}
+				for i, line := range h.lines(width) {
+					for j, r := range []rune(line) {
+						if r < 0x20 || r == 0x7f {
+							t.Fatalf("width %d level %.2f peak %.1f: line %d rune %d is control character %q (want a glyph)",
+								width, level, peak, i, j, r)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestMiniBarsWritesGlyphsNotIndices pins the same boundary from the other side.
+//
+// A ramp index that happens to be printable is still the wrong character: index
+// 11 is '!' whether or not that is the glyph the ramp wanted there. So the
+// assertion is that every cell is a member of the ramp, not merely visible.
+func TestMiniBarsWritesGlyphsNotIndices(t *testing.T) {
+	bands := make([]float64, 48)
+	for i := range bands {
+		bands[i] = float64(i) / float64(len(bands))
+	}
+	got := miniBars(bands, 64, bands)
+	if len([]rune(got)) != 64 {
+		t.Fatalf("miniBars returned %d runes, want 64", len([]rune(got)))
+	}
+	for i, r := range []rune(got) {
+		if r == ' ' {
+			continue
+		}
+		if !strings.ContainsRune(ramp, r) {
+			t.Fatalf("cell %d is %q, which is not in the ramp; miniBars appears to be "+
+				"emitting ramp indices as bytes", i, r)
+		}
 	}
 }
 

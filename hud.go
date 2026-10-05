@@ -432,14 +432,28 @@ func miniBars(bands []float64, width int, peak []float64) string {
 		// One cell of ink, so a bar has somewhere to go but the strip stays a
 		// strip. The full-screen styles have a whole grid of rows to spend on
 		// height; a single HUD row does not.
+		//
+		// ramp[] on both assignments, and that is load-bearing rather than
+		// decorative. rampFor returns a ramp *index*, because that is what
+		// VizGrid.Set takes and it converts the index to a glyph itself. This
+		// function builds a string, so it has to do the indexing itself.
+		//
+		// Writing the index directly emitted the index as a byte, and every
+		// index below 32 is a control character: index 10 is LF, 13 is CR, 9 is
+		// TAB. The strip row then wrote ~192 newlines at row 46, the bottom of
+		// the terminal, which scrolled the entire screen away -- several times a
+		// second, since the HUD repaints on every clock tick. The diff cache
+		// cannot see a scroll, so it went on skipping the cells that had moved,
+		// and the visualizer degraded into ghosting with no background at all.
+		// It read as a renderer bug and was not one.
 		v := clamp01(scratch[i])
 		if pk != nil {
 			if p := clamp01(pk[i]); p > v+0.5 {
-				cells[i] = rampBright
+				cells[i] = ramp[rampBright]
 				continue
 			}
 		}
-		cells[i] = rampFor(0.15 + 0.85*v)
+		cells[i] = ramp[rampFor(0.15+0.85*v)]
 	}
 	return string(cells)
 }

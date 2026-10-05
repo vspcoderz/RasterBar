@@ -148,6 +148,25 @@ loop that spins a core and floods stderr if anything is logging. `sess.audio` an
 `sess.frames` are both set to nil as they are consumed. A nil channel blocks forever
 in a select, which is exactly the "never again" needed.
 
+**A ramp index is not a character.** `rampFor` returns an *index*, because
+`VizGrid.Set` takes one and calls `rampLum` itself. Any code building a **string**
+has to index the ramp explicitly. `miniBars` did not, and every index below 32
+went out as a control character — index 10 is LF — so the HUD strip wrote ~192
+newlines at row 46 of 47 and scrolled the whole screen away several times a
+second. The diff cache cannot see a scroll, so it went on skipping cells that had
+moved: the visualizer ghosted and lost its background, and it read as a renderer
+bug for a whole phase. Two rules survive it:
+
+- **A control character in the chrome is never cosmetic.** `paintHUD` writes each
+  line with an absolute CUP, so any escape or newline *inside* a line is a cursor
+  movement or a scroll. Assert no line contains one.
+- **Test text as text.** `miniBars`' output was the right length and the right
+  rune count and still entirely wrong; a row-count test could not see it.
+- **When a rendering bug is not in the renderer, read the raw output.** A pty
+  capture attributes bytes to the escape sequence that caused them
+  (`CRLF x144` after `CUP 46;1H`). A screen dump can only show you the damage,
+  and the damage is downstream of the cause. See `rawcap.py` + `cells.py`.
+
 ## The spectrum: units, and what not to measure
 
 **Band levels are not dB.** `SpectrumAnalyzer` stores `20*log10` of the raw FFT

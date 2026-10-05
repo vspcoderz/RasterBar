@@ -399,6 +399,54 @@ other direction.
     content) and passes only after the `\r\n` is gone. Mono never failed, because
     `DiffRenderer` never emitted a newline.
 
+19. **The actual bug: `miniBars` wrote ramp *indices* as *bytes*.**
+
+    `rampFor` returns a ramp index, not a glyph, because `VizGrid.Set` takes an
+    index and converts it via `rampLum` itself. Every style is therefore written
+    that way and none of them can be wrong this way. `miniBars` builds a *string*
+    for the HUD strip, and it assigned the index straight into the bytes:
+
+    ```go
+    cells[i] = rampFor(0.15 + 0.85*v)   // index, used as a character
+    ```
+
+    Every index below 32 is a control character. **Index 10 is LF**, 13 is CR, 9
+    is TAB. Measured on a 192x47 terminal, music mode, strip on:
+
+    ```
+    h.strip = "\n\n\n\n...192 of them..."
+    ```
+
+    The strip row is row 46 of 47, and `paintHUD` writes each line with an
+    absolute CUP. So the strip wrote ~192 newlines at the bottom of the terminal
+    and **scrolled the entire screen away** — 4224 CRLF in six seconds, on every
+    HUD repaint, which the clock drives several times a second.
+
+    The diff cache cannot see a scroll. After one, it still believed every cell
+    was where it left it, so it skipped them and the grid lost both its content
+    and its palette background. Sampled painted-cell counts over ten seconds went
+    `2526 1769 1596 623 0 2573 1723 937 1807 0 ...` — the screen fully blank
+    roughly a third of the time.
+
+    **How this survived, and how it was finally caught.** Nothing in the unit
+    suite touched `miniBars`' output as *text*: `TestHudStripAddsARow` counts
+    rows, and the strip row was the right length (192) with the right rune count
+    (192). It was wrong characters. The screen emulator could not see it either,
+    because the damage was a scroll rather than a cell. What finally showed it
+    was reading the program's **raw pty output** instead of the screen:
+    `CRLF x144` attributed to `CUP 46;1H`, and `h.strip` printing as 192
+    newlines.
+
+    Fixed with `ramp[rampFor(...)]`, plus `TestHudLinesCarryNoControlCharacters`
+    and `TestMiniBarsWritesGlyphsNotIndices`. CRLF in six seconds: **4227 -> 3**.
+    Palette-background cells on screen: **145 -> 1708**. All 47 rows populated,
+    previously only 5-41 plus the footer.
+
+    Bug 18 in this list was real and worth fixing, but it was not this. The
+    per-style differences (particles least affected, waterfall and radial worst)
+    were never style differences at all — they were how much visual damage a
+    full-screen scroll does to a style that happens to be dense or sparse.
+
 ## Verification
 
 1. `go vet ./...`
