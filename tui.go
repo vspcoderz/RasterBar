@@ -63,7 +63,7 @@ func (t *TUI) render() {
 	t.clear()
 	w := t.width()
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "vspz-yt-cli · %d results · %s\n", len(t.tracks), t.query)
+	fmt.Fprintf(&sb, "rasterbar · %d results · %s\n", len(t.tracks), t.query)
 	sb.WriteString(strings.Repeat("─", w) + "\n")
 
 	// Budget the row: marker + title + [duration] + channel, with the title

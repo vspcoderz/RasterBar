@@ -1,4 +1,4 @@
-# vspz-yt-cli — make it a real media player
+# rasterbar — make it a real media player
 
 ## Goal
 
@@ -203,7 +203,7 @@ Run once at the end, as one chained command — not after every edit.
 1. `go vet ./...`
 2. `go test ./...` — 63 tests exist today at 41.9%; new units (frame channel,
    outcome enum, HUD bar formatting, seek position arithmetic) get direct tests
-3. `go build -ldflags="-s -w" -o vspz-yt-cli .`
+3. `go build -ldflags="-s -w" -o rasterbar .`
 4. Manual, against a real track: pause holds sync · seek lands where the bar
    says · volume responds · track end advances to the next result · `q` leaves a
    clean terminal

@@ -1,4 +1,4 @@
-// Command vspz-yt-cli searches YouTube and plays results in a terminal UI:
+// Command rasterbar searches YouTube and plays results in a terminal UI:
 // audio-first with a live FFT spectrum, synced ASCII video on toggle.
 package main
 
@@ -9,10 +9,10 @@ import (
 	"strings"
 )
 
-const usage = `vspz-yt-cli - terminal YouTube player: ASCII video or a music visualizer
+const usage = `rasterbar - terminal YouTube player: ASCII video or a music visualizer
 
 usage:
-  vspz-yt-cli [options] <query>
+  rasterbar [options] <query>
 
 modes:
   -M, --music       music mode: the visualizer replaces the video (default)

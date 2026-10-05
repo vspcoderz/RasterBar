@@ -46,7 +46,7 @@ type ipcReply struct {
 // left by a previous crash, which would otherwise stop mpv from binding.
 func ipcSocketPath() string {
 	path := filepath.Join(os.TempDir(),
-		fmt.Sprintf("vspz-yt-cli-%d.ipc", os.Getpid()))
+		fmt.Sprintf("rasterbar-%d.ipc", os.Getpid()))
 	_ = os.Remove(path)
 	return path
 }

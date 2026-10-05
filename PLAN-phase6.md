@@ -130,7 +130,7 @@ second into it, otherwise the previous chapter's start, otherwise 0.
 
 1. `go vet ./...`
 2. `go test ./...`
-3. `go build -ldflags="-s -w" -o vspz-yt-cli .`
+3. `go build -ldflags="-s -w" -o rasterbar .`
 4. Real pty, real track: `:` opens, `1:30` previews, Enter lands where the
    preview said, Esc cancels and leaves **no** overlay behind, `,`/`.` nudge one
    second, `<`/`>` jump a minute, `[`/`]` walk chapters, `q` typed inside a

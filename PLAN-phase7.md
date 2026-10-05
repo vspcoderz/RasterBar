@@ -451,7 +451,7 @@ other direction.
 
 1. `go vet ./...`
 2. `go test ./...`
-3. `go build -ldflags="-s -w" -o vspz-yt-cli .`
+3. `go build -ldflags="-s -w" -o rasterbar .`
 4. Real pty, real track, in **both** modes: transport keys, seek, volume,
    chapters, `:` jump, queue advance on track end.
 5. `v` through all six styles at 80x24 and at 200x60, mono and colour, and

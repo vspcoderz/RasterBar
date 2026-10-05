@@ -1,6 +1,13 @@
 <div align="center">
 
-# vspz-yt-cli
+<pre>
+▛▀▖      ▐        ▛▀▖      
+▙▄▘▝▀▖▞▀▘▜▀ ▞▀▖▙▀▖▙▄▘▝▀▖▙▀▖
+▌▚ ▞▀▌▝▀▖▐ ▖▛▀ ▌  ▌ ▌▞▀▌▌  
+▘ ▘▝▀▘▀▀  ▀ ▝▀▘▘  ▀▀ ▝▀▘▘  
+</pre>
+
+# RasterBar
 
 **A YouTube player that lives in your terminal.**
 ASCII video, or a music visualiser with ten gradient palettes — in one static
@@ -72,15 +79,15 @@ luminance ramp instead of a flat fill.
 ## Install
 
 ```sh
-go install github.com/vspcoderz/vspz-yt-cli@latest
+go install github.com/vspcoderz/rasterbar@latest
 ```
 
 Or build it yourself:
 
 ```sh
-git clone https://github.com/vspcoderz/vspz-yt-cli
-cd vspz-yt-cli
-go build -ldflags="-s -w" -o vspz-yt-cli .
+git clone https://github.com/vspcoderz/rasterbar
+cd rasterbar
+go build -ldflags="-s -w" -o rasterbar .
 ```
 
 **Requires** `ffmpeg` and `mpv` on `$PATH`. Searching YouTube additionally wants
@@ -89,11 +96,11 @@ go build -ldflags="-s -w" -o vspz-yt-cli .
 ## Use
 
 ```sh
-vspz-yt-cli "lofi hip hop radio"     # search and play
-vspz-yt-cli https://youtu.be/...    # a URL
-vspz-yt-cli -l ~/Music -M            # browse a folder as a visualiser
-vspz-yt-cli -l ~/Music --play       # start playing immediately
-vspz-yt-cli -a -c "tesseract"        # ASCII/colour video mode
+rasterbar "lofi hip hop radio"     # search and play
+rasterbar https://youtu.be/...    # a URL
+rasterbar -l ~/Music -M            # browse a folder as a visualiser
+rasterbar -l ~/Music --play       # start playing immediately
+rasterbar -a -c "tesseract"        # ASCII/colour video mode
 ```
 
 ### Keys while playing

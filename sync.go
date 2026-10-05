@@ -521,7 +521,7 @@ func (s *SyncPlayer) Close() {
 // there is no dependency on mkfifo(1) or a temp-file library.
 func makeFifo() (string, error) {
 	dir := os.TempDir()
-	name := fmt.Sprintf("%s/vspz-yt-cli-%d-%d.audio", dir, os.Getpid(), time.Now().UnixNano())
+	name := fmt.Sprintf("%s/rasterbar-%d-%d.audio", dir, os.Getpid(), time.Now().UnixNano())
 	if err := syscall.Mkfifo(name, 0o600); err != nil {
 		return "", fmt.Errorf("mkfifo: %w", err)
 	}

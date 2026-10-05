@@ -1,6 +1,6 @@
 # Build artifacts
-/vspz-yt-cli
-/vspz-yt-cli.exe
+/rasterbar
+/rasterbar.exe
 *.test
 *.out
 
