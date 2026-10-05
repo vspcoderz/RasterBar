@@ -341,9 +341,11 @@ flow.go        covered-terminal stall handling
 fft.go         radix-2 FFT, log-spaced band edges, raw vs smoothed magnitudes
 visual.go      LevelTap (PCM tap), Visualizer (display smoothing)
 viz.go         VizGrid, the two painters, style registry, prefs
-styles.go      the six visualizers
-palette.go     HSV -> RGB and the four colour schemes
+styles_*.go    the six visualizers, one per file; styles_common.go holds the ramp
+palette.go     HSV -> RGB and the ten colour schemes
 beat.go        spectral flux, onsets, tempo estimate
+doc.go         package documentation: modes, the zero-dep constraint, the layout
+internal/term/ raw mode, TIOCGWINSZ, pty plumbing -- the one extracted subsystem
 ```
 
 `playQueue` owns the queue index. `playTrack` plays exactly one track and returns
