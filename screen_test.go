@@ -160,27 +160,122 @@ func (s *screen) csi(params string, final byte) {
 			s.fg, s.bg, s.inverse, s.colored = 0, 0, false, false
 			return
 		}
-		for _, part := range strings.Split(params, ";") {
-			n, err := strconv.Atoi(part)
-			if err != nil {
-				continue
+		sgr(s, params)
+	}
+}
+
+// sgr parses an SGR parameter list.
+//
+// This existed as a stub that ignored 38/48 outright, which made every colour
+// assertion in this file vacuous: the emulator recorded a cell's colours as 0 no
+// matter what was emitted, and leakFrames' final frame is entirely black, so
+// "screen is black" matched "frame is black" for all 216 cells. The colour leak
+// tests passed without ever looking at a colour.
+//
+// Verified before the fix, on the emulator alone:
+//
+//	\x1b[48;2;255;0;0m   -> bg 000000   (want ff0000)
+//	\x1b[48;5;196m       -> bg 000000   (want ff0000)
+//	\x1b[38;2;0;255;0m   -> fg 000000   (want 00ff00)
+//
+// Both extended forms have to be handled: the colour renderer emits `2;r;g;b` when
+// the terminal advertises truecolor and `5;idx` otherwise, and a leak test that
+// only understands one of them tests one of the two shipping paths.
+func sgr(s *screen, params string) {
+	parts := strings.Split(params, ";")
+	for i := 0; i < len(parts); i++ {
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			continue
+		}
+		switch {
+		case n == 0:
+			s.fg, s.bg, s.inverse, s.colored = 0, 0, false, false
+		case n == 7:
+			s.inverse = true
+		case n == 27:
+			s.inverse = false
+		case n == 39:
+			s.fg = 0
+		case n == 49:
+			s.bg = 0
+		case n >= 30 && n <= 37, n >= 90 && n <= 97:
+			// The 8 basic colours. Index 0-7 of the xterm palette.
+			s.colored = true
+			s.fg = xterm256(int(n&7) + (map[bool]int{true: 8, false: 0}[n >= 90]))
+		case n == 38 || n == 48:
+			col, used := extendedColor(parts[i+1:])
+			if used < 0 {
+				continue // malformed; leave the colour alone rather than zeroing it
 			}
-			switch {
-			case n == 7:
-				s.inverse = true
-			case n == 27:
-				s.inverse = false
-			case n == 39:
-				s.fg = 0
-			case n == 49:
-				s.bg = 0
-			case n >= 30 && n <= 37, n >= 90 && n <= 97:
-				s.colored = true
-				s.fg = s.fg&0xFF00FF00 | uint32(n&7)*0x00050005&0
-			case n == 38, n == 48:
-				// 5;<idx> or 2;<r>;<g>;<b>: consume what follows.
+			i += used
+			s.colored = true
+			if n == 38 {
+				s.fg = col
+			} else {
+				s.bg = col
 			}
 		}
+	}
+}
+
+// extendedColor parses `5;<idx>` or `2;<r>;<g>;<b>`, returning the colour and how
+// many extra parameters it consumed, or -1 if the form is not recognised.
+func extendedColor(rest []string) (uint32, int) {
+	if len(rest) == 0 {
+		return 0, -1
+	}
+	switch rest[0] {
+	case "5":
+		if len(rest) < 2 {
+			return 0, -1
+		}
+		idx, err := strconv.Atoi(rest[1])
+		if err != nil || idx < 0 || idx > 255 {
+			return 0, -1
+		}
+		return xterm256(idx), 2
+	case "2":
+		if len(rest) < 4 {
+			return 0, -1
+		}
+		var c [3]uint32
+		for k := 0; k < 3; k++ {
+			v, err := strconv.Atoi(rest[k+1])
+			if err != nil || v < 0 || v > 255 {
+				return 0, -1
+			}
+			c[k] = uint32(v)
+		}
+		return c[0]<<16 | c[1]<<8 | c[2], 4
+	}
+	return 0, -1
+}
+
+// xterm256 is the terminal's own palette, index to packed 0xRRGGBB.
+//
+// The inverse of quant256, and it has to be here rather than derived: the whole
+// point of the emulator is to record what a *terminal* would show, so 5;<idx> has
+// to resolve through the real palette table. Both renderers depend on the
+// difference — quant256 maps mid-greys onto the 232-255 ramp, so an index that
+// quantize produced is not the RGB a naive reader would expect.
+func xterm256(idx int) uint32 {
+	switch {
+	case idx < 16:
+		base := [16][3]byte{
+			{0, 0, 0}, {205, 0, 0}, {0, 205, 0}, {205, 205, 0},
+			{0, 0, 238}, {205, 0, 205}, {0, 205, 205}, {229, 229, 229},
+			{127, 127, 127}, {0, 0, 0}, {205, 0, 0}, {0, 205, 0},
+			{205, 205, 0}, {0, 0, 238}, {205, 0, 205}, {0, 205, 205},
+		}
+		c := base[idx]
+		return packRGB(c[0], c[1], c[2])
+	case idx < 232:
+		i := idx - 16
+		return packRGB(byte(i/36*51), byte(i/6%6*51), byte(i%6*51))
+	default:
+		v := byte(8 + (idx-232)*10)
+		return packRGB(v, v, v)
 	}
 }
 
@@ -212,7 +307,7 @@ func TestColorRendererScreenMatchesLastFrame(t *testing.T) {
 						t.Fatalf("frame %d: %v", i, err)
 					}
 				}
-				assertScreenMatches(t, sc, cols, rows, glyph, frames[len(frames)-1])
+				assertScreenMatches(t, sc, cols, rows, glyph, mode, frames[len(frames)-1])
 			})
 		}
 	}
@@ -266,7 +361,19 @@ func leakFrames(cols, rows int, glyph GlyphMode) [][]byte {
 	return out
 }
 
-func assertScreenMatches(t *testing.T, sc *screen, cols, rows int, glyph GlyphMode, frame []byte) {
+// assertScreenMatches compares the reconstructed screen to the frame, resolving
+// through the terminal's own palette first when it only has 256 colours.
+//
+// The mode matters and this used to ignore it. On a 256-colour terminal the screen
+// can only show what quant256 chose, so comparing a 24-bit expectation against it
+// reports every non-exact colour as a failure — which is not a leak, it is
+// quantisation, and treating the two as the same thing is how a real leak gets
+// dismissed as a test bug.
+//
+// leakFrames only ever uses black and white, both of which now quantise exactly, so
+// this was invisible until a palette with actual hues was pushed through the same
+// assertion.
+func assertScreenMatches(t *testing.T, sc *screen, cols, rows int, glyph GlyphMode, mode ColorMode, frame []byte) {
 	t.Helper()
 	perCell := 1
 	if glyph == GlyphHalf {
@@ -277,6 +384,9 @@ func assertScreenMatches(t *testing.T, sc *screen, cols, rows int, glyph GlyphMo
 		for x := 0; x < cols; x++ {
 			off := (y*cols + x) * 3
 			want := packRGB(frame[off], frame[off+1], frame[off+2])
+			if mode != ColorTrue {
+				want = xterm256(quant256(byte(want>>16), byte(want>>8), byte(want)))
+			}
 			cellY := y / perCell
 			got := sc.at(cellY, x)
 			var gotFG, gotBG uint32
@@ -340,7 +450,7 @@ func TestRenderLoopScreenMatchesLastFrame(t *testing.T) {
 					}
 				}
 				// The grid must still show the last frame, not the HUD's colour.
-				assertScreenMatches(t, sc, cols, rows, glyph, frames[len(frames)-1])
+				assertScreenMatches(t, sc, cols, rows, glyph, mode, frames[len(frames)-1])
 			})
 		}
 	}
@@ -362,7 +472,7 @@ func TestRenderLoopAfterStallClear(t *testing.T) {
 			r.ForceNext() // the stall handler's recovery
 		}
 	}
-	assertScreenMatches(t, sc, cols, rows, GlyphHalf, frames[len(frames)-1])
+	assertScreenMatches(t, sc, cols, rows, GlyphHalf, ColorTrue, frames[len(frames)-1])
 }
 
 func modeName(m ColorMode) string {

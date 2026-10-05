@@ -212,8 +212,12 @@ func (s *trackSession) start(pos float64) error {
 		// channel would be left nil.
 		s.audio = make(chan struct{})
 		go func(a *exec.Cmd, done chan struct{}) {
+			var werr error
 			if a != nil {
-				_ = a.Wait()
+				werr = a.Wait()
+			}
+			if debugQueue {
+				fmt.Fprintf(os.Stderr, "music: mpv exited: %v\n", werr)
 			}
 			close(done)
 		}(p.audio, s.audio)
@@ -725,6 +729,20 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	// Non-nil once the video pipe has closed; fires if mpv has not reported by
 	// then. Reset on every rebuild so a new track starts with a clean slate.
 	var videoEnded <-chan time.Time
+	// Which of the two streams have finished. The track ends when both have, not
+	// when the first one does.
+	//
+	// This was "mpv exits -> end", and that is wrong whenever the audio is shorter
+	// than the video: a file whose soundtrack runs out thirty seconds before the
+	// picture does would jump to the next track with the video still going. It was
+	// invisible for the whole life of the project because `probeMedia` never passed
+	// -show_streams, so hasAudio was always false, every local file was classified
+	// silent, `sess.audio` stayed nil, and video mode ended tracks on the grace
+	// timer after the video pipe closed instead. Fixing the probe turned a latent
+	// ordering bug into a live one.
+	//
+	// Music mode has no video stream to wait for, so mpv's exit is the end there.
+	var videoDone, audioDone bool
 	// lastKey drives the hint fade: the row shows itself on every keypress and
 	// then gets out of the way.
 	// endOfTrack reports play finished with this track: on to the next result if
@@ -899,6 +917,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			hudText = ""
 			lastSync = time.Time{}
 			videoEnded = nil
+			videoDone, audioDone = false, false
 			if o.music {
 				// Reset rather than Resize: the level tap is restarted from the new
 				// offset, so its history describes the wrong part of the song.
@@ -958,9 +977,22 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				// tail. Returning here would cut the audio off early, so treat it
 				// as "video finished" and let sess.audio decide, with a deadline
 				// in case mpv never reports.
+				videoDone = true
+				if audioDone {
+					// Both streams are finished. No grace period needed: there is
+					// nothing left to wait for.
+					if debugQueue {
+						fmt.Fprintf(os.Stderr, "queue: both streams done at %s\n",
+							formatPos(sess.Position()))
+					}
+					return endOfTrack()
+				}
 				if videoEnded == nil {
 					videoEnded = time.After(audioTailGrace)
 				}
+				// Same reason as the audio arm: a closed channel is permanently
+				// ready, so the loop has to stop watching it.
+				sess.frames = nil
 				continue
 			}
 			sess.pos.Store(math.Float64bits(fr.pos))
@@ -1047,12 +1079,40 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			}
 
 		case <-sess.audio:
-			// The track finished. Another one queued means keep going.
+			// mpv has exited. That is the end of the track only if there is no
+			// video left to watch -- either because this is music mode, or because
+			// the video pipe already closed.
+			//
+			// Ending here unconditionally is what made a file with a short
+			// soundtrack skip to the next track while its picture was still
+			// running.
+			audioDone = true
+			// Nil the channel before doing anything else. A closed channel is
+			// *always* ready, so leaving it in the select makes this arm fire on
+			// every single iteration -- a busy loop that spins a core and, with any
+			// logging on, floods stderr. A nil channel blocks forever in a select,
+			// which is exactly the "never again" this needs.
+			sess.audio = nil
+			if !o.music && !videoDone {
+				if debugQueue {
+					fmt.Fprintf(os.Stderr, "queue: mpv done at %s, waiting for video\n",
+						formatPos(sess.Position()))
+				}
+				continue
+			}
+			if debugQueue {
+				fmt.Fprintf(os.Stderr, "queue: ending on mpv exit at %s\n",
+					formatPos(sess.Position()))
+			}
 			return endOfTrack()
 
 		case <-videoEnded:
 			// The video finished and mpv has not reported within the grace period.
 			// Its clock is the one the user hears, but it is not going to speak.
+			if debugQueue {
+				fmt.Fprintf(os.Stderr, "queue: ending on video-grace at %s\n",
+					formatPos(sess.Position()))
+			}
 			return endOfTrack()
 		}
 	}

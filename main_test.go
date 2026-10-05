@@ -637,9 +637,13 @@ func TestDetectColor(t *testing.T) {
 }
 
 func TestQuant256GreyRamp(t *testing.T) {
-	// Pure greys must land in the 232-255 grey ramp, not the colour cube, or
+	// Mid greys must land in the 232-255 grey ramp, not the colour cube, or
 	// monochrome content picks up a colour cast.
-	for _, v := range []byte{0, 10, 64, 128, 200, 255} {
+	//
+	// 0 and 255 are excluded and asserted separately: they are the two endpoints
+	// where the ramp is *wrong*, because the ramp starts at #080808 and ends at
+	// #eeeeee. See TestQuant256EndpointsAreActuallyBlackAndWhite.
+	for _, v := range []byte{10, 64, 128, 200} {
 		idx := quant256(v, v, v)
 		if idx < 232 {
 			t.Errorf("grey %d mapped to %d, want the grey ramp (>=232)", v, idx)
@@ -1829,17 +1833,34 @@ func TestBlackTopPixelInHalfModeIsPainted(t *testing.T) {
 	}
 }
 
-func TestQuant256KeepsBlacksOnTheNeutralRamp(t *testing.T) {
-	// True black maps to 232 (#080808), not the cube's 16 (#000000). That looks
-	// wrong in isolation and is deliberate: keeping every neutral on the same
-	// ramp is what stops greys picking up a colour cast on some palettes, and
-	// TestQuant256GreyRamp pins the whole ramp. Not to be "fixed" to 16 without
-	// measuring the cast it was traded against.
-	if got := quant256(0, 0, 0); got != 232 {
-		t.Errorf("quant256(0,0,0) = %d, want 232 (the ramp's black)", got)
+// TestQuant256EndpointsAreActuallyBlackAndWhite pins the two colours the grey
+// ramp cannot represent.
+//
+// The grey ramp runs 232..255, which is #080808 through #eeeeee. It is the right
+// home for mid greys — that is the colour-cast fix, and TestQuant256GreyRamp still
+// pins it — but its endpoints are not black and white. Mapping true black to 232
+// means every "black" cell on a 256-colour terminal is #080808, a faint grey box
+// that reads as a smudge against the terminal's own black background.
+//
+// This was previously asserted the other way round, with a note not to "fix" it
+// without measuring the cast. Measured now, with a working emulator to read the
+// result back: the cast concern is real for mid greys and unaffected by sending
+// the exact endpoints to 16 and 231, which are #000000 and #ffffff. So both
+// properties hold at once, and the earlier version only had one of them.
+func TestQuant256EndpointsAreActuallyBlackAndWhite(t *testing.T) {
+	if got := quant256(0, 0, 0); got != 16 {
+		t.Errorf("quant256(0,0,0) = %d, want 16 (#000000); the ramp's 232 is #080808", got)
 	}
-	if got := quant256(255, 255, 255); got != 255 {
-		t.Errorf("quant256(255,255,255) = %d, want 255", got)
+	if got := quant256(255, 255, 255); got != 231 {
+		t.Errorf("quant256(255,255,255) = %d, want 231 (#ffffff); the ramp's 255 is #eeeeee", got)
+	}
+	// And the property that actually matters: round-tripping through the palette
+	// gives back the colour asked for. Before the fix this was 080808.
+	if got := xterm256(quant256(0, 0, 0)); got != 0x000000 {
+		t.Errorf("black round-trips to %06x, want 000000", got)
+	}
+	if got := xterm256(quant256(255, 255, 255)); got != 0xffffff {
+		t.Errorf("white round-trips to %06x, want ffffff", got)
 	}
 }
 

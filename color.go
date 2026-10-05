@@ -75,10 +75,25 @@ func detectColor(env []string) ColorMode {
 // The greys matter more than they look: ASCII video is full of near-neutral
 // content, and the colour cube's darkest entry (16) is not actually black, so
 // without the grey ramp mid-greys get a visible colour cast.
+//
+// But pure black and pure white are not greys and must not go to the ramp. The
+// ramp starts at index 232, which is #080808 — not black. Sending true black there
+// means every "black" cell on a 256-colour terminal is a faint grey box, which
+// against the terminal's own black background reads as a grid of smudges rather
+// than as empty cells. Index 16 is #000000 and 231 is #ffffff in the standard
+// palette, so the exact endpoints go there and everything between takes the ramp.
+//
+// This was invisible for the entire life of the colour leak tests: the emulator in
+// screen_test.go ignored SGR 38/48 outright, so every colour compared as 0, and
+// leakFrames' final frame is entirely black — black matched black, 216 cells a
+// time, and the suite went green without ever reading a colour. See sgr.
 func quant256(r, g, b byte) int {
-	// Grey decision first. Pure black and pure white exist in the cube (16 and
-	// 231) but the 232-255 ramp is neutral, and mapping black to cube-black
-	// leaves greys with a colour cast on some palettes.
+	if r == 0 && g == 0 && b == 0 {
+		return 16 // #000000, not the ramp's #080808
+	}
+	if r == 255 && g == 255 && b == 255 {
+		return 231 // #ffffff, not the ramp's #eeeeee
+	}
 	if absDiff(r, g) < 12 && absDiff(g, b) < 12 && absDiff(r, b) < 12 {
 		avg := (int(r) + int(g) + int(b)) / 3
 		return 232 + avg*23/255

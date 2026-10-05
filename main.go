@@ -406,6 +406,10 @@ func playQueue(opts options, mode ColorMode, tracks []Track, index int, music bo
 			index+1, len(tracks), tracks[index].Title, tracks[index].ChannelText())
 
 		outcome := playTrack(po, tracks, index)
+		if debugQueue {
+			fmt.Fprintf(os.Stderr, "queue: track %d/%d %q -> %v\n",
+				index+1, len(tracks), tracks[index].Title, outcome)
+		}
 		switch outcome {
 		case OutcomeQuit, OutcomeError:
 			return
@@ -429,3 +433,8 @@ var debugSync = os.Getenv("VSPZ_YT_CLI_DEBUG_SYNC") != ""
 // debugViz traces the spectrum values reaching the styles. Same reasoning as
 // debugSync: off by default, because stderr is a stream the renderer uses.
 var debugViz = os.Getenv("VSPZ_YT_CLI_DEBUG_VIZ") != ""
+
+// debugQueue traces every queue transition. The only way to tell a track that
+// genuinely ended from one whose mpv exited for some other reason, which look
+// identical from the outside: both return an Outcome and both move the queue on.
+var debugQueue = os.Getenv("VSPZ_YT_CLI_DEBUG_QUEUE") != ""

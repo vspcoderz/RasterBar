@@ -111,6 +111,25 @@ unmarshal — which `probeMedia` cannot distinguish from "no duration", so the
 library's length column silently goes blank. `TestFfprobeOutputShape` pins the
 real response.
 
+## Two rules that look like bugs and are not
+
+**A track ends when *both* streams end, not when the first one does.** mpv exiting
+is the end of the *audio*; the video pipe closing is the end of the *picture*. Ending
+on mpv's exit alone means any file whose soundtrack is shorter than its video jumps
+to the next track with half the film unwatched.
+
+This was masked for the entire life of the project by the `probeMedia` bug above:
+`hasAudio` was always false, every local file was classified silent, `sess.audio`
+stayed nil, and video mode ended tracks on the grace timer after the video pipe
+closed instead. Fixing the probe turned a latent ordering bug into a live one, which
+is the argument for fixing a bug in the same commit that removes whatever hid it.
+
+**Nil a channel once you have consumed its close.** A closed channel is permanently
+ready, so leaving it in a `select` makes that arm fire on every iteration — a busy
+loop that spins a core and floods stderr if anything is logging. `sess.audio` and
+`sess.frames` are both set to nil as they are consumed. A nil channel blocks forever
+in a select, which is exactly the "never again" needed.
+
 ## Testing
 
 Behaviour is tested at seven seams, all runnable without ffmpeg, mpv, or network:
@@ -147,6 +166,19 @@ construction and proves nothing.
 catch a stale cell: a renderer that emits the right bytes in the wrong order still
 "writes something". Reconstructing the grid and comparing it to the frame that was
 handed in is the assertion that means anything.
+
+The emulator in `screen_test.go` used to **ignore SGR 38/48 entirely**, which made
+every colour assertion in that file vacuous: it recorded each cell's colours as 0 no
+matter what was emitted, and `leakFrames` finishes on an all-black frame, so "screen
+is black" matched "frame is black" for all 216 cells. The colour leak tests had never
+once read a colour. It is implemented now, and it immediately exposed that
+`quant256` was mapping pure black onto grey-ramp index 232 — which is `#080808`, not
+black — so every "black" cell on a 256-colour terminal was a faint grey smudge.
+
+`assertScreenMatches` also has to know the colour mode, or a 256-colour screen is
+compared against a 24-bit expectation and every non-exact colour reads as a failure.
+Quantisation is not a leak, and treating the two as the same thing is how a real leak
+gets dismissed as a test bug.
 
 `DiffRenderer` and `ColorDiffRenderer` both keep a diff cache the overlay is
 invisible to, so closing an overlay **must** be followed by `ForceNext` or the
@@ -185,6 +217,7 @@ Use a real pty. `/tmp/opencode/ptycheck.py` (cases: `seek`, `back`, `pause`,
 | `termscreen.py` | the terminal emulator every other script asserts with; mirrors `screen_test.go` deliberately, because two implementations of the same idea would disagree |
 | `ptydrive.py` | shared pty plumbing: pump, send keys, locate HUD rows by content |
 | `musiccheck.py` | music mode end to end — every style cycles, palettes, transport, prompt, strip |
+| `leakdecide.py` | dense→sparse style switch must actually clear cells; "every row has ink" is not a valid invariant, because bars fills the bottom and scope draws a line |
 | `videockeck.py` | video mode has not regressed, including **live SIGWINCH resizes** |
 | `silentcheck.py` | a video-only local file plays its full length |
 | `hanghunt.py` | repeated seeks never freeze the loop (the `Close` deadlock) |

@@ -644,7 +644,7 @@ func TestOverlayDoesNotCorruptTheNextFrame(t *testing.T) {
 				if err := r.Draw(last); err != nil {
 					t.Fatal(err)
 				}
-				assertScreenMatches(t, sc, cols, rows, glyph, last)
+				assertScreenMatches(t, sc, cols, rows, glyph, mode, last)
 			})
 		}
 	}
@@ -722,7 +722,7 @@ func TestCloseOverlayForcesARepaint(t *testing.T) {
 	if err := r.Draw(last); err != nil {
 		t.Fatal(err)
 	}
-	assertScreenMatches(t, sc, cols, rows, GlyphHalf, last)
+	assertScreenMatches(t, sc, cols, rows, GlyphHalf, ColorTrue, last)
 }
 
 // TestProgressBarMarkSitsAtTheOldPosition: the tick has to be where playback
