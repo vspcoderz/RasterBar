@@ -38,6 +38,29 @@ const agcFallDb = 1.2
 // agcFallDb is over two minutes of solid block.
 const infDb = -140.0
 
+// agcGateDb is the absolute level below which nothing is drawn, no matter what the
+// gain is doing.
+//
+// The gain is a high-water mark with a span under it, which is correct for music
+// and catastrophic without this. Band levels are logged as dB relative to the FFT
+// as computed, so a full-scale tone sits around +42dB and digital silence at
+// -240dB. A quiet passage of real music has a *flat* spectrum, and a flat spectrum
+// normalises against itself: peakDb tracks the noise, the floor lands 42dB below
+// the noise, and every band therefore reads 1.0. Measured before this existed: a
+// -120dBFS dither tone lit 48 of 48 bands with a mean of 0.825, i.e. a full-scale
+// block where the signal was inaudible.
+//
+// -80dBFS was picked by measurement rather than taste. The per-band RMS of
+// -120dBFS broadband noise came out at -92.7dB, and that has to be under the gate;
+// a -100dBFS tone came out at -57.6dB, and that has to stay visible because it is
+// a signal someone chose to record quietly. -80 sits between the two with about
+// 13dB of margin on the noise side.
+//
+// Only the floor is gated, never the peak, so the shape of anything above the gate
+// is untouched: a gate on the peak would clip a quiet passage flat, and a gate on
+// the floor merely decides where the bottom of the picture is.
+const agcGateDb = -80.0
+
 type FFT struct {
 	cos, sin []float64
 	rev      []int
@@ -229,10 +252,23 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 	// band[last]=0.950, i.e. no spectrum at all.
 	//
 	// It is not an absolute level meter and nothing claims it is.
-	if s.peakDb > -infDb {
+	// The guard is peakDb > infDb, i.e. > -140, which is the floor this is
+	// allowed to fall to.
+	//
+	// It read > -infDb, i.e. > +140, until it was caught: peakDb reaches about
+	// +42 at full scale, so the condition was never true, the subtraction never
+	// ran, and the gain's high-water mark was a pure all-time maximum. Every
+	// consequence downstream of "the gain falls" was therefore false -- the
+	// comment on agcFallDb about a note holding its place for three seconds
+	// described code that did nothing -- and nothing caught it, because the fall
+	// has no behaviour of its own that fails loudly. It only fails to adapt.
+	if s.peakDb > infDb {
 		s.peakDb -= agcFallDb
 	}
 	floor := s.peakDb - agcSpanDb
+	if floor < agcGateDb {
+		floor = agcGateDb
+	}
 
 	for b := 0; b < s.bands; b++ {
 		v := (s.raw[b] - floor) / agcSpanDb
