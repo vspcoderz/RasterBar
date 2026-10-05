@@ -300,6 +300,74 @@ the seam between them. The assertion that actually catches it is "did the field
 still have particles at the *end* of the track" — not "did it ever have any", and
 not "how many are alive": 25 were alive and all 25 had drifted off the grid.
 
+### The automatic gain
+
+Four more, all in `fft.go`, and three of the four were only findable by building
+audio designed to break them. The fixtures in play before this were one 60-second
+file with no dynamic range at all, which cannot exercise a gain that only misbehaves
+when the signal *changes character*. `genstress.py` produces eight segments — loud,
+silence, quiet, flat noise at two levels — and `musicraw/` holds real tracks for the
+other direction.
+
+14. **The gain's high-water mark never fell.** The guard read `peakDb > -infDb`,
+    i.e. `> +140`, so the subtraction never ran. `peakDb` was a pure all-time
+    maximum. Every downstream claim about the gain adapting was therefore false,
+    including a comment describing exactly that behaviour — and nothing failed
+    loudly, because a gain that never falls only fails to adapt. Fixed to
+    `peakDb > infDb`; 400 silent analyses now walk it down 480dB instead of leaving
+    it at 41.5.
+
+15. **The gain's floor was unbounded below, so broadband noise normalised against
+    itself.** `agcGateDb` was added as the fix: a -120dBFS dither tone had lit 48 of
+    48 bands with a mean of 0.825 — a full-scale block where the signal was
+    inaudible.
+
+    The gate is only good for what is *sub-audible*. A -74dBFS noise floor measures
+    -46dB per band, **34dB above the gate**, so it still drew 48/48 bands with a
+    mean of 0.738. No absolute threshold fixes this: a -60dBFS tone measures
+    -18.8dB per band, so level alone cannot separate audible noise from quiet music.
+
+16. **Two wrong answers to bug 15, both worth recording.**
+
+    *Attempt one — gate on shape, measured on the display.* Using mean/max of the
+    normalised bands: noise read 0.75-0.88, tonal fixtures read 0.04-0.11, so it
+    looked decisive. **Measured against three real tracks it read 0.42-0.80** —
+    fully overlapping the noise — and the ramp as set would have dimmed real music
+    by up to 99%. The synthetic tones lied about what music looks like.
+
+    *Attempt two — same metric, still on the display, worse.* Normalisation clamps
+    at the floor, and a clamp manufactures contrast: a quiet frame's bands land at
+    exactly zero except a few just above, which looks like structure. The gate then
+    **inverted** — -58dBFS noise passed as *less* flat and drew brighter than
+    -78dBFS noise. Quieter material rendered on top of louder material.
+
+    The fix for both: measure shape in dB, on the raw band levels, *before* the
+    floor and the clamp — so it describes the signal rather than the display. On its
+    own that still fails, because music's flattest frames (p01 5.27dB) touch noise's
+    (p95 5.18dB).
+
+17. **What does separate them is that they differ for different reasons.** Music's
+    flattest moments are *loud* — its quiet passages are sparse, hence
+    high-contrast — and noise is quiet at every moment. Measured over 1452 music
+    frames and 1072 noise frames:
+
+    ```
+                     p05        p50        p95
+    music level   -28.4 dBFS  -12.8 dBFS  -9.1 dBFS
+    noise level   -98.9 dBFS  -78.8 dBFS  -58.6 dBFS
+
+    stdDb <= 6 AND level <= -50 dBFS  ->  music gated 0.0%   noise gated 97.3%
+    ```
+
+    The gate is now two conditions ANDed, so "flat" means quiet *and* structureless.
+    Verified end to end: real music renders 43.4% of the panel against the old
+    build's 43.5% (identical min/max), while the stress track's flat-noise segment
+    went from 41% of the grid to essentially zero.
+
+    Note the band levels are **not** dBFS — they are unnormalised FFT magnitudes
+    carrying a +44.2dB offset — which is why `agcGateDb`'s "dBFS" claim never meant
+    what it said, and why `levelDbfs` is measured off the input samples instead.
+
 ## Verification
 
 1. `go vet ./...`

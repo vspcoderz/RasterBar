@@ -148,6 +148,40 @@ loop that spins a core and floods stderr if anything is logging. `sess.audio` an
 `sess.frames` are both set to nil as they are consumed. A nil channel blocks forever
 in a select, which is exactly the "never again" needed.
 
+## The spectrum: units, and what not to measure
+
+**Band levels are not dB.** `SpectrumAnalyzer` stores `20*log10` of the raw FFT
+magnitude, unnormalised — a full-scale tone reads about **+42**. Anything stated in
+"dB" in `fft.go` is therefore relative to the FFT as computed, not to the signal.
+Measured offset against known amplitudes is a constant +44.2dB, but it is only
+exact for the band a tone happens to land in, because bands are log-spaced and a
+band's level divides by its own bin count.
+
+The practical consequence: `agcGateDb`'s comment claimed to be "dBFS" and was not,
+which is why a -74dBFS noise floor sat 34dB *above* a gate named after -80dBFS.
+When a threshold has to mean a physical level, measure it off the input samples
+(`measureLevel`), never off the bands.
+
+**Never measure a property of the signal on the display.** Normalisation applies a
+floor and a clamp, and a clamp invents contrast that the input did not have — a
+quiet frame's bands all land at exactly zero except a few just above, which reads
+as structure. Measuring "how flat is this spectrum" from the normalised output
+inverted the result: quieter noise appeared *less* flat than louder noise and drew
+brighter. `stdDb` and `levelDbfs` are both computed before any of that, and the
+ordering is load-bearing — see the comment on `noiseLevelDb`.
+
+**Calibrate against real material, or the fixture will agree with your bug.** Two
+successive gates were tuned on synthesised tonal fixtures and both passed there
+while being wrong on music: the first would have dimmed real tracks by up to 99%,
+because tonal test signals read mean/max 0.04–0.11 where real music reads 0.42–0.80.
+The rule that survived was only found by measuring three real tracks and finding
+the two candidate populations *touching* — at which point the fix was to find a
+second, independent axis (level) rather than to nudge the threshold.
+
+`level` and `stdDb` are kept as unexported fields specifically so a test can assert
+the gate's *decision* directly. Asserting on rendered output alone means waiting
+through the smoother's 15-frame release before you learn the gate was wrong.
+
 ## Testing
 
 Behaviour is tested at seven seams, all runnable without ffmpeg, mpv, or network:

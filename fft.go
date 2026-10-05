@@ -44,22 +44,101 @@ const infDb = -140.0
 // The gain is a high-water mark with a span under it, which is correct for music
 // and catastrophic without this. Band levels are logged as dB relative to the FFT
 // as computed, so a full-scale tone sits around +42dB and digital silence at
-// -240dB. A quiet passage of real music has a *flat* spectrum, and a flat spectrum
-// normalises against itself: peakDb tracks the noise, the floor lands 42dB below
-// the noise, and every band therefore reads 1.0. Measured before this existed: a
-// -120dBFS dither tone lit 48 of 48 bands with a mean of 0.825, i.e. a full-scale
-// block where the signal was inaudible.
-//
-// -80dBFS was picked by measurement rather than taste. The per-band RMS of
-// -120dBFS broadband noise came out at -92.7dB, and that has to be under the gate;
-// a -100dBFS tone came out at -57.6dB, and that has to stay visible because it is
-// a signal someone chose to record quietly. -80 sits between the two with about
-// 13dB of margin on the noise side.
+// -240dB.
 //
 // Only the floor is gated, never the peak, so the shape of anything above the gate
 // is untouched: a gate on the peak would clip a quiet passage flat, and a gate on
 // the floor merely decides where the bottom of the picture is.
+//
+// It is deliberately shallow. This gate can only reject what is genuinely
+// sub-audible -- dither, codec residue, the bottom of a 24-bit capture -- and it
+// cannot do anything about audible noise, because level alone is the wrong axis.
+// A -74dBFS noise floor measures -46dB per band, 34dB above this gate, while real
+// quiet material measures anywhere from -19dB up: no absolute threshold on band
+// level separates them. See noiseLevelDb for what does.
 const agcGateDb = -80.0
+
+// The noise gate: broadband noise draws as a solid block, and neither level nor
+// shape decides that alone.
+//
+// Measured on eight seconds of deliberately flat spectrum -- the case that defeats
+// a level-based gate:
+//
+//	segment         total level  bands lit  mean/max
+//	noise -74dBFS       -74.8       48/48      0.88    solid block
+//	noise -80dBFS       -84.8       48/48      0.75    solid block
+//	loud music           -4.5        8/48      0.11    correct
+//	quiet tone          -43.0        2/48      0.04    correct
+//
+// Level alone cannot separate them: the noise measures -46dB per band, 34dB above
+// agcGateDb, while real quiet content measures from -19dB up. Shape alone cannot
+// either, which is the mistake both earlier attempts made -- measured across three
+// real tracks, the band spread of music (p01 5.27dB) and of noise (p95 5.18dB)
+// touch, so any single threshold on shape trades music for noise one-for-one.
+//
+// Together they separate cleanly, because the two populations differ for different
+// reasons: music's flattest moments are loud (its quiet passages are sparse, hence
+// high-contrast), and noise is quiet at every moment. Measured over 1452 frames of
+// music and 1072 of noise:
+//
+//	                p05        p50        p95
+//	music level   -28.4 dBFS  -12.8 dBFS  -9.1 dBFS
+//	noise level   -98.9 dBFS  -78.8 dBFS  -58.6 dBFS
+//
+//	stdDb <= 6 AND level <= -50dBFS  ->  music gated 0.0%   noise gated 97.3%
+//
+// Flat then means: quiet *and* structureless. Quiet music keeps its contrast and
+// survives; loud noise is audible and is left alone.
+//
+// Two details both cost a wrong answer when violated:
+//
+// The shape has to be measured in dB. In linear terms the spread is dominated by
+// whatever is loudest, so frames with very different content yield similar ratios;
+// in dB the spread is the dynamic range itself.
+//
+// It has to be measured before normalisation. Normalisation clamps at the floor,
+// and a clamp manufactures contrast -- a frame of -98dBFS noise lands most of its
+// bands at exactly zero and a few just above, which looks like structure and is
+// purely an artefact of the floor. That version inverted the gate completely:
+// quieter noise passed as *less* flat and drew brighter, so -58dBFS noise rendered
+// above -78dBFS noise. It passed on tonal fixtures and failed on every broadband
+// one, and is recorded here rather than silently overwritten.
+const (
+	// flatStdLo/flatStdHi are the band-spread ramp, in dB, applied only to frames
+	// already qualified as quiet. Below flatStdLo a quiet frame is flat; above
+	// flatStdHi it has structure. Between them it fades rather than blinks, because
+	// the gate runs every 93ms and a step would strobe on material sitting there.
+	//
+	// The bottom of the ramp sits at 6dB: white noise measured p50 3.34, p95 5.20,
+	// max 8.33 across 400 frames, so 6 keeps roughly 97% of noise frames fully dark
+	// while still leaving room above it for the tail. Lower it to 4 and 23% of noise
+	// frames pick up partial gain -- measured, not assumed -- which is the low-level
+	// fuzz this gate is supposed to remove.
+	//
+	// What buys the higher setting is that the ramp only ever runs on quiet frames,
+	// and quiet music has spread to spare: every quiet fixture measured came in well
+	// clear of it (9.82, 10.16), so none of them lose any height. Loud music never
+	// reaches the ramp at all -- 1 of 1452 measured frames was quiet enough to be
+	// tested, and it sat above the ramp too.
+	//
+	// The top sits at 9dB because that is where noise stops: across 1072 noise
+	// frames the spread runs p95 5.18, p99 7.26, max 9.50. Sitting it at 7 -- near
+	// music's median -- let the loudest 1.5% of noise frames reach full gain and
+	// flash the panel, and the smoother's slow release (0.18) then held that flash
+	// for about 15 frames, roughly 1.4s of residue. At 9 no measured noise frame
+	// reaches full gain.
+	flatStdLo = 6.0
+	flatStdHi = 9.0
+
+	// noiseLevelDb is the level above which a frame is never treated as noise,
+	// in dBFS of the input window.
+	//
+	// -50 sits 21dB under music's p05 (-28.4) and 9dB over noise's p95 (-58.6), so
+	// it is the wide end of the gap rather than the middle of it: dropping to -60
+	// would only stop gating the loudest 5% of noise, while raising it towards -40
+	// would start eating into quiet music to no benefit.
+	noiseLevelDb = -50.0
+)
 
 type FFT struct {
 	cos, sin []float64
@@ -153,9 +232,21 @@ type SpectrumAnalyzer struct {
 	// peakDb is the high-water mark for the automatic gain, in dB. One value for
 	// the whole spectrum, not one per band; see Analyze.
 	peakDb float64
-	rate   int
-	bands  int
-	window []float64
+	// stdDb is the standard deviation of the last frame's band levels, in dB,
+	// measured on the spectrum as the signal produced it -- before the gain, the
+	// floor or the clamp. Kept because it is the one number that says whether the
+	// frame has any shape to it, and because the alternative (recomputing it after
+	// normalisation) measures the display instead of the signal and gives the wrong
+	// answer. See noiseLevelDb.
+	stdDb float64
+	// levelDbfs is the RMS of the last input window in dBFS, the other half of the
+	// noise gate's condition. Band levels cannot supply it: they are unnormalised
+	// FFT magnitudes carrying a scale offset, so they do not mean what their name
+	// suggests. See noiseLevelDb.
+	levelDbfs float64
+	rate      int
+	bands     int
+	window    []float64
 }
 
 func NewSpectrumAnalyzer(rate, nBands int) *SpectrumAnalyzer {
@@ -210,6 +301,7 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 	if n > fftSize {
 		n = fftSize
 	}
+	s.measureLevel(samples[:n])
 	for i := 0; i < n; i++ {
 		s.re[i] = samples[i] * s.window[i]
 	}
@@ -232,6 +324,7 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 			s.peakDb = db
 		}
 	}
+	s.measureShape()
 
 	// One automatic gain for the whole spectrum, applied after every band's level
 	// is known.
@@ -270,8 +363,12 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 		floor = agcGateDb
 	}
 
+	g := s.noiseGain()
+
 	for b := 0; b < s.bands; b++ {
-		v := (s.raw[b] - floor) / agcSpanDb
+		// The gate multiplies before the clamp so that a suppressed frame lands on
+		// zero rather than on whatever the floor happened to be.
+		v := (s.raw[b] - floor) / agcSpanDb * g
 		switch {
 		case v != v: // NaN
 			v = 0
@@ -292,6 +389,78 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 		s.mags[b] = s.smooth[b]
 	}
 	return s.mags
+}
+
+// measureShape records how spread out the frame's band levels are, in dB.
+//
+// Called while raw still holds band dB -- the whole point of the field's
+// existence. Everything after this line is normalisation, and normalisation is
+// exactly what must not be part of the measurement; see noiseLevelDb for what
+// happens when it is.
+//
+// Digital silence reads as flat and is suppressed, which is the correct outcome
+// for a different reason: with no signal there is no spectrum to draw.
+func (s *SpectrumAnalyzer) measureShape() {
+	mean := 0.0
+	for b := 0; b < s.bands; b++ {
+		mean += s.raw[b]
+	}
+	mean /= float64(s.bands)
+	var vs float64
+	for b := 0; b < s.bands; b++ {
+		d := s.raw[b] - mean
+		vs += d * d
+	}
+	s.stdDb = math.Sqrt(vs / float64(s.bands))
+}
+
+// measureLevel records the input window's true RMS in dBFS.
+//
+// Measured off the samples rather than off the bands, deliberately: band levels
+// carry the FFT's own scale, which is why a -74dBFS noise floor reads -46 in band
+// terms and agcGateDb cannot be the number its comment says it is. Getting the
+// level right is what lets the gate be stated in units that mean something.
+//
+// Digital silence floors at -240 rather than negative infinity so that the value
+// stays finite and comparable; nothing downstream divides by it.
+func (s *SpectrumAnalyzer) measureLevel(samples []float64) {
+	if len(samples) == 0 {
+		s.levelDbfs = -240
+		return
+	}
+	var acc float64
+	for _, v := range samples {
+		acc += v * v
+	}
+	rms := math.Sqrt(acc / float64(len(samples)))
+	if rms <= 0 {
+		s.levelDbfs = -240
+		return
+	}
+	s.levelDbfs = 20 * math.Log10(rms)
+}
+
+// noiseGain is how much of a frame survives the noise gate.
+//
+// Two conditions, both required, because neither decides alone -- see noiseLevelDb
+// for the measurements. A loud frame is never gated: music's flattest moments are
+// loud, so the shape test only ever applies to material that is also quiet, and
+// quiet + structureless is the one description noise fits and music does not.
+//
+// The shape test ramps rather than steps because the gate runs every 93ms and a
+// step strobes on material sitting at the boundary. The level test steps, because
+// music stays 21dB clear of it and a ramp there would only dim real content.
+func (s *SpectrumAnalyzer) noiseGain() float64 {
+	if s.levelDbfs > noiseLevelDb {
+		return 1
+	}
+	switch {
+	case s.stdDb >= flatStdHi:
+		return 1
+	case s.stdDb <= flatStdLo:
+		return 0
+	}
+	return (s.stdDb - flatStdLo) / (flatStdHi - flatStdLo)
 }
 
 // Raw returns the unsmoothed band magnitudes from the last analysis.
