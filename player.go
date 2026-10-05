@@ -485,7 +485,7 @@ const seekTimeout = 2 * time.Second
 // reports how many bytes it consumed.
 //
 // A terminal does NOT guarantee that an escape sequence arrives in one read. The
-// whole reason makeRawVT sets a read timeout is that the reader has to be able to
+// whole reason term.MakeRawVT sets a read timeout is that the reader has to be able to
 // ask "is there more of this sequence?" — and when it does, the ESC turns up in
 // one read and "[C" in the next. A stateless per-read parser throws the arrow
 // away in that case, which is exactly what it did: the seek keys did nothing and

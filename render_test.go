@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/vspcoderz/rasterbar/internal/term"
 )
 
 func TestRenderFrameTo(t *testing.T) {
@@ -437,7 +439,7 @@ func TestTermSizeOnNonTTY(t *testing.T) {
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
-	if _, _, err := termSize(f); err == nil {
+	if _, _, err := term.TermSize(f); err == nil {
 		t.Error("termSize on a regular file should error")
 	}
 }

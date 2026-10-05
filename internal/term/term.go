@@ -1,4 +1,10 @@
-package main
+// Package term is the raw-terminal layer: termios, window size, and a
+// pty for subprocesses that insist on having one.
+//
+// Everything here is unexported except the four entry points the rest of the
+// program uses. It is a leaf -- nothing here knows about tracks, frames, keys or
+// colour, which is the reason it can be a package at all.
+package term
 
 import (
 	"fmt"
@@ -33,14 +39,14 @@ const (
 	vtime             = 5
 )
 
-// makeRaw disables canonical mode and echo so keys arrive one at a time
+// MakeRaw disables canonical mode and echo so keys arrive one at a time
 // without Enter. Returns a restore func and an error if stdin is not a TTY
 // (e.g. piped input), in which case the caller should keep line mode.
-func makeRaw(f *os.File) (func(), error) {
-	return makeRawVT(f, 1, 0)
+func MakeRaw(f *os.File) (func(), error) {
+	return MakeRawVT(f, 1, 0)
 }
 
-// makeRawVT is makeRaw with explicit VMIN/VTIME.
+// MakeRawVT is MakeRaw with explicit VMIN/VTIME.
 //
 // The transport keys need VTIME != 0. An arrow key arrives as three bytes
 // (ESC [ D), so the reader has to be able to ask "is there more of this
@@ -48,7 +54,7 @@ func makeRaw(f *os.File) (func(), error) {
 // pressed alone. VMIN=0/VTIME=n returns whatever arrived, or 0 bytes after n
 // tenths of a second, which is exactly that. The browse list keeps the blocking
 // variant because it only ever wants one byte at a time.
-func makeRawVT(f *os.File, min, timeout uint8) (func(), error) {
+func MakeRawVT(f *os.File, min, timeout uint8) (func(), error) {
 	var old termios
 	if err := ioctl(f.Fd(), ioctlReadTermios, unsafe.Pointer(&old)); err != nil {
 		return nil, err
@@ -81,9 +87,9 @@ type winsize struct {
 
 const tiocgwinsz = 0x5413 // TIOCGWINSZ
 
-// termSize returns the terminal's character grid dimensions.
+// TermSize returns the terminal's character grid dimensions.
 // Rejected: golang.org/x/term — one ioctl is not worth a dependency.
-func termSize(f *os.File) (cols, rows int, err error) {
+func TermSize(f *os.File) (cols, rows int, err error) {
 	var ws winsize
 	if err := ioctl(f.Fd(), tiocgwinsz, unsafe.Pointer(&ws)); err != nil {
 		return 0, 0, err

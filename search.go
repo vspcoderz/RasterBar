@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/vspcoderz/rasterbar/internal/term"
 )
 
 // Track is one search result. Field names match ytfzf's -I J output exactly
@@ -95,7 +97,7 @@ func Search(query string) ([]Track, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("empty query")
 	}
-	out, err := runUnderPTY("ytfzf", []string{"-c", "yt", "-I", "J", query})
+	out, err := term.RunUnderPTY("ytfzf", []string{"-c", "yt", "-I", "J", query})
 	if err != nil {
 		return nil, fmt.Errorf("ytfzf: %w", err)
 	}

@@ -1,4 +1,4 @@
-package main
+package term
 
 import (
 	"bytes"
@@ -22,10 +22,10 @@ const (
 	tiocGPTN   = 0x80045430 // get pty number
 )
 
-// runUnderPTY runs name with args attached to a pty, sends a newline once the
+// RunUnderPTY runs name with args attached to a pty, sends a newline once the
 // child has had time to draw its UI (to confirm an fzf selection), and returns
 // everything written to the pty.
-func runUnderPTY(name string, args []string) ([]byte, error) {
+func RunUnderPTY(name string, args []string) ([]byte, error) {
 	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open ptmx: %w", err)

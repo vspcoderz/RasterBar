@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/vspcoderz/rasterbar/internal/term"
 )
 
 // TUI is a plain-stdlib list view. No bubbletea: this is a scrollable list and
@@ -22,7 +24,7 @@ type TUI struct {
 
 func NewTUI(in, out *os.File, query string, tracks []Track) *TUI {
 	rows := 12
-	if _, r, err := termSize(out); err == nil && r > 6 {
+	if _, r, err := term.TermSize(out); err == nil && r > 6 {
 		// A third of the window, so a tall terminal shows more results.
 		rows = r / 3
 		if rows < 4 {
@@ -50,7 +52,7 @@ func (t *TUI) clear() {
 
 // width returns the terminal width, falling back to 80 when stdout is not a TTY.
 func (t *TUI) width() int {
-	if c, _, err := termSize(t.out); err == nil && c > 20 {
+	if c, _, err := term.TermSize(t.out); err == nil && c > 20 {
 		if c > maxCols {
 			return maxCols
 		}
@@ -94,7 +96,7 @@ func (t *TUI) render() {
 // in raw mode the terminal sends \r for Enter and never \n, so a line-based
 // reader (bufio.Scanner) never fires. That bug shipped in the first draft.
 func (t *TUI) Run() (Action, int) {
-	restore, err := makeRaw(t.in)
+	restore, err := term.MakeRaw(t.in)
 	if err != nil {
 		// Not a TTY (piped input). Fall back to line mode so the binary is
 		// still scriptable: read one decision from stdin.

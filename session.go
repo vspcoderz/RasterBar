@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/vspcoderz/rasterbar/internal/term"
 )
 
 // mediaPair is one track's resolved streams and duration.
@@ -500,7 +502,7 @@ type playOpts struct {
 // navigation to whoever owns the list.
 func playTrack(o playOpts, queue []Track, index int) Outcome {
 	termCols, termRows := 0, 0
-	if c, r, err := termSize(o.out); err == nil {
+	if c, r, err := term.TermSize(o.out); err == nil {
 		termCols, termRows = c, r
 	}
 	if o.cols > 0 {
@@ -516,7 +518,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	strip := o.strip || o.music
 
 	// VTIME read so arrow keys arrive whole; see makeRawVT.
-	if restore, err := makeRawVT(o.in, 0, 1); err == nil {
+	if restore, err := term.MakeRawVT(o.in, 0, 1); err == nil {
 		defer restore()
 	}
 	fmt.Fprint(o.out, "\x1b[?25l")
@@ -979,7 +981,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 					drained = true
 				}
 			}
-			c, r, err := termSize(o.out)
+			c, r, err := term.TermSize(o.out)
 			if err != nil || (c == l.cols && r == l.termRows) {
 				continue
 			}
