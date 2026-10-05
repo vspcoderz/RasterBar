@@ -1,172 +1,81 @@
+<div align="center">
+
 # vspz-yt-cli
 
-A terminal YouTube player with two modes. **Video mode** renders video as ASCII or
-colour art, locked in sync to the music. **Music mode** replaces the picture with a
-visualizer driven by a real FFT — bars, an oscilloscope, a waterfall, a radial
-spectrum, or a particle field — and it is a full player, not a demo: transport
-keys, HUD, chapters, seek-to-timestamp and an auto-advancing queue in both modes.
+**A YouTube player that lives in your terminal.**
+ASCII video, or a music visualiser with ten gradient palettes — in one static
+binary with **zero third-party Go modules**.
 
-Single static Go binary. **Zero third-party Go modules.**
+</div>
 
-```
-vspz-yt-cli "lofi hip hop"                  # music mode (default)
-vspz-yt-cli -M --viz radial "synthwave"     # music mode, radial spectrum
-vspz-yt-cli -a "synthwave"                  # video mode
-vspz-yt-cli -a -q 720 "synthwave"           # force a higher-resolution source
-vspz-yt-cli -m "jazz"                       # muted; the visualizer still animates
-```
+---
 
-### The two modes
+<p align="center">
+  <img src="docs/mirror.png" width="49%" alt="mirror visualiser at 435x372">
+  <img src="docs/mirror-wide.png" width="49%" alt="mirror visualiser at 715x445">
+</p>
 
-| | Video (`-a`) | Music (`-M`, default) |
-|---|---|---|
-| Picture | ASCII or colour video | a visualizer |
-| Children | ffmpeg (video) + mpv (audio) | mpv (audio) + a second ffmpeg for the spectrum tap |
-| Clock | frame count, drift-corrected against mpv | mpv's own position, asked per frame |
-| Extra keys | `s` toggles the spectrum strip | `v`/`V` style, `c` palette, `s` strip |
+<p align="center"><sub>
+  <code>mirror</code> visualiser, two terminal widths. The strip under the progress
+  bar is the live spectrum; the chrome is the HUD.
+</sub></p>
 
-Every playback key works in both. The strip costs a row of video, so it is off by
-default in video mode and on by default in music mode.
+---
 
-### Visualizers
+## What it is
 
-`v` cycles the style, `c` the palette. Both carry over to the next track, so you
-press them once per session rather than once per song.
+You point it at a search, a URL, or a folder. It plays the audio through `mpv`
+and paints the picture itself, straight into the terminal's cell grid — colour,
+half-blocks, diff-rendered so only the cells that changed get written.
 
-| Style | What it draws |
+Two modes, one player:
+
+| | |
 |---|---|
-| `bars` | log-spaced bands with peak-hold caps |
-| `scope` | the raw waveform, decimated across the width |
-| `mirror` | bands mirrored about an axis, kaleidoscope-folded when wide enough |
-| `waterfall` | spectrum history scrolling down — song structure you can see |
-| `radial` | spokes from a centre point, aspect-corrected |
-| `particles` | dots launched on transients |
+| **`-M` music mode** *(default)* | no video. Six audio-reacting visualisers, ten palettes, beat detection. |
+| **`-a` video mode** | ASCII or truecolour video, with the spectrum strip under the picture. |
 
-Palettes: `spectrum` (bass red → treble violet), `height`, `ocean`, `ember`,
-`mono`. In mono every palette draws the same grey ramp, so `c` says so rather than
-cycling invisibly.
+## Visualisers
 
-The two expensive styles are capped rather than disabled: particles never exceed
-400, and neither costs more on a 300x120 terminal than on an 80x24 one. A style
-that only works on a big terminal is a style most people never see.
+`v` and `V` walk them; `--viz NAME` picks one at startup.
 
-### Beat detection
-
-Spectral flux with an adaptive threshold, feeding an onset envelope and a tempo
-estimate. Both are honest about their limits: the tempo is a median of recent
-intervals clamped to 60–180 and it is an *estimate*, and the envelope is what the
-strobe and the particles draw rather than the raw onset flag, because a flag true
-for one 93ms window is invisible at 30fps.
-
-Two decisions in here were got wrong first and are worth knowing about before
-changing either:
-
-- The detector reads the analyser's **raw** magnitudes, not its smoothed output. A
-  bar wants a slow release; an onset detector wants the opposite, and gets weaker
-  every bar otherwise.
-- The adaptive threshold is a **median**, not a mean. Onsets are rare, so a mean is
-  dragged up by the very events it should detect, and on a periodic signal the
-  mean *is* the event — nothing can cross `mean * 1.6`.
-
-### Resolution follows your terminal
-
-The ASCII grid and the source video resolution are both derived from your
-terminal size (`TIOCGWINSZ`), so you never pay decode CPU for pixels you cannot
-see:
-
-| Terminal | Character grid | Source |
-|---|---|---|
-| 80x24 | 80 x ~21 | 360p |
-| 120x40 | 120 x ~40 | 480p |
-| 200x60 | 200 x ~57 | 720p |
-
-Overrides, because auto-detection cannot be perfect:
-
-```
--q 240|360|480|720|1080   hard cap/floor on source resolution
---aspect R                cell height/width ratio (default 2.0)
---cols N / --rows N       force the character grid
--c / --mono               force colour on, or off
-```
-
-`--aspect` exists because the 2:1 cell ratio is an assumption about your font,
-not a measured value. Raise it if the image looks squashed, lower it if it
-looks stretched.
-
-## Features
-
-- **Search** via `ytfzf -c yt -I J` under a built-in PTY, falling back to
-  `yt-dlp ytsearch10` if the ytfzf scrape comes back empty.
-- **Browse** in a dependency-free TUI: `j`/`k`/arrows, `g`/`G`, `1`-`9` jump.
-- **A real player in both modes**: play/pause, ±10s/±1s/±60s seek, chapter
-  navigation, `:1:30` jump-to-timestamp with a preview, volume, `n`/`p` through
-  the queue, and auto-advance when a track ends.
-- **Music mode** with a real 48-band spectrum — hand-rolled radix-2 FFT with a
-  Hann window and log-spaced band edges (30 Hz → Nyquist) — behind six visualizers.
-- **ASCII video** rendered from raw frames, with **A/V sync**.
-- **Colour** via half-block cells (`▀`), auto-detected: 24-bit when the terminal
-  advertises it, xterm-256 palette otherwise, monochrome if not. Two pixels per
-  cell means colour *doubles* vertical resolution instead of costing it.
-- **Diff-based rendering** that repaints only changed cells, which is what keeps
-  large grids smooth. The visualizers paint through the same renderer, so they
-  inherit its diffing instead of needing their own.
-- **Tuned for low-end machines**: resolution, frame rate, particle count and
-  visualizer rate all scale with your terminal and grid size.
-- **Library mode** — point it at a directory and your own anime, series or music
-  browse as a catalog, ordered by series/season/episode, with the queue
-  auto-advancing. Audio containers (`.mp3`, `.flac`, `.m4a`, …) are recognised
-  too. See below.
-
-## Library mode
-
-```
-vspz-yt-cli --library ~/Videos/Anime
-vspz-yt-cli -l ~/Videos/Anime --play          # start the first episode, no list
-vspz-yt-cli -l ~/Videos/Anime --no-probe       # instant scan, durations shown as --:--
-```
-
-Filenames are parsed into series, season and episode, so a messy tree lands in a
-watchable order instead of a lexical one:
-
-| Filename | Becomes |
+| name | what it does |
 |---|---|
-| `Cowboy Bebop S01E02 - Stray Dog Strut.mkv` | `S01E02` Cowboy Bebop — Stray Dog Strut |
-| `Cowboy Bebop - 07 - Session 3 [SubsPlease].mkv` | `E07` Cowboy Bebop — Session 3 |
-| `Show Name 01x05.mkv` | `S01E05` Show Name |
-| `Show Name - 100.mkv` | `E100` Show Name |
-| `Show Name (2019) - 03.mkv` | `E03` Show Name — the year is not an episode |
-| `Random Home Video.mkv` | skipped, no episode marker |
+| `bars` | the classic. Bars grow from the baseline, peak caps hold the top. |
+| `scope` | a waveform trace, aspect-corrected so it's a line and not a smear. |
+| `mirror` | mirrored around the centreline — the wings in the screenshots. |
+| `waterfall` | a scrolling spectrogram. Newest row on top, fading with age. |
+| `radial` | one spoke per frequency band, fanning out from the centre. |
+| `particles` | dots launched on transients and integrated with momentum. |
 
-Rules that matter:
+## Palettes
 
-- **Season comes from the directory** when the filename has none, so
-  `Show/Season 2/Show - 01.mkv` files as `S02E01`.
-- **Episode order is numeric.** A lexical sort plays episode 10 before episode 2.
-- **A title year is never an episode number.** Four digits cannot match the
-  one-to-three digit rule, so `Show (2019)` files as `Show`.
-- **A file with no episode marker is skipped**, not placed arbitrarily.
-- **An unreadable subdirectory is skipped**, not fatal.
-- Episode 1 playing through advances the queue to episode 2 on its own.
+`c` cycles. `1`–`9` and `0` pick one outright.
 
-Local files need no resolving: `ffmpeg` and `mpv` both open a path directly, so
-`yt-dlp` is never invoked in library mode. `--no-probe` skips the `ffprobe` pass
-that fills in durations — worth it on a large library over a network share.
+| key | palette | gradient runs on |
+|:---:|---|---|
+| 1 | `spectrum` | frequency — bass red → treble violet |
+| 2 | `height` | cell value, so every bar is a gradient of its own length |
+| 3 | `ocean` | frequency, narrow cyan→blue. Quiet on a dark terminal. |
+| 4 | `ember` | frequency, warm red→orange. Transients read as heat. |
+| 5 | `graphite` | cell value, **pure greyscale** |
+| 6 | `ink` | frequency, **pure greyscale** — bass black, treble white |
+| 7 | `ice` | cell value, deep navy → near-white |
+| 8 | `magma` | cell value, black → red → orange → yellow |
+| 9 | `viridis` | both, dark purple → teal → yellow |
+| 0 | `mono` | none — no colour at all. Deliberately last. |
 
-`ffmpeg`, `ffprobe` and `mpv` are required for library mode. `yt-dlp` and `ytfzf`
-are only needed for search.
-
-## Requirements
-
-External binaries, all in the Arch repos:
-
-| Tool | Why |
-|---|---|
-| `yt-dlp` | search + resolving media URLs |
-| `ffmpeg` / `ffprobe` | decode, scale, format conversion |
-| `mpv` | audio output |
-| `ytfzf` *(optional)* | preferred scraper |
+Every one is a gradient. The two greyscale ones are *not* `--mono`: they return
+`r==g==b` from the same colour path, which is what lets them carry a real
+luminance ramp instead of a flat fill.
 
 ## Install
+
+```sh
+go install github.com/vspcoderz/vspz-yt-cli@latest
+```
+
+Or build it yourself:
 
 ```sh
 git clone https://github.com/vspcoderz/vspz-yt-cli
@@ -174,124 +83,71 @@ cd vspz-yt-cli
 go build -ldflags="-s -w" -o vspz-yt-cli .
 ```
 
-## Keys
+**Requires** `ffmpeg` and `mpv` on `$PATH`. Searching YouTube additionally wants
+`yt-dlp` and `ytfzf`.
 
-**Browse:** `j`/`k`/arrows move · `g`/`G` top/bottom · `1`-`9` jump · `enter` play
-audio · `a` ASCII video · `q` quit
+## Use
 
-**ASCII playback:**
+```sh
+vspz-yt-cli "lofi hip hop radio"     # search and play
+vspz-yt-cli https://youtu.be/...    # a URL
+vspz-yt-cli -l ~/Music -M            # browse a folder as a visualiser
+vspz-yt-cli -l ~/Music --play       # start playing immediately
+vspz-yt-cli -a -c "tesseract"        # ASCII/colour video mode
+```
 
-| Key | Action |
+### Keys while playing
+
+| key | |
 |---|---|
 | `space` | pause / resume |
-| `←` `→` | seek -10s / +10s |
-| `,` `.` | seek -1s / +1s |
-| `<` `>` | seek -60s / +60s |
+| `←` `→` | seek ∓10s |
+| `,` `.` | seek ∓1s |
+| `<` `>` | seek ∓60s |
 | `[` `]` | previous / next chapter |
 | `:` | jump to a timestamp |
 | `n` `p` | next / previous result |
-| `+` `-` | volume up / down |
-| `q` `ctrl-c` | quit |
+| `+` `-` | volume |
+| `v` `V` | next / previous visualiser |
+| `c` | next palette |
+| `1`–`9` `0` | pick a palette directly |
+| `s` | toggle the spectrum strip |
+| `q` | quit |
 
-A track that finishes starts the next result on its own, so a search is a
-playlist for as long as you want it. Playback stops at the end of the list
-rather than wrapping — nothing in a search result set is ordered like a
-playlist.
+### Keys while browsing
 
-The bar shows position and duration; the top line shows the track and its
-`04/19` place in the queue. After a seek the bar keeps a `┃` where playback was,
-for a few seconds, so a jump across forty minutes and a nudge of one second do
-not look the same. When a track has chapters, the one playing takes the hint row
-once the hints have faded.
-
-### `:` — jump to a timestamp
-
-Ten seconds per keypress is 240 presses to reach the credits of a long video, and
-no way at all to reach the part you can only describe as "around twelve minutes
-in". `:` opens a field over the video:
-
-```
- jump to █ 1:30
- → 1:30 / 3:20   ·   enter jump  ·   esc cancel
-```
-
-| You type | It means |
+| key | |
 |---|---|
-| `90` | 90 seconds |
-| `1:30` | minutes:seconds |
-| `1:02:03` | hours:minutes:seconds |
-| `90s` `2m` `1h2m3s` | explicit units |
-| `+30` `-1:30` | relative to where you are now |
-| `50%` | that fraction of the track |
+| `j` `k` / arrows | move |
+| `g` `G` | top / bottom |
+| `1`–`9` | jump to row |
+| `enter` | play in music mode |
+| `a` | play in video mode |
 
-The second line previews where the jump will land, from the same parser the HUD
-clock is built from, so what you type and what you see are the same format.
-`enter` jumps, `esc` cancels, and `ctrl-u` clears the line. Everything typed while
-the field is open is text — including `q`, `n` and `-`.
+The `:` prompt takes `1:30`, `1:02:03`, a bare `90` (seconds), `90s` / `2m` /
+`1h2m3s`, `+30` / `-1:30` relative to now, and `50%` of the track. It previews
+where the jump will land before you commit.
 
-Fields are not range-checked: `1:90` is 150 seconds and `90:00` is 90 minutes,
-because both are what the person typing them meant.
+## Notable
 
+**Zero third-party Go modules.** The FFT, the PTY, raw mode and termios are all
+hand-rolled. That's the project's defining constraint, not a preference — each
+dependency would have been a few dozen lines of syscall or arithmetic, and a
+player you can `go install` and trust is worth more than one with a module graph.
 
-## Design notes
+**The renderer diffs.** Repainting the whole grid every frame cost ~11KB at
+200×57 and made the terminal, not the CPU, the bottleneck. Writes are grouped into
+per-row runs so a changed cell costs a cursor move and a few characters.
 
-Why these choices, and what was rejected:
+**The spectrum is calibrated against real music.** The band levels are
+unnormalised FFT magnitudes carrying a measured +44.2dB offset, and the noise
+gate tests shape *and* level on the raw bands before any normalisation. Both
+earlier versions of that gate passed on synthesised tones and were wrong on music
+— the tones read mean/max 0.04–0.11 where real tracks read 0.42–0.80.
 
-**Zero Go dependencies, deliberately.** The spectrum analyser would normally
-pull in gonum or a DSP package; it is a radix-2 Cooley–Tukey FFT in ~80 lines
-instead (`fft.go`). The PTY needed to drive `ytfzf`/`fzf` would normally pull in
-`creack/pty`; it is two `ioctl`s (`pty.go`). Raw terminal mode would normally
-pull in `x/term`; it is `TCGETS`/`TCSETS` directly (`raw.go`). Each dependency was
-a handful of lines of syscall or arithmetic, and a zero-dependency static binary
-was the better trade.
-
-**A/V sync cannot be structural, so it is measured.** The obvious approach —
-one `ffmpeg` emitting both a video pipe and an audio FIFO — deadlocks: ffmpeg
-blocks on the second output while the first waits on a reader. So `ffmpeg` owns
-video (`-re` paced) and `mpv` owns audio, on separate clocks: the system clock
-versus the sound card's. Those drift apart over a long track no matter how
-carefully they are started, so the player asks `mpv` for its real position over
-its IPC socket every 2s and seeks the audio back onto the video when they
-diverge by more than 250ms. Measured steady-state drift is ~70ms, below the
-perceptual lip-sync threshold. Run with `VSPZ_YT_CLI_DEBUG_SYNC=1` to watch it.
-
-Two protocol details cost real time here: `mpv` **creates and binds** its IPC
-socket rather than connecting to it, and it sets `"error":"success"` on
-*successful* replies — testing for a non-empty error field rejects every good
-answer, which silently disabled the corrector entirely.
-
-**Backgrounding the window suspends both children.** An unread terminal stops
-accepting writes, so `ffmpeg` blocks; `mpv` writes straight to PipeWire and would
-keep playing, and the streams would drift apart. `SIGSTOP` on both in the same
-instant freezes both clocks — no desync, no respawn, and nothing painted over
-whatever is on screen.
-
-**Resolution, not a fixed size.** `ffmpeg` decodes every source frame regardless
-of output size, so decode cost scales with source resolution. The grid, the
-source height, and the frame rate are all derived from your terminal, so a small
-window never pays for pixels it cannot show.
-
-**mpv's stdout is discarded.** `mpv` prints a status line many times a second;
-inheriting the terminal paints over every rendered frame. This cost a real
-debugging session (0 frames visible).
-
-## Known limitations
-
-- **Transport keys are ASCII-only.** The spectrum/audio view still plays one
-  track and exits; no pause, seek, or queue advance there.
-- **Seek rebuilds both processes**, so it costs a frame or two of latency. Media
-  URLs are resolved once per track and reused across seeks; they are re-resolved
-  only if ffmpeg rejects one.
-- ASCII is luminance-only: colour is lost, and dark or low-contrast video
-  renders mostly blank. (`--mono` is the fallback path; colour is default.)
-- The half-block glyph `▀` is East Asian Ambiguous width, so a terminal that
-  renders it double-width will misalign the grid.
-- Colour mode depends on the terminal: terminals without `COLORTERM=truecolor`
-  get the 256-colour palette, and unknown terminals get no colour at all.
-- Spectrum bands are derived from an FFT over the audio tap; they track the music
-  but are not isolated per-bin equalisers.
-- `ytfzf`'s scrape depends on a reachable path and can be flaky; `yt-dlp` is the
-  fallback.
+**It fits your terminal.** Grid width, height, source resolution and frame rate
+are all derived from the window size, so a small window doesn't ask ffmpeg for a
+4K stream. `TIOCGWINSZ` is watched, and a resize rebuilds the decoder.
 
 ## License
 
