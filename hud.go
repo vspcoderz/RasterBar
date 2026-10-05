@@ -256,6 +256,24 @@ type hud struct {
 	// next keypress, so a player does not permanently spend a row reminding you
 	// what space does.
 	showHints bool
+	// status is a transient message about the last thing the user did: "viz
+	// waterfall", "transport: seek failed", "viz keys need music mode".
+	//
+	// It lives here rather than being written straight to the terminal because
+	// the HUD owns row 3 and repaints it. A message painted directly onto that
+	// row survives exactly until the next HUD repaint -- which, on the key path,
+	// is the same function call a few lines later. Writing the status from here
+	// means the "unchanged, skip" cache sees it as part of the HUD and leaves it
+	// up for as long as it is meant to last.
+	status string
+	// strip is the spectrum row shown under the video, or "" for no strip.
+	//
+	// Non-empty means the layout was computed with an extra chrome row, so the
+	// grid above it is one row shorter than it otherwise would be. That coupling
+	// is deliberate: the strip takes its space from the video rather than being
+	// painted over it, because overlaying the grid means fighting the diff cache
+	// for those cells and repainting the whole thing every frame.
+	strip string
 }
 
 // lines renders the HUD to exactly `width` columns per row.
@@ -290,6 +308,18 @@ func (h hud) lines(width int) []string {
 	barWidth := width - clockWidth
 	if barWidth < 4 {
 		// Too narrow for a usable bar: the clock matters more than progress.
+		// The strip still goes on, because it is the only thing on this row that
+		// moves -- dropping it here would silently disable a feature the user
+		// asked for, and only on a terminal narrow enough that they would not
+		// notice.
+		if h.strip != "" {
+			return []string{
+				fit(head, width),
+				fit(clock, width),
+				fit(h.strip, width),
+				fit(h.footer(), width),
+			}
+		}
 		return []string{
 			fit(head, width),
 			fit(clock, width),
@@ -301,6 +331,23 @@ func (h hud) lines(width int) []string {
 		mark = h.mark
 	}
 	bar := progressBar(h.pos, h.dur, barWidth, mark)
+
+	if h.strip != "" {
+		// Four rows, and the order is fixed: head, progress, strip, footer. The
+		// strip sits directly above the footer rather than directly under the
+		// progress bar because it is content, not chrome -- it belongs with the
+		// thing it describes.
+		return []string{
+			fit(head, width),
+			// fit() matters on this row: progressBar returns "" when the duration
+			// is unknown, so the bar contributes zero cells and the row would
+			// otherwise be short — leaving a stale tail and breaking the
+			// fixed-width invariant both renderers depend on.
+			fit(bar+"  "+clock, width),
+			fit(h.strip, width),
+			fit(h.footer(), width),
+		}
+	}
 
 	return []string{
 		fit(head, width),
@@ -326,8 +373,21 @@ func (h hud) lines(width int) []string {
 // where you are in something with structure, and it costs nothing while the hints
 // are up because those are the moments you are pressing keys anyway.
 func (h hud) footer() string {
+	// Paused first, then status, joined rather than exclusive.
+	//
+	// An earlier version let the status win outright, which hid PAUSED for four
+	// seconds every time you pressed `c` while paused -- so pausing appeared not
+	// to work. Both facts are wanted and the row is wide enough for both: the
+	// banner is a persistent state, the status is a transient one, and neither
+	// replaces the other.
 	if h.paused {
+		if h.status != "" {
+			return "PAUSED  " + h.status
+		}
 		return "PAUSED  space play  ←/→ seek  n/p next  +/- vol  : jump  q quit"
+	}
+	if h.status != "" {
+		return h.status
 	}
 	if h.chapter != "" {
 		return "▸ " + h.chapter
@@ -342,6 +402,46 @@ func (h hud) footer() string {
 		return ""
 	}
 	return "space pause  ←/→ seek  ,/. fine  </> 60s  : jump  n/p next  q quit"
+}
+
+// miniBars renders a band array as exactly width cells.
+//
+// The spectrum strip under the video, and the same ramp the bars style uses, so
+// the strip and the full-screen style read as the same instrument. Pure
+// formatting: it resamples rather than drawing, so it works at any width
+// regardless of how many bands the analyser produced.
+func miniBars(bands []float64, width int, peak []float64) string {
+	if width <= 0 {
+		return ""
+	}
+	cells := make([]byte, width)
+	if len(bands) == 0 {
+		for i := range cells {
+			cells[i] = ' '
+		}
+		return string(cells)
+	}
+	scratch := make([]float64, width)
+	resampleBands(bands, width, scratch)
+	var pk []float64
+	if len(peak) > 0 {
+		pk = make([]float64, width)
+		resampleBands(peak, width, pk)
+	}
+	for i := 0; i < width; i++ {
+		// One cell of ink, so a bar has somewhere to go but the strip stays a
+		// strip. The full-screen styles have a whole grid of rows to spend on
+		// height; a single HUD row does not.
+		v := clamp01(scratch[i])
+		if pk != nil {
+			if p := clamp01(pk[i]); p > v+0.5 {
+				cells[i] = rampBright
+				continue
+			}
+		}
+		cells[i] = rampFor(0.15 + 0.85*v)
+	}
+	return string(cells)
 }
 
 // pad2 zero-pads to two digits, for the queue counter.

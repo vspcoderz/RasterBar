@@ -103,6 +103,7 @@ type SpectrumAnalyzer struct {
 	re, im []float64
 	edges  []int // bin index per band edge
 	mags   []float64
+	raw    []float64 // pre-smoothing magnitudes; see Raw
 	smooth []float64
 	rate   int
 	bands  int
@@ -121,6 +122,7 @@ func NewSpectrumAnalyzer(rate, nBands int) *SpectrumAnalyzer {
 		re:     make([]float64, fftSize),
 		im:     make([]float64, fftSize),
 		mags:   make([]float64, nBands),
+		raw:    make([]float64, nBands),
 		smooth: make([]float64, nBands),
 		edges:  make([]int, nBands+1),
 		rate:   rate,
@@ -185,6 +187,9 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 		case v > 1:
 			v = 1
 		}
+		// Kept before the smoothing, and separately from it, because the two have
+		// different jobs and feeding one to the other breaks the second.
+		s.raw[b] = v
 		// asymmetric smoothing: fast attack, slow release reads better
 		if v > s.smooth[b] {
 			s.smooth[b] += (v - s.smooth[b]) * 0.6
@@ -195,3 +200,23 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 	}
 	return s.mags
 }
+
+// Raw returns the unsmoothed band magnitudes from the last analysis.
+//
+// Exists for the onset detector, and only for it. Detect and display need
+// opposite things from the same spectrum:
+//
+//   - A bar wants a slow release, so a hit stays visible while it decays.
+//   - An onset detector wants the opposite, and badly.
+//
+// Onset detection measures the *rise* between consecutive windows. Handed the
+// smoothed output, the slow 0.18 release means each band only falls to 82% of its
+// previous value per analysis, so the gap between transients closes by only ~18%
+// instead of all the way to zero. The next transient's rise is therefore
+// proportionally smaller than the one before, the flux shrinks geometrically, and
+// after a few bars it sits under the detector's threshold forever.
+//
+// Measured on a 120bpm gated tone: the first onset fired and then nothing for the
+// rest of the track, so the particle field spawned four dots and stopped. Fed the
+// raw magnitudes, the same signal onsets on every transient.
+func (s *SpectrumAnalyzer) Raw() []float64 { return s.raw }

@@ -54,6 +54,22 @@ const (
 	// render-loop special case so that the key table and the transport stay in
 	// one place; what happens once it is open is the loop's business.
 	CmdPrompt
+	// Visualizer keys. These carry no state of their own: Player does not know
+	// what a visualizer is, so they are passed straight through to the render
+	// loop, which does. They are still Cmds rather than raw bytes because the key
+	// table and the decoder have to agree on which byte means what, and splitting
+	// that across two places is how a key ends up half-wired.
+	CmdVizNext
+	CmdVizPrev
+	CmdPalette
+	// CmdStrip toggles the spectrum row under the video.
+	//
+	// The only key that changes the layout, and therefore the only one that has to
+	// rebuild the decoder: the strip takes a row from the grid, and the grid is
+	// ffmpeg's scale target. It also works in music mode, where it is free --
+	// there is no video to give up a row to -- so the same key means "more
+	// information" in both modes rather than "sometimes nothing".
+	CmdStrip
 )
 
 // Three seek sizes, because one is never the right one.
@@ -538,6 +554,14 @@ func cmdForByte(c byte) Cmd {
 		return CmdChapPrev
 	case ':':
 		return CmdPrompt
+	case 'v':
+		return CmdVizNext
+	case 'V':
+		return CmdVizPrev
+	case 'c':
+		return CmdPalette
+	case 's':
+		return CmdStrip
 	}
 	return CmdNone
 }

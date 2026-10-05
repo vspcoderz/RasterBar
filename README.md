@@ -1,17 +1,72 @@
 # vspz-yt-cli
 
-A terminal YouTube player: search with `ytfzf`, browse results in a custom TUI,
-play audio with a live FFT spectrum, or play video as ASCII art — with the ASCII
-locked in sync to the music.
+A terminal YouTube player with two modes. **Video mode** renders video as ASCII or
+colour art, locked in sync to the music. **Music mode** replaces the picture with a
+visualizer driven by a real FFT — bars, an oscilloscope, a waterfall, a radial
+spectrum, or a particle field — and it is a full player, not a demo: transport
+keys, HUD, chapters, seek-to-timestamp and an auto-advancing queue in both modes.
 
 Single static Go binary. **Zero third-party Go modules.**
 
 ```
-vspz-yt-cli "lofi hip hop"
-vspz-yt-cli -m "jazz"      # muted, spectrum still animates
-vspz-yt-cli -a "synthwave" # start in ASCII mode
-vspz-yt-cli -a -q 720 "synthwave"   # force a higher-resolution source
+vspz-yt-cli "lofi hip hop"                  # music mode (default)
+vspz-yt-cli -M --viz radial "synthwave"     # music mode, radial spectrum
+vspz-yt-cli -a "synthwave"                  # video mode
+vspz-yt-cli -a -q 720 "synthwave"           # force a higher-resolution source
+vspz-yt-cli -m "jazz"                       # muted; the visualizer still animates
 ```
+
+### The two modes
+
+| | Video (`-a`) | Music (`-M`, default) |
+|---|---|---|
+| Picture | ASCII or colour video | a visualizer |
+| Children | ffmpeg (video) + mpv (audio) | mpv (audio) + a second ffmpeg for the spectrum tap |
+| Clock | frame count, drift-corrected against mpv | mpv's own position, asked per frame |
+| Extra keys | `s` toggles the spectrum strip | `v`/`V` style, `c` palette, `s` strip |
+
+Every playback key works in both. The strip costs a row of video, so it is off by
+default in video mode and on by default in music mode.
+
+### Visualizers
+
+`v` cycles the style, `c` the palette. Both carry over to the next track, so you
+press them once per session rather than once per song.
+
+| Style | What it draws |
+|---|---|
+| `bars` | log-spaced bands with peak-hold caps |
+| `scope` | the raw waveform, decimated across the width |
+| `mirror` | bands mirrored about an axis, kaleidoscope-folded when wide enough |
+| `waterfall` | spectrum history scrolling down — song structure you can see |
+| `radial` | spokes from a centre point, aspect-corrected |
+| `particles` | dots launched on transients |
+
+Palettes: `spectrum` (bass red → treble violet), `height`, `ocean`, `ember`,
+`mono`. In mono every palette draws the same grey ramp, so `c` says so rather than
+cycling invisibly.
+
+The two expensive styles are capped rather than disabled: particles never exceed
+400, and neither costs more on a 300x120 terminal than on an 80x24 one. A style
+that only works on a big terminal is a style most people never see.
+
+### Beat detection
+
+Spectral flux with an adaptive threshold, feeding an onset envelope and a tempo
+estimate. Both are honest about their limits: the tempo is a median of recent
+intervals clamped to 60–180 and it is an *estimate*, and the envelope is what the
+strobe and the particles draw rather than the raw onset flag, because a flag true
+for one 93ms window is invisible at 30fps.
+
+Two decisions in here were got wrong first and are worth knowing about before
+changing either:
+
+- The detector reads the analyser's **raw** magnitudes, not its smoothed output. A
+  bar wants a slow release; an onset detector wants the opposite, and gets weaker
+  every bar otherwise.
+- The adaptive threshold is a **median**, not a mean. Onsets are rare, so a mean is
+  dragged up by the very events it should detect, and on a periodic signal the
+  mean *is* the event — nothing can cross `mean * 1.6`.
 
 ### Resolution follows your terminal
 
@@ -43,19 +98,24 @@ looks stretched.
 - **Search** via `ytfzf -c yt -I J` under a built-in PTY, falling back to
   `yt-dlp ytsearch10` if the ytfzf scrape comes back empty.
 - **Browse** in a dependency-free TUI: `j`/`k`/arrows, `g`/`G`, `1`-`9` jump.
-- **Audio playback** with a real 48-band spectrum — hand-rolled radix-2 FFT with
-  a Hann window and log-spaced band edges (30 Hz → Nyquist).
+- **A real player in both modes**: play/pause, ±10s/±1s/±60s seek, chapter
+  navigation, `:1:30` jump-to-timestamp with a preview, volume, `n`/`p` through
+  the queue, and auto-advance when a track ends.
+- **Music mode** with a real 48-band spectrum — hand-rolled radix-2 FFT with a
+  Hann window and log-spaced band edges (30 Hz → Nyquist) — behind six visualizers.
 - **ASCII video** rendered from raw frames, with **A/V sync**.
 - **Colour** via half-block cells (`▀`), auto-detected: 24-bit when the terminal
   advertises it, xterm-256 palette otherwise, monochrome if not. Two pixels per
   cell means colour *doubles* vertical resolution instead of costing it.
 - **Diff-based rendering** that repaints only changed cells, which is what keeps
-  large grids smooth.
-- **Tuned for low-end machines**: resolution and frame rate both scale with your
-  terminal and grid size.
-- **Library mode** — point it at a directory and your own anime and series
+  large grids smooth. The visualizers paint through the same renderer, so they
+  inherit its diffing instead of needing their own.
+- **Tuned for low-end machines**: resolution, frame rate, particle count and
+  visualizer rate all scale with your terminal and grid size.
+- **Library mode** — point it at a directory and your own anime, series or music
   browse as a catalog, ordered by series/season/episode, with the queue
-  auto-advancing to the next episode. See below.
+  auto-advancing. Audio containers (`.mp3`, `.flac`, `.m4a`, …) are recognised
+  too. See below.
 
 ## Library mode
 

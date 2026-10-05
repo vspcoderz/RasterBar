@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -33,7 +34,12 @@ const (
 	audioChans = 2
 )
 
-// SyncPlayer plays a track as ASCII video with audio in sync.
+// SyncPlayer plays a track: mpv owns audio, ffmpeg optionally owns video.
+//
+// musicOnly is the audio-with-no-video case, and it changes where the position
+// comes from rather than adding a second player. Video mode has two children on
+// two clocks and derives a position from the frame count; music mode has one
+// child that will simply be asked. See Seconds.
 type SyncPlayer struct {
 	ff        *exec.Cmd
 	vidOut    io.ReadCloser
@@ -49,6 +55,9 @@ type SyncPlayer struct {
 	rows      int
 	fps       int
 	startAt   float64 // media offset this player was rebuilt at
+
+	musicOnly bool
+	clock     posClock
 }
 
 // startSyncPlayer plays video (ffmpeg, -re paced) and audio (mpv) with a shared
@@ -68,18 +77,102 @@ func startSyncPlayer(videoURL, audioURL string, cols, rows, fps int, mute bool, 
 // startSyncPlayerAt is startSyncPlayer with a resume offset, used after a
 // terminal resize so playback continues instead of restarting.
 func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool, startAt float64, mode ColorMode, glyph GlyphMode) (*SyncPlayer, error) {
-	// scale straight to the character grid with flags=area. Area averaging is a
-	// proper box filter: every source pixel contributes.
-	//
-	// The previous approach scaled to cols*2 x rows*2 and then sampled every
-	// second pixel in Go. That threw away 3 of every 4 pixels, which is
-	// aliasing, not downsampling -- the image looked soft and blocky.
-	//
-	// unsharp adds a little edge contrast back, which is what makes the result
-	// read as "sharp" rather than uniformly grey.
-	//
-	// Colour path: output rgb24 at DOUBLE height, because each cell holds two
-	// stacked pixels (the half-block trick). Mono path: gray at cell height.
+	// Video first, and the first frame is read inside startVideoTap: mpv must not
+	// start until the video clock is already running, or the two begin at
+	// different wall-clock instants and video leads by however long the socket
+	// handshake took. That ordering is the whole reason this is a function call
+	// rather than two independent starts.
+	vt, err := startVideoTap(videoURL, cols, rows, fps, startAt, mode, glyph)
+	if err != nil {
+		return nil, err
+	}
+
+	audio, ipc, sock, err := startMpv(audioURL, mute, startAt)
+	if err != nil {
+		vt.kill()
+		return nil, fmt.Errorf("mpv start: %w", err)
+	}
+
+	return &SyncPlayer{
+		ff:        vt.cmd,
+		vidOut:    vt.out,
+		audio:     audio,
+		frame:     make([]byte, vt.size),
+		ipc:       ipc,
+		sockPath:  sock,
+		primed:    vt.first,
+		primedSet: true,
+		cols:      cols,
+		rows:      rows,
+		fps:       fps,
+		startAt:   startAt,
+	}, nil
+}
+
+// startAudioOnly is music mode: mpv and nothing else.
+//
+// No ffmpeg, because there is no video to decode, and because decoding a stream
+// this program is going to throw away is the most expensive thing it could do on
+// a low-end machine. The visualizer gets its audio from a separate LevelTap over
+// a separately resolved URL -- one consumer per grant, since a googlevideo URL
+// is effectively single-use (see AGENT.MD).
+func startAudioOnly(audioURL string, mute bool, startAt float64) (*SyncPlayer, error) {
+	audio, ipc, sock, err := startMpv(audioURL, mute, startAt)
+	if err != nil {
+		return nil, fmt.Errorf("mpv start: %w", err)
+	}
+	return &SyncPlayer{
+		audio:     audio,
+		ipc:       ipc,
+		sockPath:  sock,
+		startAt:   startAt,
+		musicOnly: true,
+	}, nil
+}
+
+// videoTap is the ffmpeg half of video playback: the process, its pipe, and the
+// first frame already read off it.
+type videoTap struct {
+	cmd   *exec.Cmd
+	out   io.ReadCloser
+	first []byte
+	size  int
+}
+
+// kill retires the process without waiting on the pipe.
+//
+// Deliberately SIGKILL and not a graceful close: Close on the read end of a pipe
+// with a read in flight waits for that read to finish, and the read is waiting on
+// ffmpeg, which is blocked on a full pipe. See SyncPlayer.Close for the full
+// account of that deadlock.
+func (vt *videoTap) kill() {
+	if vt == nil {
+		return
+	}
+	if vt.cmd != nil && vt.cmd.Process != nil {
+		_ = vt.cmd.Process.Kill()
+	}
+	if vt.cmd != nil {
+		_ = vt.cmd.Wait()
+	}
+}
+
+// startVideoTap launches ffmpeg for the video pipe and returns once frame 1 is in
+// hand, which is the moment the video clock starts running.
+//
+// scale straight to the character grid with flags=area. Area averaging is a
+// proper box filter: every source pixel contributes.
+//
+// The previous approach scaled to cols*2 x rows*2 and then sampled every
+// second pixel in Go. That threw away 3 of every 4 pixels, which is
+// aliasing, not downsampling -- the image looked soft and blocky.
+//
+// unsharp adds a little edge contrast back, which is what makes the result
+// read as "sharp" rather than uniformly grey.
+//
+// Colour path: output rgb24 at DOUBLE height, because each cell holds two
+// stacked pixels (the half-block trick). Mono path: gray at cell height.
+func startVideoTap(videoURL string, cols, rows, fps int, startAt float64, mode ColorMode, glyph GlyphMode) (*videoTap, error) {
 	var filter, pixFmt string
 	frameBytes := 0
 	if mode == ColorNone {
@@ -141,17 +234,25 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 		return nil, fmt.Errorf("ffmpeg start: %w", err)
 	}
 
-	// Read the first frame BEFORE starting audio. ffmpeg with -re emits frames
-	// on wall-clock, so once frame 1 is in hand the video clock is running;
-	// starting mpv at position 0 here puts both at media time 0 together.
+	// Read the first frame BEFORE returning. ffmpeg with -re emits frames on
+	// wall-clock, so the caller starting audio the moment this returns puts both
+	// children at media time 0 together.
 	first := make([]byte, frameBytes)
 	if _, err := io.ReadFull(vidOut, first); err != nil {
-		ff.Process.Kill()
-		ff.Wait()
+		vt := &videoTap{cmd: ff, out: vidOut, size: frameBytes}
+		vt.kill()
 		return nil, fmt.Errorf("read first frame: %w", err)
 	}
 
-	// mpv creates and binds its own IPC socket; we connect to it afterwards.
+	return &videoTap{cmd: ff, out: vidOut, first: first, size: frameBytes}, nil
+}
+
+// startMpv launches mpv on the audio stream and connects to its IPC socket.
+//
+// mpv creates and binds its own IPC socket; we connect to it afterwards. A
+// connection failure is not fatal: playback still works, it simply cannot be
+// measured or seeked from here.
+func startMpv(audioURL string, mute bool, startAt float64) (*exec.Cmd, *mpvIPC, string, error) {
 	sockPath := ipcSocketPath()
 
 	mpvArgs := []string{"--no-config", "--no-video", fmt.Sprintf("--start=%.3f", startAt)}
@@ -171,51 +272,102 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 	audio.Stdout = io.Discard
 	audio.Stderr = os.Stderr
 	if err := audio.Start(); err != nil {
-		ff.Process.Kill()
-		ff.Wait()
 		os.Remove(sockPath)
-		return nil, fmt.Errorf("mpv start: %w", err)
+		return nil, nil, "", err
 	}
 
-	// Connect for drift correction. A failure here is not fatal: playback still
-	// works, it simply cannot be measured or nudged.
 	ipc, err := dialIPC(sockPath, 4*time.Second)
 	if err != nil {
 		ipc = nil
 	}
-
-	return &SyncPlayer{
-		ff:        ff,
-		vidOut:    vidOut,
-		audio:     audio,
-		frame:     make([]byte, frameBytes),
-		ipc:       ipc,
-		sockPath:  sockPath,
-		primed:    first,
-		primedSet: true,
-		cols:      cols,
-		rows:      rows,
-		fps:       fps,
-		startAt:   startAt,
-	}, nil
+	return audio, ipc, sockPath, nil
 }
 
-// Seconds reports the media position reached so far, tracked from the frame
-// count. Because ffmpeg is paced by -re at native frame rate, frames rendered
-// divided by fps is an accurate position -- no probing needed, which matters
-// because probing a googlevideo URL burns it (see resolveMedia).
+// posClock holds the last position mpv reported.
 //
-// startAt is added because a rebuilt player starts decoding mid-stream at
-// -ss <startAt>: its frame counter begins at zero while the media it is
-// decoding is at 300s. Without the offset this reported 0, checkSync read that
-// as 300s of drift against mpv, and seeked the audio back to the beginning --
-// so every terminal resize rewound the track. The same applied to every seek.
+// It holds rather than extrapolating. At the rate the music pump polls, a
+// 40ms-stale clock is invisible, and extrapolating would be actively wrong
+// during a pause: the children are SIGSTOPped, mpv's reading correctly stops
+// advancing, and a wall-clock estimate would keep counting straight through the
+// freeze and come back overstating the position by the length of the pause.
+type posClock struct {
+	mu   sync.Mutex
+	pos  float64
+	seen bool
+}
+
+// update records a reading. A failed read is ignored rather than zeroing the
+// clock, so a dropped IPC reply cannot make the HUD jump back to 0:00.
+func (c *posClock) update(pos float64, ok bool) {
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	c.pos, c.seen = pos, true
+	c.mu.Unlock()
+}
+
+func (c *posClock) now() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pos
+}
+
+// started reports whether any reading has landed. mpv reports position 0 while it
+// is still probing the stream, and a clock that shows 0:00 for the first half
+// second of every seek reads as a seek that did not happen.
+func (c *posClock) started() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seen
+}
+
+// Seconds reports the media position reached so far.
+//
+// Two clocks, two answers. Video mode tracks the frame count, because ffmpeg is
+// paced by -re at native frame rate and frames rendered divided by fps is an
+// accurate position -- no probing needed, which matters because probing a
+// googlevideo URL burns it (see resolveMedia).
+//
+// Music mode asks mpv, because there is no ffmpeg to count frames and mpv will
+// answer directly. That is not a downgrade: it is the sound card's own clock,
+// reported by the process making the sound.
+//
+// startAt is added in the video path because a rebuilt player starts decoding
+// mid-stream at -ss <startAt>: its frame counter begins at zero while the media
+// it is decoding is at 300s. Without the offset this reported 0, checkSync read
+// that as 300s of drift against mpv, and seeked the audio back to the beginning
+// -- so every terminal resize rewound the track. The same applied to every seek.
+// Music mode does not need it, because mpv reports absolute position itself.
 func (s *SyncPlayer) Seconds() float64 {
+	if s.musicOnly {
+		return s.clock.now()
+	}
 	if s.fps <= 0 {
 		return s.startAt
 	}
 	return s.startAt + float64(s.frames)/float64(s.fps)
 }
+
+// pollPosition refreshes the cached position from mpv.
+//
+// The only caller is the music pump, and it polls on the render tick rather than
+// having Seconds reach for the socket. Seconds is called from the render loop,
+// and a socket round trip there is a stall of unknown length on a connection that
+// can block: a busy mpv answers late, and the frame budget is gone. Polling
+// somewhere else turns that into one missed tick instead of a dropped frame.
+func (s *SyncPlayer) pollPosition(timeout time.Duration) (float64, bool) {
+	if s.ipc == nil {
+		return 0, false
+	}
+	pos, ok := s.ipc.timePos(timeout)
+	s.clock.update(pos, ok)
+	return pos, ok
+}
+
+// ClockStarted reports whether mpv has ever reported a position. False means it
+// is still probing, and the position is not yet meaningful.
+func (s *SyncPlayer) ClockStarted() bool { return s.clock.started() }
 
 // SyncReport describes one drift measurement.
 type SyncReport struct {
@@ -242,9 +394,14 @@ const driftCorrectThreshold = 0.25
 // The audio is corrected rather than the video: video is a live pipe that
 // cannot be seeked cheaply, whereas an mpv seek is cheap. It is rare (only on
 // real drift) and small.
+//
+// In music mode it is a no-op, and not because it was skipped: there is one
+// clock and it is mpv's, so the two positions being compared would be the same
+// number. Reporting a drift of zero from a subtraction of a value with itself
+// would look like a passing measurement rather than an absent one.
 func (s *SyncPlayer) checkSync() (SyncReport, bool) {
 	v := s.Seconds()
-	if s.paused || s.ipc == nil {
+	if s.musicOnly || s.paused || s.ipc == nil {
 		return SyncReport{VideoPos: v}, false
 	}
 	a, ok := s.ipc.timePos(400 * time.Millisecond)

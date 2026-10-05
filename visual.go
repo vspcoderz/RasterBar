@@ -7,24 +7,28 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 )
 
-// Spectrum visualizer.
+// Spectrum analysis: the audio tap and the display smoothing on top of it.
 //
 // Levels come from a real audio tap (ffmpeg -> raw s16le PCM), analysed with a
-// hand-rolled FFT (fft.go). Nothing here is driven by a timer.
-// The shared `ramp` lives in ascii.go.
+// hand-rolled FFT (fft.go). Nothing here is driven by a timer -- the tap's clock
+// is the audio's own.
 //
 // Rejected: mpv's astats/ebur128 metadata properties. Four attempts to read
 // ${af-metadata/...} and ${metadata/...} through --term-playing-msg returned
 // "(error)" on mpv as built here, so that property path is not portable enough
-// to build on. Rejected: gonum/a DSP package — zero module dependencies is a
+// to build on. Rejected: gonum/a DSP package -- zero module dependencies is a
 // hard requirement of this project (see PLAN.md).
 
-// Visualizer draws bars with peak-hold caps.
+// Visualizer holds a smoothed level and a held peak per band.
+//
+// This is display smoothing, not analysis: the level has a fast attack and a slow
+// release so a transient reads as a spike rather than as a blur, and the peak is
+// held so the eye can see how loud a passage got between two frames. A bar with
+// neither is unreadable at any frame rate you would actually watch.
 type Visualizer struct {
 	mu    sync.Mutex
 	level []float64
@@ -36,6 +40,23 @@ func NewVisualizer(bars int) *Visualizer {
 		bars = bands
 	}
 	return &Visualizer{level: make([]float64, bars), peak: make([]float64, bars)}
+}
+
+// Resize changes the band count, keeping the levels it can.
+//
+// Levels already computed are kept rather than zeroed, because a terminal resize
+// is not a new piece of music: dropping the bars to zero for a frame on every
+// drag of the window edge is worse than carrying them over. The tails are left at
+// whatever the old bands had, which is close enough and costs nothing.
+func (v *Visualizer) Resize(n int) {
+	if n <= 0 || n == len(v.level) {
+		return
+	}
+	level := make([]float64, n)
+	copy(level, v.level)
+	peak := make([]float64, n)
+	copy(peak, v.peak)
+	v.level, v.peak = level, peak
 }
 
 // Push feeds one set of band magnitudes (0..1 each).
@@ -90,11 +111,29 @@ func (v *Visualizer) PushScalar(amp float64) {
 	v.mu.Unlock()
 }
 
+// Level returns the smoothed band levels. Caller must not retain the slice.
+func (v *Visualizer) Level() []float64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.level
+}
+
+// Peak returns the held band peaks. Caller must not retain the slice.
+func (v *Visualizer) Peak() []float64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.peak
+}
+
+// Render draws the levels as one line of ramp characters with peak caps.
+//
+// Kept as a string because it is what the HUD's spectrum strip needs, and the
+// strip is plain text in a fixed-width row rather than a grid.
 func (v *Visualizer) Render() string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	var sb strings.Builder
-	sb.Grow(len(v.level) * 2)
+	var sb []byte
+	sb = append(sb, make([]byte, len(v.level))...)
 	for i, lv := range v.level {
 		li := int(lv * float64(len(ramp)-1))
 		if li < 0 {
@@ -103,25 +142,64 @@ func (v *Visualizer) Render() string {
 		if li >= len(ramp) {
 			li = len(ramp) - 1
 		}
-		sb.WriteByte(ramp[li])
-		// peak cap: one char above the bar, only if there is headroom
-		pi := int(v.peak[i] * float64(len(ramp)-1))
-		if pi > li && pi < len(ramp) {
-			sb.WriteByte(ramp[pi])
-		}
+		sb[i] = ramp[li]
 	}
-	return sb.String()
+	return string(sb)
 }
 
-// LevelTap decodes a media URL's audio to raw PCM and exposes spectrum bands.
+// levelTapArgs is the ffmpeg command line for the tap, split out so it can be
+// asserted on.
+//
+// Every flag here is load-bearing and the absence of one of them is silent, which
+// is why this is a function with a test rather than a literal buried in an
+// exec.Command call.
+//
+// -re is the one that bit. Without it ffmpeg decodes and pushes as fast as the
+// CPU allows, so the whole track is analysed in the first fraction of a second,
+// ffmpeg exits, and the visualizer is then showing the last frame it will ever get
+// while mpv is still playing. Observed exactly that: the spectrum drew one spectrum
+// and then froze for the rest of a 60s track, the onset envelope stopped at 0.193,
+// and the particle field spawned a burst and stopped.
+//
+// Every one of those symptoms points at the onset detector. The detector was fine --
+// it had run out of audio a minute early. Same reason sync.go puts -re on the video
+// pipe: without it the output races ahead of the music.
+//
+// -ss is the other one. The tap is its own ffmpeg reading its own copy of the
+// stream (see resolveAudioPair on why it cannot share mpv's), so after a seek it
+// has to be told where playback is or it analyses from the top of the file.
+func levelTapArgs(mediaURL string, startAt float64) []string {
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+	}
+	if startAt > 0 {
+		args = append(args, "-ss", fmt.Sprintf("%.3f", startAt))
+	}
+	args = append(args,
+		"-re",
+		"-i", mediaURL,
+		"-vn", "-sn", "-dn",
+		"-ac", "1", "-ar", fmt.Sprint(spectrumRate),
+		"-f", "s16le", "-",
+	)
+	return args
+}
+
+// LevelTap decodes a media URL's audio to raw PCM and exposes spectrum bands, the
+// time-domain waveform and an onset envelope.
 type LevelTap struct {
 	cmd *exec.Cmd
 	r   io.ReadCloser
 
-	mu    sync.Mutex
-	bands []float64
-	an    *SpectrumAnalyzer
-	once  sync.Once
+	mu      sync.Mutex
+	bands   []float64
+	wave    []float64 // retained for the next read, so the hot loop allocates nothing
+	waveBuf []float64
+	beat    float64
+	bpm     float64
+	an      *SpectrumAnalyzer
+	onsets  *onsetDetector
+	once    sync.Once
 }
 
 // spectrumRate is higher than the old RMS tap on purpose: an FFT needs
@@ -129,14 +207,27 @@ type LevelTap struct {
 // 22KB/s of pipe traffic, still trivial.
 const spectrumRate = 11025
 
+// waveWindow is how many raw samples the tap keeps for the oscilloscope.
+//
+// fftSize, so it is exactly one analysis window: the scope then draws the same
+// span of time the FFT just looked at, which means the waveform and the bars
+// always describe the same moment. A different length would be a different
+// moment and the two styles would disagree.
+const waveWindow = fftSize
+
 func StartLevelTap(mediaURL string) (*LevelTap, error) {
-	cmd := exec.Command("ffmpeg",
-		"-hide_banner", "-loglevel", "error", "-nostdin",
-		"-i", mediaURL,
-		"-vn", "-sn", "-dn",
-		"-ac", "1", "-ar", fmt.Sprint(spectrumRate),
-		"-f", "s16le", "-",
-	)
+	return StartLevelTapAt(mediaURL, 0)
+}
+
+// StartLevelTapAt is StartLevelTap with a media offset, so the analysis stays
+// aligned with playback across a seek.
+//
+// The offset is not an optimisation. The tap is its own ffmpeg reading its own
+// copy of the stream (see resolveAudioPair on why it cannot share mpv's), so it
+// has to be told where playback is or it analyses from the top of the file while
+// the music plays from the middle.
+func StartLevelTapAt(mediaURL string, startAt float64) (*LevelTap, error) {
+	cmd := exec.Command("ffmpeg", levelTapArgs(mediaURL, startAt)...)
 	r, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -145,10 +236,13 @@ func StartLevelTap(mediaURL string) (*LevelTap, error) {
 		return nil, fmt.Errorf("level tap start: %w", err)
 	}
 	lt := &LevelTap{
-		cmd:   cmd,
-		r:     r,
-		an:    NewSpectrumAnalyzer(spectrumRate, bands),
-		bands: make([]float64, bands),
+		cmd:     cmd,
+		r:       r,
+		an:      NewSpectrumAnalyzer(spectrumRate, bands),
+		onsets:  NewOnsetDetector(bands),
+		bands:   make([]float64, bands),
+		wave:    make([]float64, 0, waveWindow),
+		waveBuf: make([]float64, fftSize),
 	}
 	go lt.pump()
 	return lt, nil
@@ -167,8 +261,24 @@ func (l *LevelTap) pump() {
 				samples[i] = float64(int16(binary.LittleEndian.Uint16(buf[i*2:]))) / 32768.0
 			}
 			mags := l.an.Analyze(samples[:ns])
+			// Wave window: the same samples the FFT just consumed, so scope and
+			// bars always describe the same moment. Copied rather than aliased
+			// because samples is reused by the next read, and the render loop
+			// reads this slice from another goroutine.
+			// Reused rather than reallocated: this runs ~11 times a second for
+			// the life of the track, and a fresh slice each time is garbage the
+			// renderer never asks for. Only the filled prefix is handed on.
+			wave := l.waveBuf[:ns]
+			copy(wave, samples[:ns])
+			// Raw, not the smoothed mags. See SpectrumAnalyzer.Raw for why the
+			// detector must not see the display's smoothing.
+			beat, _ := l.onsets.Push(l.an.Raw())
+
 			l.mu.Lock()
 			copy(l.bands, mags)
+			l.wave = wave
+			l.beat = beat
+			l.bpm = l.onsets.BPM()
 			l.mu.Unlock()
 		}
 		if err != nil {
@@ -182,6 +292,39 @@ func (l *LevelTap) Bands() []float64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.bands
+}
+
+// Wave returns the most recent time-domain window. Caller must not retain it.
+func (l *LevelTap) Wave() []float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.wave
+}
+
+// Beat returns the onset envelope and tempo estimate.
+func (l *LevelTap) Beat() (float64, float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.beat, l.bpm
+}
+
+// Frame collects everything the visualizers draw from, in one read of the tap.
+//
+// One call rather than three because the values have to be consistent with each
+// other: a style that read bands on one tick and the beat on the next would be
+// drawing a waveform from one moment and an envelope from another, and on a
+// transient the mismatch is visible as the reaction lagging the beat.
+//
+// Caller must not retain Bands or Wave.
+func (l *LevelTap) Frame() AudioFrame {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return AudioFrame{
+		Bands: l.bands,
+		Wave:  l.wave,
+		Beat:  l.beat,
+		BPM:   l.bpm,
+	}
 }
 
 func (l *LevelTap) Close() {
@@ -240,75 +383,10 @@ func watchQuit(in *os.File) <-chan struct{} {
 	return ch
 }
 
-// runVisualAudio plays audio and draws the spectrum. Audio-only mode used to
-// be a blank terminal for the entire track.
-func runVisualAudio(track Track, in, out *os.File, audioURL string, mute bool) error {
-	restore, err := makeRaw(in)
-	if err == nil {
-		defer restore()
-	}
-	fmt.Fprint(out, "\x1b[?25l")
-	defer fmt.Fprint(out, "\x1b[?25h\x1b[2J\x1b[H")
-
-	tap, err := StartLevelTap(audioURL)
-	if err != nil {
-		fmt.Fprintf(out, "level tap unavailable: %v\r\n", err)
-	}
-	if tap != nil {
-		defer tap.Close()
-	}
-
-	args := []string{"--no-config", "--no-video"}
-	if mute {
-		// Muted is a real, tested path: the spectrum is analysed from the ffmpeg
-		// tap, which is independent of mpv's audio output, so the visualizer
-		// still animates with no sound.
-		args = append(args, "--mute=yes")
-	}
-	audio := exec.Command("mpv", append(args, audioURL)...)
-	// mpv prints a status line to stdout many times a second. Inheriting our
-	// terminal means it paints over every frame (verified: 0 frames survived).
-	audio.Stdout = io.Discard
-	audio.Stderr = os.Stderr
-	if err := audio.Start(); err != nil {
-		return fmt.Errorf("mpv start: %w", err)
-	}
-	exited := make(chan error, 1)
-	go func() { exited <- audio.Wait() }()
-	defer func() {
-		if audio.Process != nil {
-			audio.Process.Kill()
-		}
-	}()
-
-	quit := watchQuit(in)
-	viz := NewVisualizer(bands)
-
-	const fps = 24
-	tick := time.NewTicker(time.Second / fps)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-quit:
-			return nil
-		case err := <-exited:
-			return err
-		case <-tick.C:
-			if tap != nil {
-				viz.Push(tap.Bands())
-			}
-			// Home + fixed lines, no full clear: less traffic, no flicker.
-			fmt.Fprintf(out, "\x1b[H\r%s\r\n\r%s\r\n\rq quit\r",
-				viz.Render(), trackSummary(track))
-		}
-	}
-}
-
-func trackSummary(t Track) string {
-	s := fmt.Sprintf("%s  —  %s  [%s]", t.Title, t.ChannelText(), t.DurationText())
-	if len(s) > 76 {
-		s = s[:75] + "…"
-	}
-	return s
-}
+// tapTimeout bounds the initial read before ffmpeg is assumed to be dead.
+//
+// Sized against the tap's own read size rather than picked: a full fftSize block
+// at spectrumRate is 93ms, so a third of a second is three windows. Long enough
+// that a slow disk or a cold cache does not trip it, short enough that a dead
+// ffmpeg is reported rather than hanging the mode.
+const tapTimeout = 300 * time.Millisecond

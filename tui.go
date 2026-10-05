@@ -87,7 +87,7 @@ func (t *TUI) render() {
 	}
 	sb.WriteString(strings.Repeat("─", w) + "\n")
 	fmt.Fprint(t.out, sb.String())
-	fmt.Fprint(t.out, "j/k move  enter play  a ascii  q quit\n")
+	fmt.Fprint(t.out, "j/k move  enter music  a video  q quit\n")
 }
 
 // Run reads single keypresses until the user acts. Reads raw bytes, not lines:

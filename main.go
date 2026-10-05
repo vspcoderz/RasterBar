@@ -9,15 +9,21 @@ import (
 	"strings"
 )
 
-const usage = `vspz-yt-cli - terminal YouTube player with ASCII video and audio spectrum
+const usage = `vspz-yt-cli - terminal YouTube player: ASCII video or a music visualizer
 
 usage:
   vspz-yt-cli [options] <query>
 
+modes:
+  -M, --music       music mode: the visualizer replaces the video (default)
+  -a, --ascii       video mode: ASCII/colour video with a spectrum strip
+
 options:
   -m, --mute         play audio muted (visualizer still animates)
-  -a, --ascii        start ASCII video mode instead of audio
-      --glyph MODE   auto (probe terminal), half (2px/cell), cell (1px/cell)
+      --viz NAME     visualizer style: bars, scope, mirror, waterfall,
+                     radial, particles (default: bars)
+      --palette NAME colour scheme: spectrum, height, ocean, ember, mono
+                     (default: spectrum)
   -c, --color        force colour (default: auto-detected from the terminal)
       --mono         force plain monochrome ASCII, no colour
       --glyph MODE   cell layout: auto (probe the terminal), half (2 pixels
@@ -43,19 +49,19 @@ library mode (browse a directory instead of searching):
 
   requires: ffmpeg, mpv  (yt-dlp and ytfzf are needed only for search)
 
-The ASCII grid and the source resolution both follow your terminal size
-automatically: a small window requests a small video, a large one a larger
-video, so you never pay decode CPU for pixels you cannot see.
+The grid and the source resolution both follow your terminal size automatically:
+a small window requests a small video, a large one a larger video, so you never
+pay decode CPU for pixels you cannot see.
 
 keys (browse):
   j / k / arrows   move
   g / G            top / bottom
   1-9              jump to row
-  enter            play audio + spectrum
-  a                play ASCII video
+  enter            play music mode (visualizer)
+  a                play video mode
   q                quit
 
-keys (ascii playback):
+keys (playback, both modes):
   space            pause / resume
   left / right     seek -10s / +10s
   , / .            seek -1s / +1s
@@ -64,19 +70,27 @@ keys (ascii playback):
   :                jump to a timestamp
   n / p            next / previous result
   + / -            volume up / down
+  v / V            next / previous visualizer style
+  c                next colour palette
+  s                toggle the spectrum strip under the video
   q / ctrl-c       quit
 
   The jump prompt takes 1:30, 1:02:03, a bare 90 (seconds), 90s / 2m / 1h2m3s,
   +30 / -1:30 (relative to now), and 50% (of the track). It previews where the
   jump will land before you commit to it. enter jumps, esc cancels.
 
+  The style and palette you pick carry over to the next track, so v is pressed
+  once per session rather than once per song.
+
   When a track finishes the next result starts on its own; playback stops at the
   end of the list.
 
-tuned for low-end machines: ASCII mode requests a 360p h264 source because
+tuned for low-end machines: video mode requests a 360p h264 source because
 ffmpeg decode cost scales with resolution, and an 80x22 character grid cannot
 show the difference between 360p and 1080p. The spectrum is computed in-process
-with a hand-rolled FFT, so there are no third-party Go modules.
+with a hand-rolled FFT, so there are no third-party Go modules. The expensive
+styles (radial, particles) are capped rather than disabled: particles never
+exceed 400, and both styles cost the same on a large terminal as on a small one.
 
 requires: yt-dlp, ffmpeg, mpv  (ytfzf optional, used as the primary scraper)
 `
@@ -85,6 +99,7 @@ type options struct {
 	query    string
 	mute     bool
 	ascii    bool
+	music    bool
 	quality  Quality
 	aspect   float64
 	cols     int // explicit override, 0 = auto
@@ -94,6 +109,40 @@ type options struct {
 	library  string    // directory to browse instead of searching
 	noProbe  bool      // skip ffprobe during a library scan
 	playOnly bool      // play immediately, skip the browse list
+
+	// viz and palette name a starting style, resolved here rather than at first
+	// use so a typo is an argument error instead of a silently ignored flag.
+	viz     string
+	palette string
+
+	// vizPrefs caches the resolved style/palette across the queue. Built by
+	// prefs() on demand and shared, so the `v` and `c` keys mutate one value.
+	vizPrefs *vizPrefs
+}
+
+// prefs returns the shared visualizer preferences, resolving the named style and
+// palette the first time.
+//
+// Resolution is deferred rather than done in parseArgs because a style needs the
+// registry, and the registry is a package-level table -- but an *invalid* name is
+// rejected in parseArgs, so this cannot silently fall back.
+func (o *options) prefs() *vizPrefs {
+	if o.vizPrefs != nil {
+		return o.vizPrefs
+	}
+	p := newVizPrefs()
+	for i, mk := range vizRegistry {
+		if o.viz != "" && strings.EqualFold(mk().Name(), o.viz) {
+			p.style = i
+		}
+	}
+	for i, pal := range palettes {
+		if o.palette != "" && strings.EqualFold(pal.name, o.palette) {
+			p.palette = i
+		}
+	}
+	o.vizPrefs = p
+	return p
 }
 
 // colorAuto requests terminal capability detection.
@@ -129,6 +178,38 @@ func parseArgs(args []string) (options, error) {
 			o.color = ColorNone
 		case "-a", "--ascii":
 			o.ascii = true
+		case "-M", "--music":
+			o.music = true
+		case "--viz", "--visualizer":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--viz needs a value: %s", strings.Join(VizNames(), ", "))
+			}
+			i++
+			if _, ok := VizByName(args[i]); !ok {
+				return o, fmt.Errorf("--viz must be one of %s (got %s)",
+					strings.Join(VizNames(), ", "), args[i])
+			}
+			o.viz = args[i]
+		case "--palette":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--palette needs a value")
+			}
+			i++
+			valid := false
+			for _, p := range palettes {
+				if strings.EqualFold(p.name, args[i]) {
+					valid = true
+				}
+			}
+			if !valid {
+				names := make([]string, 0, len(palettes))
+				for _, p := range palettes {
+					names = append(names, p.name)
+				}
+				return o, fmt.Errorf("--palette must be one of %s (got %s)",
+					strings.Join(names, ", "), args[i])
+			}
+			o.palette = args[i]
 		case "-q", "--quality":
 			if i+1 >= len(args) {
 				return o, fmt.Errorf("-q needs a value (240, 360, 480, 720, 1080)")
@@ -260,31 +341,26 @@ func main() {
 		}
 		idx = sel
 	}
-	track := tracks[idx]
 
-	// --play skips the browse list, so there is no keypress to request ASCII
-	// mode. Default it on: asking for a library episode and getting a spectrum
-	// alone would not be what anyone wanted.
-	wantASCII := opts.ascii || (opts.playOnly && opts.library != "")
+	// --play skips the browse list, so there is no keypress to request video mode.
+	// Default it on: asking for a library episode and getting a spectrum alone
+	// would not be what anyone wanted.
+	wantVideo := opts.ascii || (opts.playOnly && opts.library != "")
 	if action == ActionASCII {
-		wantASCII = true
+		wantVideo = true
+	}
+	if opts.music {
+		// An explicit --music overrides the browse list's choice, including the
+		// library default above. A flag that silently lost to a heuristic would be
+		// worse than the heuristic not existing.
+		wantVideo = false
 	}
 
-	if wantASCII {
-		playQueue(opts, colorMode, tracks, idx)
-		return
-	}
-
-	fmt.Fprintf(os.Stderr, "playing: %s — %s\n", track.Title, track.ChannelText())
-	audioURL, err := resolveAudioURL(track)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve audio failed: %v\n", err)
-		os.Exit(1)
-	}
-	if err := runVisualAudio(track, os.Stdin, os.Stdout, audioURL, opts.mute); err != nil {
-		fmt.Fprintf(os.Stderr, "playback failed: %v\n", err)
-		os.Exit(1)
-	}
+	// One queue, two modes. Music mode used to be runVisualAudio: a separate loop
+	// with one key, no HUD, no duration, no seek and no queue advance. Sharing
+	// playQueue is what makes it a player rather than a demo, and it is why the
+	// prompt, the resize path and the stall handler work there for free.
+	playQueue(opts, colorMode, tracks, idx, !wantVideo)
 }
 
 // playQueue plays the selected result and then keeps going through the rest of
@@ -298,7 +374,7 @@ func main() {
 //
 // Navigation keys (n/p) return an outcome rather than changing the queue here, so
 // the loop stays the single owner of the index.
-func playQueue(opts options, mode ColorMode, tracks []Track, index int) {
+func playQueue(opts options, mode ColorMode, tracks []Track, index int, music bool) {
 	po := playOpts{
 		in:        os.Stdin,
 		out:       os.Stdout,
@@ -309,6 +385,10 @@ func playQueue(opts options, mode ColorMode, tracks []Track, index int) {
 		rows:      opts.rows,
 		mode:      mode,
 		glyphPref: opts.glyph,
+		music:     music,
+		// One prefs value for the whole queue, shared by every track: pressing `v`
+		// once should not have to be repeated per song.
+		prefs: opts.prefs(),
 	}
 	if po.aspect <= 0 {
 		po.aspect = defaultAspect
@@ -345,3 +425,7 @@ func playQueue(opts options, mode ColorMode, tracks []Track, index int) {
 // debugSync enables the A/V drift readout on stderr. Off by default because it
 // writes to the same stream the renderer uses.
 var debugSync = os.Getenv("VSPZ_YT_CLI_DEBUG_SYNC") != ""
+
+// debugViz traces the spectrum values reaching the styles. Same reasoning as
+// debugSync: off by default, because stderr is a stream the renderer uses.
+var debugViz = os.Getenv("VSPZ_YT_CLI_DEBUG_VIZ") != ""

@@ -24,10 +24,22 @@ import (
 // is skipped silently — a media folder also holds artwork, .nfo sidecars,
 // subtitles and checksum files, and warning about each one turns a library
 // listing into noise.
+//
+// The audio containers are here because music mode needs them. A music folder is
+// .mp3 and .flac, not .mkv, and a library that could only see video containers
+// would have nothing to show the spectrum.
+//
+// Ordering is unaffected: libraryTrack still requires an episode marker, so
+// "17 - Artist - Song.mp3" lands in position 17 while a bare "Song.mp3" is skipped
+// rather than placed arbitrarily. What order a music library should use instead is
+// not decided here.
 var mediaExts = map[string]bool{
 	".mp4": true, ".m4v": true, ".mkv": true, ".webm": true,
 	".avi": true, ".mov": true, ".mpg": true, ".mpeg": true, ".wmv": true,
 	".flv": true, ".ts": true, ".m2ts": true, ".ogv": true,
+	// Audio-only containers. `-vn` and the level tap both read these fine.
+	".mp3": true, ".m4a": true, ".flac": true, ".opus": true,
+	".ogg": true, ".oga": true, ".wav": true, ".aac": true, ".wma": true,
 }
 
 var (
@@ -424,10 +436,21 @@ type ffprobeOutput struct {
 // that exit as "the track finished" — so a silent video stopped about two seconds
 // in and looked like a broken player rather than a file with no sound.
 func probeMedia(path string) (dur int, chapters []Chapter, hasAudio bool) {
+	// -show_streams is not optional and its absence was invisible for a long time.
+	//
+	// Without it ffprobe returns format and chapters but no `streams` key, so the
+	// loop below never ran, hasAudio was always false, and *every* local file was
+	// classified silent. In video mode that was survivable and hard to notice: the
+	// nil audio channel blocks forever by design and the track ended on the
+	// grace timer after the video pipe closed instead of on mpv exiting. In music
+	// mode it is fatal, because refusing a source with no audio stream is exactly
+	// the check this flag was supposed to inform -- and it refused the audio-only
+	// file that music mode exists to play.
 	out, err := exec.Command("ffprobe",
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
+		"-show_streams",
 		"-show_chapters",
 		path).Output()
 	if err != nil {

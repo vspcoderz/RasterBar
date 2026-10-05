@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -26,9 +27,24 @@ import (
 // The pair comes from a single `yt-dlp -J` call. Duration rides along in that
 // same response, which is why the progress bar needs no second request and no
 // ffprobe — probing a googlevideo URL burns its grant (see resolveMedia).
+//
+// music mode fills a different set: videoURL stays empty, and tapURL is a
+// *different* URL from audioURL so the level tap and mpv do not share a grant.
+//
+// That duplication is the fix for a real bug, not defensive style.
+// `runVisualAudio` resolved one `bestaudio` URL and handed it to both the tap's
+// ffmpeg and mpv. A googlevideo URL is effectively single-use, so one of the two
+// consumers spent the other's grant and got "403 Forbidden (access denied)". It
+// failed intermittently because the grant is a cache: whichever consumer opened
+// it first won and the other lost, depending on scheduling.
+//
+// The rule in AGENT.MD is one input, one consumer, and it is a rule about URLs,
+// not about streams. Two separate yt-dlp calls mint two independent grants, so
+// each consumer genuinely holds its own. See resolveAudioPair.
 type mediaPair struct {
-	videoURL string
-	audioURL string
+	videoURL string // empty in music mode: there is no video to decode
+	audioURL string // mpv
+	tapURL   string // music mode only: the level tap's ffmpeg
 	dur      float64
 	// chapters comes from the same response as the URLs and the duration, so
 	// chapter navigation costs no extra request on either path.
@@ -38,6 +54,10 @@ type mediaPair struct {
 	// Only ever set on the local path, where the probe already knows. YouTube
 	// always has audio, so the zero value is the right default and the network
 	// path needs no extra request to learn it.
+	//
+	// Music mode reads it as fatal rather than falling back to video: a track
+	// with no audio has no spectrum, which is the entire thing that mode draws.
+	// Showing a silent video there would be worse than refusing it.
 	silent bool
 }
 
@@ -82,6 +102,17 @@ type trackSession struct {
 	mute  bool
 	mode  ColorMode
 	glyph GlyphMode
+
+	// music is music mode: no ffmpeg, no video pipe, and the spectrum instead of
+	// frames. It is a flag rather than a second session type because everything
+	// above this struct -- the render loop, the prompt, the resize path, the
+	// stall handler, the queue -- is mode-agnostic already, and duplicating it
+	// is what phase 6's byte pump and key router were spent avoiding.
+	music bool
+	// tap is the level tap feeding the spectrum. Per-generation like the
+	// decoder: it is rebuilt on every seek so it re-reads from the new offset,
+	// and closing it is part of retiring the old generation.
+	tap *LevelTap
 }
 
 // newTrackSession resolves a track's streams once and starts playback at pos.
@@ -95,10 +126,21 @@ type trackSession struct {
 // The layout is taken whole rather than as cols/rows/fps because the source
 // resolution travels with it: a re-resolve that forgot l.sourceH would silently
 // downgrade a 1080p session to the 360p default.
-func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMode, glyph GlyphMode) (*trackSession, error) {
-	pair, err := resolveMedia(track, l.sourceH)
+func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMode, glyph GlyphMode, music bool) (*trackSession, error) {
+	var (
+		pair mediaPair
+		err  error
+	)
+	if music {
+		pair, err = resolveAudioPair(track)
+	} else {
+		pair, err = resolveMedia(track, l.sourceH)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if music && pair.silent {
+		return nil, fmt.Errorf("no audio stream in %s", track.Title)
 	}
 	s := &trackSession{
 		track: track,
@@ -107,6 +149,7 @@ func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMo
 		mute:  mute,
 		mode:  mode,
 		glyph: glyph,
+		music: music,
 	}
 	if err := s.start(pos); err != nil {
 		return nil, err
@@ -114,17 +157,35 @@ func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMo
 	return s, nil
 }
 
-// start launches ffmpeg + mpv at a media offset and spawns the decoder.
+// resolve re-mints this track's streams after a failure.
+//
+// One re-resolve is worth it and a second failure is the track's problem. The
+// same source height is requested on the video path, because dropping it here
+// would quietly downgrade the stream mid-session.
+func (s *trackSession) resolve() (mediaPair, error) {
+	if s.music {
+		return resolveAudioPair(s.track)
+	}
+	return resolveMedia(s.track, s.l.sourceH)
+}
+
+// start launches the children at a media offset and spawns the decoder.
 func (s *trackSession) start(pos float64) error {
-	p, err := startSyncPlayerAt(s.pair.videoURL, s.pair.audioURL, s.l.cols, s.l.rows, s.l.fps, s.mute, pos, s.mode, s.glyph)
+	var (
+		p   *SyncPlayer
+		err error
+	)
+	launch := func() (*SyncPlayer, error) {
+		if s.music {
+			return startAudioOnly(s.pair.audioURL, s.mute, pos)
+		}
+		return startSyncPlayerAt(s.pair.videoURL, s.pair.audioURL, s.l.cols, s.l.rows, s.l.fps, s.mute, pos, s.mode, s.glyph)
+	}
+	p, err = launch()
 	if err != nil {
-		// A grant can expire between resolving and playing. One re-resolve is
-		// worth it; a second failure is the track's problem, not ours. The same
-		// source height is requested, because dropping it here would quietly
-		// downgrade the stream mid-session.
-		if pair, rerr := resolveMedia(s.track, s.l.sourceH); rerr == nil {
+		if pair, rerr := s.resolve(); rerr == nil {
 			s.pair = pair
-			p, err = startSyncPlayerAt(s.pair.videoURL, s.pair.audioURL, s.l.cols, s.l.rows, s.l.fps, s.mute, pos, s.mode, s.glyph)
+			p, err = launch()
 		}
 		if err != nil {
 			return err
@@ -139,6 +200,25 @@ func (s *trackSession) start(pos float64) error {
 	// ones without a second loop or a lock.
 	s.frames = make(chan videoFrame, frameQueueDepth)
 	s.stop = make(chan struct{})
+
+	if s.music {
+		if err := s.startTap(pos); err != nil {
+			return err
+		}
+		go s.pumpMusic(p, s.frames, s.stop)
+		// mpv is the only child, so it is also the end of the track. This is the
+		// same signal video mode gets from mpv, minus the silent case: music mode
+		// refuses a source with no audio stream, so there is nothing where the
+		// channel would be left nil.
+		s.audio = make(chan struct{})
+		go func(a *exec.Cmd, done chan struct{}) {
+			if a != nil {
+				_ = a.Wait()
+			}
+			close(done)
+		}(p.audio, s.audio)
+		return nil
+	}
 
 	// s.audio stays nil for a source with no audio stream, and a nil channel in a
 	// select blocks forever — which is the point. `mpv --no-video` on a video-only
@@ -157,6 +237,59 @@ func (s *trackSession) start(pos float64) error {
 		}(p.audio, s.audio)
 	}
 	return nil
+}
+
+// startTap opens the level tap for this generation.
+//
+// A failure is fatal to music mode, and deliberately not degraded to "play the
+// audio with a dead screen". The spectrum is the content in this mode: a muted
+// track playing silently behind a flat grid is indistinguishable from a hung
+// process, and the user has no way to tell which it is.
+func (s *trackSession) startTap(at float64) error {
+	tap, err := StartLevelTapAt(s.pair.tapURL, at)
+	if err != nil {
+		return fmt.Errorf("level tap: %w", err)
+	}
+	s.tap = tap
+	return nil
+}
+
+// pumpMusic paces the spectrum and reports the position.
+//
+// It is deliberately the same channel video mode's decoder fills, with a nil
+// frame buffer. That is what keeps the render loop mode-agnostic: one select arm,
+// one place that decides whether the frame is pixels or a visualizer redraw. The
+// alternative -- a second loop for music mode -- is the duplication phase 6
+// exists to warn about.
+//
+// The position is refreshed here rather than inside SyncPlayer.Seconds because
+// this is the only goroutine in music mode that is allowed to block, and the
+// render loop is not it.
+func (s *trackSession) pumpMusic(p *SyncPlayer, out chan<- videoFrame, stop <-chan struct{}) {
+	defer close(out)
+	tick := time.NewTicker(time.Second / time.Duration(musicFPS(s.l.cols, s.l.rows)))
+	defer tick.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+			// Poll on every tick, not just until the first reading lands. In video
+			// mode the frame counter is the clock and mpv is only asked every two
+			// seconds to correct drift; here mpv *is* the clock, so skipping the
+			// poll freezes the position at whatever the first reading said.
+			//
+			// A dropped or late read is harmless -- posClock holds its last value
+			// -- so paying a socket round trip per frame is the right trade. At
+			// 30fps it is a few tens of microseconds a second.
+			p.pollPosition(musicPollTimeout)
+			select {
+			case out <- videoFrame{buf: nil, pos: p.Seconds()}:
+			case <-stop:
+				return
+			}
+		}
+	}
 }
 
 // frameQueueDepth is how many frames may sit between the decoder and the
@@ -204,6 +337,10 @@ func (s *trackSession) stopDecoder() {
 	if s.stop != nil {
 		close(s.stop)
 		s.stop = nil
+	}
+	if s.tap != nil {
+		s.tap.Close()
+		s.tap = nil
 	}
 	if s.cur != nil {
 		s.cur.Close()
@@ -336,6 +473,19 @@ type playOpts struct {
 	// Bytes and not commands, because the render loop is the only thing that
 	// knows whether a prompt is open. See readKeys.
 	keys <-chan []byte
+
+	// strip starts with the spectrum row on. Only meaningful in video mode.
+	strip bool
+
+	// music selects the spectrum over the video. See trackSession.music.
+	music bool
+	// prefs is the visualizer style and palette, shared across the whole queue.
+	//
+	// A pointer so that pressing `v` once survives a track ending. playQueue
+	// owns the value and playOpts only carries the handle; the alternative -- a
+	// copy per track -- would mean re-pressing `v` on every song, which is the
+	// opposite of remembered. See vizPrefs.
+	prefs *vizPrefs
 }
 
 // playTrack plays one track and reports why it stopped.
@@ -356,6 +506,11 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		termRows = o.rows
 	}
 
+	// The spectrum strip. Off by default in video mode, because it costs a row of
+	// video and most people watching a video are watching the video. On by default
+	// in music mode, where it costs nothing -- there is no video to take a row from.
+	strip := o.strip || o.music
+
 	// VTIME read so arrow keys arrive whole; see makeRawVT.
 	if restore, err := makeRawVT(o.in, 0, 1); err == nil {
 		defer restore()
@@ -363,7 +518,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	fmt.Fprint(o.out, "\x1b[?25l")
 	defer fmt.Fprint(o.out, "\x1b[?25h\x1b[2J\x1b[H")
 
-	l := computeLayout(termCols, termRows, o.aspect, o.quality)
+	l := computeLayout(termCols, termRows, o.aspect, o.quality, chromeRowsFor(strip))
 
 	// The glyph probe round-trips with the terminal, so it must happen after raw
 	// mode is set and before ffmpeg starts: the frame height depends on it.
@@ -377,7 +532,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	}
 	track := queue[index]
 
-	sess, err := newTrackSession(track, l, 0, o.mute, o.mode, glyph)
+	sess, err := newTrackSession(track, l, 0, o.mute, o.mode, glyph, o.music)
 	if err != nil {
 		fmt.Fprintf(o.out, "\r\ncannot play %s: %v\r\n", truncate(track.Title, 60), err)
 		return OutcomeError
@@ -402,6 +557,55 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	bw := newBufWriter(o.out)
 	renderer := newRenderer(bw, l.cols, l.rows, o.mode, glyph)
 
+	// The visualizer, its grid and the palette. All three are rebuilt on a resize
+	// or a style switch, and none of them exist in video mode -- a visualizer in
+	// the video path would be paying for state nobody draws.
+	//
+	// prefs is defaulted here rather than in parseArgs so that a caller who
+	// forgets it gets a working visualizer instead of a nil pointer on the first
+	// keypress.
+	prefs := o.prefs
+	if prefs == nil {
+		prefs = newVizPrefs()
+	}
+	var (
+		viz  Viz
+		grid *VizGrid
+	)
+	if o.music {
+		viz = prefs.makeViz()
+		viz.Resize(l.cols, l.rows)
+		grid = NewVizGrid(l.cols, l.rows, o.mode != ColorNone, vizPixPerCell(glyph))
+		grid.SetPalette(paletteAt(prefs.palette))
+	}
+
+	// paintMusic draws one spectrum frame. Split out so the render loop's select
+	// arm stays a single statement and the rebuild path can share it.
+	paintMusic := func() error {
+		// Push before Clear/Paint: the styles fold the new analysis into their
+		// own state (waterfall captures a row, particles integrate), and doing it
+		// in this order means the frame drawn is the frame analysed.
+		if sess.tap != nil {
+			f := sess.tap.Frame()
+			viz.Push(&f)
+			if debugViz {
+				alive := -1
+				if p, ok := viz.(*particlesViz); ok {
+					alive = p.alive
+				}
+				fmt.Fprintf(os.Stderr, "viz %s beat=%.3f bpm=%.1f alive=%d band[0]=%.3f band[last]=%.3f\r\n",
+					viz.Name(), f.Beat, f.BPM, alive,
+					f.Bands[0], f.Bands[len(f.Bands)-1])
+			}
+		}
+		grid.Clear()
+		viz.Paint(grid)
+		if o.mode == ColorNone {
+			return renderer.Draw(grid.MonoFrame())
+		}
+		return renderer.Draw(grid.ColorFrame())
+	}
+
 	// lastKey drives the hint fade: the row shows itself on every keypress and
 	// then gets out of the way.
 	lastKey := time.Now()
@@ -417,9 +621,25 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	// The last HUD painted, so an unchanged repaint is skipped instead of
 	// written ten times a second for nothing.
 	hudText := ""
+
+	// statusText is the transient footer message and when it expires. Held here
+	// rather than written to the terminal, because the HUD owns the footer row and
+	// repaints it -- see hud.status.
+	statusText := ""
+	statusUntil := time.Time{}
+
+	// spectrum is the band's current level and peak, for the HUD strip. A Visualizer
+	// rather than the raw analyser bands so the strip and the music-mode styles
+	// react identically -- otherwise the strip would sit still while the
+	// full-screen bars move, which reads as one of them being broken.
+	var stripViz Visualizer
+	if strip {
+		stripViz.Resize(l.cols)
+	}
+
 	paintHUD := func(force bool) {
 		st := pl.State()
-		lines := hud{
+		h := hud{
 			title:     track.Title,
 			channel:   track.ChannelText(),
 			pos:       st.Pos,
@@ -433,8 +653,18 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			mark:      st.Mark,
 			hasMark:   st.HasMark,
 			showHints: time.Since(lastKey) < hintLinger,
-		}.lines(l.cols)
-		joined := lines[0] + "\n" + lines[1] + "\n" + lines[2]
+			status:    statusText,
+		}
+		if strip {
+			if sess.tap != nil {
+				stripViz.Push(sess.tap.Bands())
+				h.strip = miniBars(stripViz.Level(), l.cols, stripViz.Peak())
+			} else {
+				h.strip = miniBars(nil, l.cols, nil)
+			}
+		}
+		lines := h.lines(l.cols)
+		joined := strings.Join(lines, "\n")
 		if !force && joined == hudText {
 			return
 		}
@@ -506,6 +736,21 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		return OutcomeEnded
 	}
 
+	// reportLine writes a one-line status over the error row and lets it expire
+	// on the hint clock.
+	//
+	// Shares the transport error row rather than adding a fourth HUD row: the row
+	// already exists for "a key you pressed failed", and this is the same kind of
+	// message. A dedicated row would mean recomputing the layout, re-resolving
+	// ffmpeg's scale target and rebuilding the decoder to change how many rows
+	// there are, which is not worth a status line.
+	reportLine := func(s string) {
+		statusText = s
+		statusUntil = time.Now().Add(hintLinger)
+		lastKey = time.Now()
+		paintHUD(true)
+	}
+
 	// applyCmd runs one decoded transport command and reports whether playback
 	// should stop. Split out of the select so feedKeys can drive it while a
 	// prompt is closing and the bytes after the closing key still count.
@@ -518,6 +763,76 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		case CmdTogglePause:
 			userPaused = !userPaused
 			pl.Do(cmd)
+		case CmdStrip:
+			strip = !strip
+			// Recompute the layout and rebuild. In video mode this is mandatory
+			// rather than cosmetic: the strip takes a row out of the grid, and the
+			// grid is ffmpeg's scale target, so the decoder has to be told. In music
+			// mode there is no video and nothing to rebuild, which is why the same
+			// key is free there.
+			l = computeLayout(termCols, termRows, o.aspect, o.quality, chromeRowsFor(strip))
+			if strip {
+				stripViz = Visualizer{level: make([]float64, l.cols), peak: make([]float64, l.cols)}
+			}
+			if !o.music {
+				sess.Resize(l, sess.Position())
+			}
+			reportLine(map[bool]string{true: "spectrum on", false: "spectrum off"}[strip])
+		case CmdVizNext, CmdVizPrev, CmdPalette:
+			// Not transport, and Player has no business knowing about them.
+			// Handled here because the render loop is the only thing that knows
+			// whether a visualizer exists -- in video mode there is no grid and no
+			// tap, so switching style would switch nothing and say so, which is
+			// better than a key that appears broken.
+			//
+			// Written as early returns rather than breaks on purpose. A `break`
+			// inside the inner switch below breaks out of *that switch*, not out of
+			// this case, so the mono message fell through and was immediately
+			// overwritten by the status line at the end -- which is what made the
+			// first version of this report a palette name in mono mode.
+			if !o.music {
+				reportLine("viz keys need music mode (-M)")
+				return OutcomePlaying
+			}
+			if cmd == CmdPalette {
+				if o.mode == ColorNone {
+					// Not a dead key: the grid draws through the grey ramp when
+					// colour is off, so every palette would produce an identical
+					// screen and cycling would look broken.
+					reportLine("no colour in this terminal  ·  --mono, or try --color")
+					return OutcomePlaying
+				}
+				prefs.nextPalette()
+				grid.SetPalette(paletteAt(prefs.palette))
+				// No new Viz and no Reset: the palette lives on the grid, and the
+				// style keeps its history. Only the colours changed.
+				renderer.ForceNext()
+				hudText = ""
+				reportLine(describeStyle(prefs))
+				return OutcomePlaying
+			}
+			if cmd == CmdVizNext {
+				prefs.nextStyle()
+			} else {
+				prefs.prevStyle()
+			}
+			// A new style has never drawn these cells. Without the forced repaint
+			// the diff cache still holds the old frame's values and the next Draw
+			// sees no change -- the same stale-cell trap as the prompt overlay,
+			// and the reason ForceNext is not optional here.
+			//
+			// hudText has to go with it. ForceNext's next Draw clears the whole
+			// screen, chrome included, and paintHUD's "unchanged, skip" cache
+			// would then decide there is nothing to repaint and leave the title,
+			// clock and footer blank until something else changed them. This is the
+			// same trap the stall-recovery path documents, and a style switch is
+			// another way to reach it.
+			viz = prefs.makeViz()
+			viz.Resize(l.cols, l.rows)
+			viz.Reset()
+			renderer.ForceNext()
+			hudText = ""
+			reportLine(describeStyle(prefs))
 		default:
 			pl.Do(cmd)
 			if st := pl.State(); st.Outcome != OutcomePlaying {
@@ -527,15 +842,13 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		// A keypress the user just made failed. Say so rather than letting it look
 		// like a broken key.
 		//
-		// The SGR reset is not decoration. The colour renderer leaves the last
-		// cell's colour in force, so without it this line is drawn in a colour
-		// sampled from the video — which on a dark scene is dark on dark.
+		// Through reportLine, not straight to the terminal: the footer row is
+		// repainted by paintHUD a few lines below, and a message written directly
+		// would be overwritten before it was ever on screen. That was the previous
+		// behaviour and it is why a failed transport key looked like no key at all.
 		if st := pl.State(); st.LastErr != nil {
-			fmt.Fprintf(bw, "\x1b[0m\x1b[%d;1H%s", l.rows+3,
-				fit("transport: "+st.LastErr.Error(), l.cols))
-			_ = bw.Flush()
+			reportLine("transport: " + st.LastErr.Error())
 			pl.ClearErr()
-			lastKey = time.Now()
 		}
 		return OutcomePlaying
 	}
@@ -586,6 +899,13 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			hudText = ""
 			lastSync = time.Time{}
 			videoEnded = nil
+			if o.music {
+				// Reset rather than Resize: the level tap is restarted from the new
+				// offset, so its history describes the wrong part of the song.
+				// Keeping it would draw a waterfall of the part you just left.
+				viz.Reset()
+				grid.Clear()
+			}
 			if userPaused {
 				_ = sess.SetPaused(true)
 			}
@@ -617,8 +937,20 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			if err != nil || (c == l.cols && r == l.termRows) {
 				continue
 			}
-			l = computeLayout(c, r, o.aspect, o.quality)
+			l = computeLayout(c, r, o.aspect, o.quality, chromeRowsFor(strip))
 			sess.Resize(l, sess.Position())
+			if o.music {
+				// The visualizer has to be told, and so does the grid: both hold
+				// cols*rows state. This is the case the plan flagged as the one
+				// only a real terminal shows -- a style whose internal row count is
+				// from before the resize paints out of bounds or leaves a band of
+				// stale cells, and neither shows up in a unit test that never
+				// resizes.
+				viz.Resize(l.cols, l.rows)
+				grid = NewVizGrid(l.cols, l.rows, o.mode != ColorNone, vizPixPerCell(glyph))
+				grid.SetPalette(paletteAt(prefs.palette))
+				renderer.ForceNext()
+			}
 
 		case fr, open := <-sess.frames:
 			if !open {
@@ -633,7 +965,16 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			}
 			sess.pos.Store(math.Float64bits(fr.pos))
 			pl.Tick(fr.pos)
-			if err := renderer.Draw(fr.buf); err != nil {
+			// One arm, two sources. Music mode sends a nil buffer and a position;
+			// video mode sends pixels. Branching here rather than having two loops
+			// is what keeps the prompt, the stall handler and the HUD working
+			// identically in both modes -- which is the entire reason music mode is
+			// a flag on trackSession and not a second player.
+			if o.music {
+				if err := paintMusic(); err != nil {
+					return OutcomeError
+				}
+			} else if err := renderer.Draw(fr.buf); err != nil {
 				return OutcomeError
 			}
 			if err := bw.Flush(); err != nil {
@@ -663,6 +1004,16 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 
 			if time.Since(lastHUD) > hudInterval {
 				lastHUD = time.Now()
+				// Expire the status line on the same tick as the mark. Expiring it
+				// inside reportLine would need a timer, and expiring it in the HUD's
+				// own skip check would leave the footer pinned to a message that
+				// has nothing to replace it -- a HUD whose "unchanged" cache never
+				// fires is a HUD that repaints every frame for nothing.
+				if statusText != "" && time.Now().After(statusUntil) {
+					statusText = ""
+					lastKey = time.Time{} // let the hints stay faded rather than
+					// popping back because of an expiring message
+				}
 				// The pre-seek tick has been up long enough to be read. Leaving it
 				// would make a bar that is never entirely clean, which reads as a
 				// rendering fault rather than as information.
@@ -706,6 +1057,24 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		}
 	}
 }
+
+// chromeRows is the HUD's row count without the spectrum strip, and
+// chromeRowsFor is the count with it.
+//
+// A function rather than two constants because the number is used in exactly two
+// places -- computeLayout and the strip toggle -- and a pair of constants that has
+// to stay in step with the HUD's own row count is a way to have a strip that eats
+// the footer without anything complaining.
+func chromeRowsFor(strip bool) int {
+	if strip {
+		return hudStripRows + 1
+	}
+	return hudStripRows
+}
+
+// hudStripRows is the HUD's own size: title, progress, footer. The strip, when
+// on, is a fourth row above the footer.
+const hudStripRows = 3
 
 // audioTailGrace is how long the audio gets to finish after the video pipe
 // closes. Short enough that a stuck mpv is not a hang, long enough that a track

@@ -56,17 +56,23 @@ type layout struct {
 // Video resolution follows the grid: a 40-column display does not benefit from
 // 1080p, and asking for it wastes decode CPU on a low-end machine. sourceH is
 // clamped to what the grid can actually resolve.
-func computeLayout(termCols, termRows int, aspect float64, quality Quality) layout {
+//
+// chromeRows is how many rows below the grid the HUD will use. It is a parameter
+// rather than a constant because the spectrum strip adds one, and the strip has to
+// come out of the *grid* rather than being drawn over it -- see the strip note in
+// PLAN-phase7.md. Overlaying the bottom rows of the video would mean fighting the
+// diff cache for those cells and forcing a full repaint every frame, which throws
+// away the reason the diff renderer exists.
+func computeLayout(termCols, termRows int, aspect float64, quality Quality, chromeRows int) layout {
 	if termCols <= 0 || termRows <= 0 {
 		termCols, termRows = defaultCols, defaultRows
 	}
 	if aspect <= 0 {
 		aspect = defaultAspect
 	}
-
-	// Leave room for the title bar and the key hints. Without this the frame
-	// overwrites the header and the screen tears.
-	const chromeRows = 3
+	if chromeRows < 3 {
+		chromeRows = 3
+	}
 	availRows := termRows - chromeRows
 	if availRows < 4 {
 		availRows = 4
@@ -289,6 +295,107 @@ func resolveMedia(track Track, sourceH int) (mediaPair, error) {
 		dur:      info.Duration,
 		chapters: chaptersFrom(info.Chapters),
 	}, nil
+}
+
+// resolveAudioPair resolves music mode's streams into a mediaPair with no video.
+//
+// Two `yt-dlp -J` calls, and the second one is not redundant. One call would hand
+// out a single URL, which is the bug above; the point of the second call is
+// precisely that it mints a different grant. Duration and chapters come from the
+// first response only, because they are metadata rather than a consumable --
+// reading them again would buy nothing.
+//
+// A local file needs no resolving and is safe to open twice, because a filesystem
+// path is not a signed grant: it can be opened as many times as there are readers.
+// So local playback is one probe and two copies of the same path.
+func resolveAudioPair(track Track) (mediaPair, error) {
+	if track.IsLocal() {
+		dur, chaps, hasAudio := probeMedia(track.LocalPath)
+		return mediaPair{
+			tapURL:   track.LocalPath,
+			audioURL: track.LocalPath,
+			dur:      float64(dur),
+			chapters: chaps,
+			silent:   !hasAudio,
+		}, nil
+	}
+
+	tapURL, dur, chaps, err := audioURLOnce(track)
+	if err != nil {
+		return mediaPair{}, err
+	}
+	audioURL, _, _, err := audioURLOnce(track)
+	if err != nil {
+		return mediaPair{}, err
+	}
+	return mediaPair{
+		tapURL:   tapURL,
+		audioURL: audioURL,
+		dur:      dur,
+		chapters: chaps,
+	}, nil
+}
+
+// audioURLOnce is one `yt-dlp -J` call reduced to an audio URL plus the metadata
+// that rides along in the same response.
+func audioURLOnce(track Track) (url string, dur float64, chaps []Chapter, err error) {
+	cmd := exec.Command("yt-dlp", "-J", "--no-warnings", "--no-playlist", track.URL)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("yt-dlp -J: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	var info ytInfo
+	if err := json.Unmarshal(out, &info); err != nil {
+		return "", 0, nil, fmt.Errorf("parse yt-dlp -J: %w", err)
+	}
+	url, err = pickAudio(info.Formats)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	return url, info.Duration, chaptersFrom(info.Chapters), nil
+}
+
+// pickAudio chooses the cheapest audio stream, preferring one that carries no
+// video at all.
+//
+// Audio-only first, and the reason is decode cost rather than tidiness: the level
+// tap's ffmpeg is given `-vn`, so it never *outputs* video, but ffmpeg still
+// demuxes and decodes what it is handed before discarding it. Pointed at a
+// progressive format that means decoding a 360p h264 video purely to throw it
+// away, on every track, on the machine that can least afford it. An audio-only
+// DASH format has no video track in the container to decode at all.
+//
+// Progressive is the fallback rather than never, because it is all some uploads
+// have.
+func pickAudio(formats []ytFormat) (string, error) {
+	var bestAudio, progressive ytFormat
+	for _, f := range formats {
+		if f.Protocol == "m3u8" || f.URL == "" {
+			continue
+		}
+		hasA := !isNone(f.ACodec)
+		hasV := !isNone(f.VCodec)
+		switch {
+		case hasA && !hasV:
+			if betterAudio(f, bestAudio) {
+				bestAudio = f
+			}
+		case hasA && hasV:
+			if progressive.URL == "" || f.TBR > progressive.TBR {
+				progressive = f
+			}
+		}
+	}
+	if bestAudio.URL != "" {
+		return bestAudio.URL, nil
+	}
+	if progressive.URL != "" {
+		return progressive.URL, nil
+	}
+	return "", fmt.Errorf("no usable audio format")
 }
 
 // ytInfo is the subset of `yt-dlp -J` we need.

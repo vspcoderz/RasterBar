@@ -36,6 +36,35 @@ failure. Re-testing them wastes a session.
 ffmpeg opens it anyway, and googlevideo URLs are effectively single-use — mpv's
 own request then fails with 403. One input, one consumer.
 
+Music mode resolves the audio stream **twice** on purpose, once for the level tap
+and once for mpv. Two `yt-dlp -J` calls mint two independent grants, so each
+consumer genuinely holds its own. That is not a contradiction of the rule above:
+the rule is about URLs, not streams. The single-URL version it replaced is what
+made music mode one 403 away from silence, intermittently, because a grant is a
+cache and whichever consumer opened it first won.
+
+**Every ffmpeg that feeds a *clock* needs `-re`.** The video pipe and the level tap
+both do. Without it ffmpeg pushes as fast as the CPU allows, so the whole track is
+consumed while mpv is still on the first second — and every symptom points
+somewhere else. Measured: the spectrum drew one frame and froze for the rest of a
+60s track, the onset envelope stopped at 0.193, the particle field fired once, and
+the bars stopped moving. None of that looks like a missing `-re`; it looks like a
+broken detector, a broken analyser and a broken renderer.
+
+**The level tap is its own ffmpeg, so it needs `-ss` too.** It cannot share mpv's
+copy of the stream, so after a seek it has to be told where playback is or it
+analyses from the top of the file. `levelTapArgs` is a function with a test because
+both flags fail silently.
+
+**The onset detector reads the analyser's *raw* magnitudes, not `Analyze`'s return
+value.** A bar wants a slow release; an onset detector needs the opposite and gets
+geometrically weaker every bar otherwise, because smoothed values only fall 18% per
+analysis.
+
+**The onset threshold is a median, never a mean.** Onsets are rare by definition, so
+a mean is dragged up by the very events it should detect. On a periodic signal the
+mean *is* the transient, and `mean * 1.6` is a threshold nothing can cross.
+
 **Never set `mpv --idle`.** It survives end-of-file, so mpv never exits and track
 end is unobservable. The queue hangs on the last frame of every track.
 
@@ -49,6 +78,12 @@ YouTube format, so there is nothing to select.
 **ffprobe is safe on a local path and unsafe on a resolved URL.** The reason this
 project avoids probing a googlevideo URL is the single-use grant, not the
 subprocess. `library.go` probes freely, once per file, capped at 8 concurrent.
+
+`probeMedia` must pass `-show_streams`. Without it ffprobe returns format and
+chapters but no `streams` key, so `hasAudio` is always false and every local file is
+classified silent. In video mode that silently downgrades track-end detection to the
+grace timer after the video pipe closes; in music mode it refuses to play the
+audio-only file that mode exists for.
 
 **Never close the video pipe before killing ffmpeg, and never `Wait` on mpv.**
 Both hang the render loop rather than crashing it, and a hung loop ignores `q`
@@ -78,15 +113,25 @@ real response.
 
 ## Testing
 
-Behaviour is tested at five seams, all runnable without ffmpeg, mpv, or network:
+Behaviour is tested at seven seams, all runnable without ffmpeg, mpv, or network:
 
 1. `Player` — transport state machine, against a `fakeMedia` backend
 2. `hud.go` — pure formatting (`formatClock`, `progressBar`, `parseTimestamp`,
-   `hud.lines`)
+   `hud.lines`, `miniBars`)
 3. `Outcome` — why playback stopped
 4. `mpvIPC` — request encoding and reply parsing
 5. `keyRouter` / `prompt` — byte routing, so a `:` and its timestamp in one read
    is a unit test rather than something you have to press keys to find
+6. `VizGrid` + each style — band resampling, the ramp round-trip through
+   `levelFor`, and one paint per style against a hand-worked grid
+7. **the whole tap pipeline** — `testdata/beat-12s.pcm` through
+   `SpectrumAnalyzer` → `onsetDetector` → `AudioFrame` → a style
+
+Seam 7 exists because seams 1–6 all passed while the feature was broken, and they
+were structurally incapable of catching it. Every piece was right; they were wired
+together wrongly. The fixture is checked in as raw PCM rather than synthesised in
+the test because the bug was a *calibration* problem — absolute band levels decide
+the thresholds — so a signal that happened to be 3dB quieter would have hidden it.
 
 Deliberately **not** unit tested, because they need real processes: the SIGSTOP
 pause, the ffmpeg rebuild on seek/resize, the decoder goroutine against a live
@@ -109,6 +154,18 @@ prompt stays on screen for the rest of the track. The colour path additionally
 tracks cursor position and last-emitted SGR; painting over the grid invalidates
 both, or the next frame resumes mid-row.
 
+`ForceNext` also invalidates the **HUD's** skip cache, and every caller has to know
+that. A forced repaint clears the whole screen including the chrome, so
+`paintHUD`'s "unchanged, skip" then decides there is nothing to repaint and the
+title, clock and footer stay blank. Three separate places reach a `ForceNext` —
+the stall recovery, a seek rebuild, and a visualizer style switch — and all three
+must clear `hudText` with it.
+
+The visualizers paint into `VizGrid` and then hand the result to those same two
+renderers, so everything above applies to them for free. That reuse is why
+`screen_test.go`'s no-stale-cells suite covers visualizer output without a single
+new test, and why a third bespoke painter would have meant re-proving all of it.
+
 ### Driving it without a TTY
 
 Pipe-driven testing of this program gives misleading results: a reopened
@@ -125,21 +182,29 @@ Use a real pty. `/tmp/opencode/ptycheck.py` (cases: `seek`, `back`, `pause`,
 
 | Script | What it proves |
 |---|---|
-| `termscreen.py` | the terminal emulator every other script asserts with |
-| `ptydrive.py` | drive keys at a live player, print clock/footer after each step |
+| `termscreen.py` | the terminal emulator every other script asserts with; mirrors `screen_test.go` deliberately, because two implementations of the same idea would disagree |
+| `ptydrive.py` | shared pty plumbing: pump, send keys, locate HUD rows by content |
+| `musiccheck.py` | music mode end to end — every style cycles, palettes, transport, prompt, strip |
+| `videockeck.py` | video mode has not regressed, including **live SIGWINCH resizes** |
 | `silentcheck.py` | a video-only local file plays its full length |
 | `hanghunt.py` | repeated seeks never freeze the loop (the `Close` deadlock) |
 | `leakhunt.py` | hunts stale cells in a running player |
 
-Two rules for these, both learned the hard way:
+Four rules for these, all learned the hard way:
 
 - **Never run two of them at once.** They all spawn and kill ffmpeg and mpv, and
   one script's cleanup will reap another script's children mid-run.
 - **A synthetic test clip needs an audio stream.** `mpv` exits instantly on a
   video-only file, which reads as track end and ends the run in about two seconds.
-- **Never override `--rows`.** `computeLayout` already subtracts the three chrome
-  rows, so passing a value double-subtracts and every assertion lands on the wrong
-  row.
+- **Never override `--rows`.** `computeLayout` already subtracts the chrome rows,
+  so passing a value double-subtracts and every assertion lands on the wrong row.
+- **Locate HUD rows by content, never by index.** The chrome height changes when
+  the spectrum strip is toggled, so every fixed index is wrong the moment `s` is
+  pressed. That reads as "the strip toggle broke the HUD".
+- **A steady test tone has no transients**, so the particle field is *correctly*
+  empty on one. Use a gated pulse train (`testdata/beat-12s.pcm` is 12s of 50ms
+  bursts every 500ms) when checking anything that reacts to onsets, or you will
+  chase a bug that is not there.
 
 ## Architecture
 
@@ -152,14 +217,38 @@ session.go     trackSession (media backend), decoder goroutine, render loop
 player.go      Player: transport rules, byte routing, the `:` prompt
 sync.go        SyncPlayer: ffmpeg video pipe + mpv audio, A/V sync
 ipc.go         mpv JSON IPC: time position, seek, properties
-hud.go         title / progress bar / hints / parseTimestamp
+hud.go         title / progress bar / hints / parseTimestamp / miniBars
 render.go      mono diff renderer + overlay layout
 color.go       colour renderer, glyph probe, terminal detection
 flow.go        covered-terminal stall handling
+fft.go         radix-2 FFT, log-spaced band edges, raw vs smoothed magnitudes
+visual.go      LevelTap (PCM tap), Visualizer (display smoothing)
+viz.go         VizGrid, the two painters, style registry, prefs
+styles.go      the six visualizers
+palette.go     HSV -> RGB and the four colour schemes
+beat.go        spectral flux, onsets, tempo estimate
 ```
 
 `playQueue` owns the queue index. `playTrack` plays exactly one track and returns
 an `Outcome`; it never mutates the queue.
+
+### Music mode is a flag, not a second player
+
+`trackSession.music` is a bool. Video mode and music mode share the render loop,
+the prompt, the resize path, the stall handler and the queue, and they feed the
+same channel: music mode's `pumpMusic` pushes a `videoFrame` with a **nil** buffer
+and a position, and the loop branches on that once.
+
+This is not tidiness. Phase 6 is what making one mode good cost — a byte pump, a
+key router and a prompt state machine. A parallel `runVisualMusic` would have
+rebuilt all three. The old `runVisualAudio` was exactly that mistake: its own loop,
+one key (`q`), no HUD, no duration, no seek, no queue advance, and it was the
+*default* mode.
+
+The two modes differ in one structural way worth remembering: **where the position
+comes from**. Video mode has two children on two clocks and counts frames; music
+mode has one child and asks it. `SyncPlayer.Seconds()` branches on it, and
+`checkSync` is a no-op in music mode because there is nothing to drift from.
 
 ### Seeking and the prompt
 
@@ -190,6 +279,25 @@ reads the error as drift.
 together is what preserves sync exactly. Do not route pause through mpv's `pause`
 property — mpv would stop on the sound card's schedule while the video pipe kept
 filling, and that backlog would surface as a burst on resume.
+
+In music mode there is only one child to stop, and `pauseChildren` already guards
+the nil ffmpeg. The pause *banner* is drawn on the keypress by `feedKeys` before the
+loop can notice the children are frozen — so it appears even though no further
+frames arrive to repaint it.
+
+### The spectrum strip costs a grid row
+
+`s` toggles it. It takes its space out of the **video grid**, not by overlaying the
+bottom rows, because overlaying means fighting the diff cache for those cells and
+forcing a full repaint every frame — giving up the reason the diff renderer exists.
+So `chromeRows` is a parameter to `computeLayout`, and toggling is a layout recompute
+plus the rebuild that SIGWINCH already does. In music mode there is no video, so the
+same key is free.
+
+The HUD therefore has two shapes, three rows and four. Which is why `hud.lines`
+returns a slice the caller indexes by position rather than three named strings, and
+why `chromeRowsFor(strip)` exists rather than a constant: three places have to agree
+on the chrome height.
 
 ## Style
 
