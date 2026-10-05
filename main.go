@@ -22,8 +22,8 @@ options:
   -m, --mute         play audio muted (visualizer still animates)
       --viz NAME     visualizer style: bars, scope, mirror, waterfall,
                      radial, particles (default: bars)
-      --palette NAME colour scheme: spectrum, height, ocean, ember, mono
-                     (default: spectrum)
+      --palette NAME colour scheme: spectrum, height, ocean, ember, graphite,
+                     ink, ice, magma, viridis, mono (default: spectrum)
   -c, --color        force colour (default: auto-detected from the terminal)
       --mono         force plain monochrome ASCII, no colour
       --glyph MODE   cell layout: auto (probe the terminal), half (2 pixels
@@ -72,6 +72,9 @@ keys (playback, both modes):
   + / -            volume up / down
   v / V            next / previous visualizer style
   c                next colour palette
+  1 - 0            pick a palette directly: 1 spectrum, 2 height, 3 ocean,
+                   4 ember, 5 graphite, 6 ink, 7 ice, 8 magma, 9 viridis,
+                   0 mono
   s                toggle the spectrum strip under the video
   q / ctrl-c       quit
 
@@ -136,10 +139,8 @@ func (o *options) prefs() *vizPrefs {
 			p.style = i
 		}
 	}
-	for i, pal := range palettes {
-		if o.palette != "" && strings.EqualFold(pal.name, o.palette) {
-			p.palette = i
-		}
+	if i := paletteIndexByName(o.palette); i >= 0 {
+		p.palette = i
 	}
 	o.vizPrefs = p
 	return p
@@ -195,13 +196,7 @@ func parseArgs(args []string) (options, error) {
 				return o, fmt.Errorf("--palette needs a value")
 			}
 			i++
-			valid := false
-			for _, p := range palettes {
-				if strings.EqualFold(p.name, args[i]) {
-					valid = true
-				}
-			}
-			if !valid {
+			if paletteIndexByName(args[i]) < 0 {
 				names := make([]string, 0, len(palettes))
 				for _, p := range palettes {
 					names = append(names, p.name)

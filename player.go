@@ -70,7 +70,37 @@ const (
 	// there is no video to give up a row to -- so the same key means "more
 	// information" in both modes rather than "sometimes nothing".
 	CmdStrip
+	// CmdPaletteSelect is the base of a range: CmdPaletteSelect+n selects palette
+	// n directly, for the digit keys.
+	//
+	// A range rather than ten constants because the digit *is* the payload and a
+	// Cmd is a plain int, so the offset carries it with no new type and no struct.
+	// The alternative -- ten constants and ten cases on each side -- is the same
+	// ten mappings in twice the space, and one of them would eventually be wrong.
+	//
+	// The decoder and the render loop both derive the base from this constant, so
+	// they cannot drift apart. See paletteDigit.
+	CmdPaletteSelect
 )
+
+// paletteDigit maps a digit byte to a palette index, or -1 if it is not one.
+//
+// `1` through `9` are indices 0 through 8 and `0` is the last palette. That is
+// the only ordering that keeps `mono` off the first keypress, and mono being last
+// is deliberate (see palettes). It also reads the way people expect: ten keys,
+// left to right, 1-9 then 0.
+//
+// A palette added past the tenth stays reachable through `c` but gets no digit of
+// its own. Adding a key would mean taking one away from something.
+func paletteDigit(c byte) int {
+	switch {
+	case c >= '1' && c <= '9':
+		return int(c - '1')
+	case c == '0':
+		return len(palettes) - 1
+	}
+	return -1
+}
 
 // Three seek sizes, because one is never the right one.
 //
@@ -509,20 +539,44 @@ func decodeOne(pending []byte) (cmds []Cmd, used int, ok bool) {
 		// would eat that key, which is worse than losing the Escape press.
 		return nil, 1, true
 	}
-	if len(pending) < 3 {
-		return nil, 0, false // ESC [ seen, final byte still to come
+	// A CSI is ESC [ parameters final, and the final byte is the first in
+	// 0x40-0x7E. Scan to it rather than assuming three bytes.
+	//
+	// Assuming three is what let a bracketed-paste marker reach the key table:
+	// ESC [ 200 ~ is six bytes, so "200~" was decoded as ordinary keystrokes.
+	// That was harmless while every unmapped byte meant CmdNone. It stopped being
+	// harmless the moment a digit became a palette select, because pasting
+	// anything at all would have silently changed the palette.
+	const csiLimit = 32
+	end := -1
+	for j := 2; j < len(pending) && j < csiLimit; j++ {
+		if pending[j] >= 0x40 && pending[j] <= 0x7e {
+			end = j
+			break
+		}
 	}
-	switch pending[2] {
-	case 'C':
-		return []Cmd{CmdSeekFwd}, 3, true
-	case 'D':
-		return []Cmd{CmdSeekBack}, 3, true
+	if end < 0 {
+		if len(pending) >= csiLimit {
+			// Truncated or malformed beyond any sequence a terminal really sends.
+			// Swallow the cap rather than hold the bytes waiting for a final byte
+			// that is never coming, which would wedge the decoder.
+			return []Cmd{CmdNone}, csiLimit, true
+		}
+		return nil, 0, false // the rest of the sequence has not arrived
+	}
+	if end == 2 {
+		switch pending[2] {
+		case 'C':
+			return []Cmd{CmdSeekFwd}, 3, true
+		case 'D':
+			return []Cmd{CmdSeekBack}, 3, true
+		}
 	}
 	// Up/down, or a sequence we do not use. Swallowed rather than guessed at, so
 	// a mouse report or a function key cannot be mistaken for a seek — but still
 	// reported as one consumed command, so every byte the decoder eats is
 	// accounted for by exactly one entry.
-	return []Cmd{CmdNone}, 3, true
+	return []Cmd{CmdNone}, end + 1, true
 }
 
 // cmdForByte maps one non-escape byte to a command.
@@ -562,6 +616,14 @@ func cmdForByte(c byte) Cmd {
 		return CmdPalette
 	case 's':
 		return CmdStrip
+	default:
+		// Digits are checked last and only if nothing above claimed the byte.
+		// They were free here: the browse list's 1-9 is a different router
+		// (tui.go), and the jump-to-time prompt is routed before this table is
+		// consulted at all.
+		if n := paletteDigit(c); n >= 0 {
+			return CmdPaletteSelect + Cmd(n)
+		}
 	}
 	return CmdNone
 }

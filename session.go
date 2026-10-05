@@ -773,6 +773,33 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	// should stop. Split out of the select so feedKeys can drive it while a
 	// prompt is closing and the bytes after the closing key still count.
 	applyCmd := func(cmd Cmd) Outcome {
+		// Digit palette select, ahead of the switch because the Cmd is a range
+		// and a Go `case` cannot spell one.
+		//
+		// Same two guard rails as `c`, for the same reasons: the grid only exists
+		// in music mode, and in mono every palette resolves to the same picture,
+		// so selecting one silently would look like a broken key.
+		if cmd >= CmdPaletteSelect && cmd < CmdPaletteSelect+Cmd(len(palettes)) {
+			if !o.music {
+				reportLine("viz keys need music mode (-M)")
+				return OutcomePlaying
+			}
+			if o.mode == ColorNone {
+				reportLine("no colour in this terminal  ·  --mono, or try --color")
+				return OutcomePlaying
+			}
+			prefs.palette = int(cmd - CmdPaletteSelect)
+			prefs.clamp()
+			grid.SetPalette(paletteAt(prefs.palette))
+			// ForceNext and hudText are both load-bearing, for the reasons
+			// spelled out at the style-switch case below: the palette lives on the
+			// grid and the diff cache holds the old frame's colours, and that
+			// Draw clears the whole screen including the chrome.
+			renderer.ForceNext()
+			hudText = ""
+			reportLine(describeStyle(prefs))
+			return OutcomePlaying
+		}
 		switch cmd {
 		case CmdNone:
 			return OutcomePlaying

@@ -1332,6 +1332,98 @@ func TestMiniBarsWritesGlyphsNotIndices(t *testing.T) {
 	}
 }
 
+// TestEveryPaletteGradients is the requirement, asserted.
+//
+// Every palette has to be a gradient, and the black-and-white ones especially --
+// "black and white with a gradient" and "no colour at all" are different things,
+// and the second is what the `mono` flag already was. A palette that returned a
+// constant would pass every other test in this file: right length, in-range
+// values, no control characters. It would just be the flat thing the ten-palette
+// exercise exists to replace.
+//
+// Asserted as variation across val rather than as strictly rising luminance.
+// Rising luminance is what most of these do, but spectrum also raises saturation
+// with val, and for some hues that lowers luminance -- so a monotonicity
+// assertion would encode a property the palettes do not actually promise.
+func TestEveryPaletteGradients(t *testing.T) {
+	const steps = 20
+	for _, p := range palettes {
+		if p.mono {
+			// Draws no colour, so it cannot gradient. Reaching it needs a
+			// deliberate press rather than being the default; see palettes.
+			if p.fn != nil {
+				t.Errorf("palette %q is mono but has an fn", p.name)
+			}
+			continue
+		}
+		if p.fn == nil {
+			t.Errorf("palette %q has no fn and is not mono, so every cell resolves to black", p.name)
+			continue
+		}
+		distinct := map[uint32]bool{}
+		for i := 0; i <= steps; i++ {
+			distinct[p.colorFor(0.5, float64(i)/steps, 0)] = true
+		}
+		if len(distinct) < steps/2 {
+			t.Errorf("palette %q produced %d distinct colours across %d levels; "+
+				"that is a flat fill, not a gradient", p.name, len(distinct), steps+1)
+		}
+	}
+}
+
+// TestGreyscalePalettesAreNotMono is the distinction the request turned on.
+//
+// graphite and ink return r==g==b, which is how they get a real luminance ramp.
+// The `mono` flag means the opposite -- no colour at all, routed through the grey
+// ramp as one flat glyph. Reaching for `mono` to get black and white would have
+// produced the flat thing instead of the gradient.
+func TestGreyscalePalettesAreNotMono(t *testing.T) {
+	for _, name := range []string{"graphite", "ink"} {
+		p := paletteByName(name)
+		if p.name == "" {
+			t.Fatalf("palette %q is missing", name)
+		}
+		if p.mono {
+			t.Errorf("palette %q is mono, so it cannot gradient", name)
+		}
+		if p.fn == nil {
+			t.Fatalf("palette %q has no fn", name)
+		}
+		// Pick a mid value and insist the three channels agree.
+		c := p.colorFor(0.5, 0.5, 0)
+		r, g, b := c>>16&0xff, c>>8&0xff, c&0xff
+		if r != g || g != b {
+			t.Errorf("palette %q returned %d,%d,%d; wanted r==g==b", name, r, g, b)
+		}
+	}
+}
+
+// TestPalettesTableInvariants pins the assumptions the digit keys depend on.
+func TestPalettesTableInvariants(t *testing.T) {
+	if len(palettes) != paletteCount {
+		t.Errorf("len(palettes) = %d, paletteCount = %d; the digit table would desync",
+			len(palettes), paletteCount)
+	}
+	if palettes[0].mono {
+		t.Errorf("palettes[0] is %q and mono; a mono default draws black on black, "+
+			"which is invisible and looks like an empty grid", palettes[0].name)
+	}
+	if !palettes[len(palettes)-1].mono {
+		t.Errorf("palettes[%d] is %q and not mono; mono is meant to be reachable "+
+			"only by deliberate presses", len(palettes)-1, palettes[len(palettes)-1].name)
+	}
+	seen := map[string]bool{}
+	for i, p := range palettes {
+		if p.name == "" {
+			t.Errorf("palette %d has no name, so --palette cannot select it", i)
+		}
+		if seen[p.name] {
+			t.Errorf("palette name %q is duplicated at %d", p.name, i)
+		}
+		seen[p.name] = true
+	}
+}
+
 // TestChromeRowsForMatchesTheHud is the coupling that would otherwise be a pair of
 // constants drifting apart.
 func TestChromeRowsForMatchesTheHud(t *testing.T) {

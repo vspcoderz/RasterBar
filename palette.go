@@ -1,6 +1,9 @@
 package main
 
-import "math"
+import (
+	"math"
+	"strings"
+)
 
 // Colour palettes for the visualizers.
 //
@@ -45,7 +48,8 @@ type palette struct {
 	fn func(band, val, beat float64) uint32
 }
 
-// palettes is the cycling order, matching what `c` walks.
+// palettes is the cycling order, matching what `c` walks, and the digit order:
+// `1` selects index 0 through `9` selecting index 8, with `0` selecting the last.
 //
 // Index 0 is a real colour, not the mono entry. That ordering is load-bearing and
 // the first version had it backwards, which made colour mode draw a completely
@@ -57,13 +61,27 @@ type palette struct {
 // may not want it -- flickering hues are not for everyone, and `--mono` is a
 // restart. It is last so reaching it takes deliberate presses rather than being
 // where you land.
+//
+// The black-and-white entries are *not* `mono: true`. They are palettes that
+// happen to return r==g==b, which is what lets them gradient; `mono: true` draws
+// no colour and cannot. See graphiteHue.
 var palettes = []palette{
 	{name: "spectrum", byBand: true, bg: [3]float64{0.10, 0.03, 0.12}, fn: spectrumHue},
 	{name: "height", bg: [3]float64{0.11, 0.04, 0.04}, fn: heightHue},
 	{name: "ocean", byBand: true, bg: [3]float64{0.02, 0.06, 0.10}, fn: oceanHue},
 	{name: "ember", byBand: true, bg: [3]float64{0.12, 0.05, 0.02}, fn: emberHue},
+	{name: "graphite", bg: [3]float64{0.07, 0.07, 0.07}, fn: graphiteHue},
+	{name: "ink", byBand: true, bg: [3]float64{0.06, 0.06, 0.07}, fn: inkHue},
+	{name: "ice", bg: [3]float64{0.04, 0.07, 0.12}, fn: iceHue},
+	{name: "magma", bg: [3]float64{0.11, 0.03, 0.05}, fn: magmaHue},
+	{name: "viridis", byBand: true, bg: [3]float64{0.05, 0.07, 0.08}, fn: viridisHue},
 	{name: "mono", mono: true, bg: [3]float64{0.09, 0.09, 0.09}},
 }
+
+// paletteCount is the number of direct-select keys, and the reason the digit
+// table in player.go is generated rather than written out: one entry here and the
+// key range follows, so adding an eleventh palette cannot desync the keys.
+const paletteCount = 10
 
 // bgColor is the packed background for an unlit cell.
 func (p palette) bgColor() uint32 {
@@ -170,6 +188,79 @@ func emberHue(band, val, beat float64) uint32 {
 	return rgb(1, g, b)
 }
 
+// graphiteHue is the black-and-white palette, gradient by value.
+//
+// Not `mono: true`. That flag means "draw no colour at all", which routes the
+// cell through the grey ramp as a single flat glyph and cannot gradient -- and a
+// flat grey spectrum is exactly what this palette exists to avoid. Returning
+// r==g==b from fn instead gives a real luminance ramp: dark at the foot of a bar,
+// white at the top, with the beat lifting it a further tenth.
+//
+// The +0.80 ceiling is deliberate. Pure white has no headroom, so a loud passage
+// would flatten at the top and the peaks would stop reading as peaks.
+func graphiteHue(band, val, beat float64) uint32 {
+	g := clamp01(0.12 + 0.80*clamp01(val) + 0.10*clamp01(beat))
+	return rgb(g, g, g)
+}
+
+// inkHue is the other black-and-white one: gradient by band, in pure greys.
+//
+// The same split as height (value) against spectrum (band), and for the same
+// reason -- a reader has to be able to ask "how loud" or "which frequency" and
+// get one answer. Ink answers the second: bass is black, treble is white.
+//
+// band drives the base grey and val only lifts it, so a quiet treble band stays
+// dimmer than a loud bass one. Letting val dominate instead would make every
+// palette look like graphite.
+func inkHue(band, val, beat float64) uint32 {
+	g := 0.10 + 0.70*clamp01(band)
+	g *= 0.45 + 0.55*clamp01(val)
+	g = clamp01(g + 0.06*clamp01(beat))
+	return rgb(g, g, g)
+}
+
+// iceHue is a cold monochrome gradient, deep navy at rest to near-white at the
+// top of a bar.
+//
+// Interpolated straight in RGB rather than through the wheel, because the ramp is
+// a straight line in colour space and a hue sweep would put the middle of a bar
+// somewhere green instead of halfway up.
+func iceHue(band, val, beat float64) uint32 {
+	t := clamp01(val)
+	t = clamp01(t + 0.10*clamp01(beat))
+	return rgb(0.25+0.70*t, 0.45+0.52*t, 0.80+0.20*t)
+}
+
+// magmaHue is the heat ramp: black through red and orange to yellow.
+//
+// Two linear segments meeting at t=0.5 rather than five stops from a table. Same
+// reason the rest of this file interpolates: a lookup list bands badly once
+// quant256 gets hold of it, and a two-segment ramp has one seam to hide instead
+// of four.
+func magmaHue(band, val, beat float64) uint32 {
+	t := clamp01(val + 0.08*clamp01(beat))
+	if t < 0.5 {
+		u := t / 0.5
+		return rgb(0.05+0.95*u, 0.01+0.18*u, 0.20*(1-u))
+	}
+	u := (t - 0.5) / 0.5
+	return rgb(1, 0.19+0.76*u, 0.01*u)
+}
+
+// viridisHue is the perceptually-ordered one: dark purple through teal to
+// yellow, which is the ramp people expect from a scientific plot.
+//
+// band pushes the hue *back* toward blue while val pushes it forward toward
+// yellow, so the two axes stay separable. Driving hue from val alone would look
+// identical to magma and the band axis would be wasted.
+func viridisHue(band, val, beat float64) uint32 {
+	hue := 0.34 + 0.24*clamp01(val) - 0.10*clamp01(band)
+	s := 0.80 - 0.30*clamp01(band)
+	v := 0.28 + 0.66*clamp01(val) + 0.10*clamp01(beat)
+	r, g, b := hsvToRGB(hue, s, v)
+	return rgb(r, g, b)
+}
+
 // colorFor asks the palette for a cell.
 //
 // The three inputs are normalised here rather than by each palette, so a new
@@ -180,6 +271,23 @@ func (p palette) colorFor(band, val, beat float64) uint32 {
 		return 0
 	}
 	return p.fn(clamp01(band), clamp01(val), clamp01(beat))
+}
+
+// paletteIndexByName resolves a palette name to its index, case-insensitively,
+// or -1.
+//
+// One helper because this lookup was written inline twice in main.go -- once to
+// resolve a name to an index and once to validate one -- and two copies of a name
+// list is how they drift the first time a palette is added. The case-insensitive
+// match is why it lives here rather than as a test helper: --palette has always
+// accepted `--palette SPECTRUM`, and a refactor must not take that away.
+func paletteIndexByName(name string) int {
+	for i, p := range palettes {
+		if strings.EqualFold(p.name, name) {
+			return i
+		}
+	}
+	return -1
 }
 
 // paletteAt returns a palette by index, clamped.

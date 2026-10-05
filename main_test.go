@@ -1613,6 +1613,83 @@ func TestDecodeKeysMapsTransportKeys(t *testing.T) {
 	}
 }
 
+// TestDecodeKeysMapsPaletteDigits pins the digit table for the direct palette
+// keys.
+//
+// It has to catch two things. A digit wired to the wrong palette is invisible
+// until someone presses it, and a palette with no digit is unreachable without
+// walking `c`. The completeness check is the one that matters: adding an
+// eleventh palette with no key would otherwise fail silently.
+func TestDecodeKeysMapsPaletteDigits(t *testing.T) {
+	if paletteCount != len(palettes) {
+		t.Fatalf("paletteCount = %d, len(palettes) = %d; the digit table would desync",
+			paletteCount, len(palettes))
+	}
+	digits := []byte{'1', '2', '3', '4', '5', '6', '7', '8', '9', '0'}
+	seen := make(map[int]bool, len(digits))
+	for _, c := range digits {
+		n := paletteDigit(c)
+		if n < 0 {
+			t.Fatalf("paletteDigit(%q) = -1, want a palette index", c)
+		}
+		want := CmdPaletteSelect + Cmd(n)
+		got := decodeKeys([]byte{c})
+		if len(got) != 1 || got[0] != want {
+			t.Errorf("decodeKeys(%q) = %v, want [%d] (palette %d, %q)",
+				c, got, want, n, palettes[n].name)
+		}
+		seen[n] = true
+	}
+	for i, p := range palettes {
+		if !seen[i] {
+			t.Errorf("palette %q (index %d) has no digit key", p.name, i)
+		}
+	}
+}
+
+// TestDigitsDoNotLeakFromUnknownSequences is the regression test for a bug this
+// feature introduced rather than revealed.
+//
+// The decoder used to consume exactly three bytes of any CSI sequence, so a
+// bracketed paste marker -- ESC [ 200 ~, six bytes -- left "00~" to be decoded as
+// ordinary keystrokes. Every unmapped byte meant CmdNone so nothing showed. Once a
+// digit became a palette select, pasting anything at all would have changed the
+// palette to mono.
+func TestDigitsDoNotLeakFromUnknownSequences(t *testing.T) {
+	for _, seq := range []string{
+		"\x1b[200~",     // bracketed paste start
+		"\x1b[201~",     // bracketed paste end
+		"\x1b[<0;10;5M", // mouse press, digits in its parameters
+		"\x1b[1;5A",     // modified cursor up
+		"\x1b[3~",       // delete key
+	} {
+		for _, c := range decodeKeys([]byte(seq)) {
+			if c >= CmdPaletteSelect {
+				t.Errorf("decodeKeys(%q) produced palette select %d; digits inside "+
+					"an escape sequence must never reach the key table", seq, c-CmdPaletteSelect)
+			}
+		}
+	}
+}
+
+// TestCsiSequenceIsConsumedWhole checks the decoder leaves nothing behind.
+//
+// Not about the commands it returns -- CmdNone for all of these is correct -- but
+// about `used`, because a short read is how leaked bytes reach the key table.
+func TestCsiSequenceIsConsumedWhole(t *testing.T) {
+	for _, seq := range []string{"\x1b[C", "\x1b[D", "\x1b[200~", "\x1b[<0;10;5M", "\x1b[1;5A"} {
+		_, used, ok := decodeOne([]byte(seq))
+		if !ok {
+			t.Errorf("decodeOne(%q) asked for more bytes; it should be complete", seq)
+			continue
+		}
+		if used != len(seq) {
+			t.Errorf("decodeOne(%q) consumed %d of %d bytes, leaking %q into the key table",
+				seq, used, len(seq), seq[used:])
+		}
+	}
+}
+
 func TestDecodeKeysArrows(t *testing.T) {
 	cases := []struct {
 		in   string
