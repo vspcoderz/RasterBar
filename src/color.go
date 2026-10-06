@@ -129,9 +129,20 @@ type ColorDiffRenderer struct {
 	prevBot []uint32
 	first   bool
 
-	lastFG, lastBG uint32
-	lastX, lastY   int
-	haveLast       bool
+	lastX, lastY int
+	haveLast     bool
+
+	// SGR dedup state, deliberately separate from haveLast. haveLast is about
+	// cursor contiguity and is cleared at the end of every row; the emitted SGR
+	// survives that reset, so the dedup key is kept separately or the first
+	// changed cell of each row re-emits a sequence that is still active.
+	sgrFG, sgrBG uint32
+	sgrValid     bool
+
+	// esc is the reusable escape-sequence scratch for emitColor, so the hot path
+	// writes no garbage. fmt.Sprintf per changed cell was the dominant allocator
+	// in a full-frame repaint.
+	esc []byte
 }
 
 // newColorRenderer picks the colour renderer with the resolved glyph layout.
@@ -151,6 +162,7 @@ func NewColorDiffRenderer(w io.Writer, cols, rows int, mode ColorMode, glyph Gly
 		prevTop:   make([]uint32, n),
 		prevBot:   make([]uint32, n),
 		first:     true,
+		esc:       make([]byte, 0, 64),
 	}
 }
 
@@ -182,6 +194,7 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 		}
 		c.first = false
 		c.haveLast = false
+		c.sgrValid = false
 		// Seed the previous buffers with an impossible value. They start as
 		// zeros, which is a legitimate colour, so a first frame that happened to
 		// be all-black would diff as "unchanged" and never be drawn.
@@ -191,10 +204,11 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 		}
 	} else {
 		// Reset SGR so a stale background colour cannot bleed into a cell whose
-		// previous frame painted one.
+		// previous frame painted one. That reset invalidates the dedup key.
 		if _, err := io.WriteString(c.w, "\x1b[0m"); err != nil {
 			return err
 		}
+		c.sgrValid = false
 	}
 
 	// In one-pixel mode each cell is a space with a background colour: U+0020
@@ -265,23 +279,36 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 // emitColor writes the SGR sequence for a cell, skipping it when neither colour
 // changed since the previous cell. This is the main bandwidth saving.
 func (c *ColorDiffRenderer) emitColor(top, bot uint32) error {
-	if c.haveLast && top == c.lastFG && bot == c.lastBG {
+	if c.sgrValid && top == c.sgrFG && bot == c.sgrBG {
 		return nil
 	}
-	var seq string
+	b := c.esc[:0]
 	if c.truecolor {
-		seq = fmt.Sprintf("\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm",
-			top>>16&0xff, top>>8&0xff, top&0xff,
-			bot>>16&0xff, bot>>8&0xff, bot&0xff)
+		b = append(b, "\x1b[38;2;"...)
+		b = strconv.AppendInt(b, int64(top>>16&0xff), 10)
+		b = append(b, ';')
+		b = strconv.AppendInt(b, int64(top>>8&0xff), 10)
+		b = append(b, ';')
+		b = strconv.AppendInt(b, int64(top&0xff), 10)
+		b = append(b, ";48;2;"...)
+		b = strconv.AppendInt(b, int64(bot>>16&0xff), 10)
+		b = append(b, ';')
+		b = strconv.AppendInt(b, int64(bot>>8&0xff), 10)
+		b = append(b, ';')
+		b = strconv.AppendInt(b, int64(bot&0xff), 10)
+		b = append(b, 'm')
 	} else {
-		seq = fmt.Sprintf("\x1b[38;5;%d;48;5;%dm",
-			quant256(byte(top>>16), byte(top>>8), byte(top)),
-			quant256(byte(bot>>16), byte(bot>>8), byte(bot)))
+		b = append(b, "\x1b[38;5;"...)
+		b = strconv.AppendInt(b, int64(quant256(byte(top>>16), byte(top>>8), byte(top))), 10)
+		b = append(b, ";48;5;"...)
+		b = strconv.AppendInt(b, int64(quant256(byte(bot>>16), byte(bot>>8), byte(bot))), 10)
+		b = append(b, 'm')
 	}
-	if _, err := io.WriteString(c.w, seq); err != nil {
+	c.esc = b
+	if _, err := c.w.Write(b); err != nil {
 		return err
 	}
-	c.lastFG, c.lastBG = top, bot
+	c.sgrFG, c.sgrBG, c.sgrValid = top, bot, true
 	return nil
 }
 
@@ -314,6 +341,7 @@ func (c *ColorDiffRenderer) Overlay(lines []string) error {
 		return err
 	}
 	c.haveLast = false
+	c.sgrValid = false
 	return nil
 }
 

@@ -194,6 +194,69 @@ func TestPromptDropsControlBytes(t *testing.T) {
 	}
 }
 
+// TestPromptHoldsASplitArrowSequence is the regression test for the read
+// boundary landing inside an escape sequence.
+//
+// A burst the render loop hands over is one read, and a read can end anywhere.
+// `ESC [` with the final byte in the next read is the case that mattered: the
+// "is this a complete arrow" test needs three bytes, so a two-byte prefix fell
+// through to the bare-Escape branch and cancelled the field. Someone reaching for
+// an arrow in the jump field lost what they had typed, and only on a slow
+// terminal or at a buffer boundary.
+func TestPromptHoldsASplitArrowSequence(t *testing.T) {
+	var p prompt
+	p.start()
+	p.consume([]byte("1:3"))
+	if _, act := p.consume([]byte("\x1b[")); act != promptNone {
+		t.Fatalf("a split ESC [ cancelled the prompt: %v", act)
+	}
+	if !p.open {
+		t.Fatal("prompt closed on an incomplete sequence")
+	}
+	if _, act := p.consume([]byte("C")); act != promptNone {
+		t.Errorf("the completed arrow produced %v, want promptNone", act)
+	}
+	if !p.open {
+		t.Error("prompt closed when the arrow completed")
+	}
+	if got := p.text(); got != "1:3" {
+		t.Errorf("text = %q, want 1:3 — the arrow must not have edited or cleared it", got)
+	}
+}
+
+// TestPromptSwallowsAWholeArrow covers the application-cursor-mode introducer
+// too: ESC O C is the same right-arrow.
+func TestPromptSwallowsAWholeArrow(t *testing.T) {
+	// Only the two real introducers. ESC [ O is deliberately not here: 'O' is a
+	// valid CSI final byte (0x4F), so `ESC [ O` is a complete sequence and any
+	// byte after it is an ordinary keypress, not part of an arrow.
+	for _, seq := range [][]byte{[]byte("\x1b[C"), []byte("\x1bOC"), []byte("\x1b[D"), []byte("\x1bOD")} {
+		var p prompt
+		p.start()
+		p.consume([]byte("42"))
+		if _, act := p.consume(seq); act != promptNone || !p.open {
+			t.Errorf("%q: act=%v open=%v; want an arrow swallowed, not a cancel", seq, act, p.open)
+		}
+		if got := p.text(); got != "42" {
+			t.Errorf("%q: text = %q, want 42", seq, got)
+		}
+	}
+}
+
+// TestPromptEscapeStillCancels is the other half: a bare Escape has to keep
+// working, or the field becomes impossible to dismiss.
+func TestPromptEscapeStillCancels(t *testing.T) {
+	var p prompt
+	p.start()
+	p.consume([]byte("42"))
+	if _, act := p.consume([]byte("\x1bx")); act != promptCancel {
+		t.Errorf("ESC followed by a plain key = %v, want promptCancel", act)
+	}
+	if p.open {
+		t.Error("field still open after Escape")
+	}
+}
+
 func TestPromptCtrlCCancels(t *testing.T) {
 	var p prompt
 	p.start()

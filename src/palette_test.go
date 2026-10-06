@@ -69,6 +69,45 @@ func paletteByName(name string) palette {
 	return palette{}
 }
 
+// TestHuePalettesUseTheConvertedRedComponent is the regression test for four
+// palettes that threw away hsvToRGB's red and pinned it to 1:
+//
+//	_, g, b := hsvToRGB(hue, s, v); return rgb(1, g, b)
+//
+// For any hue past the red-to-yellow arc, hsvToRGB's red is the low `p` term, so
+// forcing it to 1 sends every one of those hues to full red. The visible
+// damage was that `ocean`, which claims to be "narrow cyan to blue", rendered
+// pink; `viridis` did it correctly and proved the intent.
+func TestHuePalettesUseTheConvertedRedComponent(t *testing.T) {
+	blueOverRed := []struct {
+		name string
+		band float64
+	}{
+		{"ocean", 0}, {"ocean", 0.25}, {"ocean", 0.5}, {"ocean", 0.75}, {"ocean", 1},
+		{"spectrum", 1},
+	}
+	for _, c := range blueOverRed {
+		got := paletteByName(c.name).colorFor(c.band, 0.8, 0)
+		r, b := got>>16&0xff, got&0xff
+		if b <= r {
+			t.Errorf("%s at band %.2f is %06x; blue (%d) must dominate red (%d)",
+				c.name, c.band, got, b, r)
+		}
+	}
+	// ember is the warm counterpart and runs the other way: red must dominate.
+	for _, band := range []float64{0, 0.5, 1} {
+		got := paletteByName("ember").colorFor(band, 0.8, 0)
+		if got>>16&0xff <= got&0xff {
+			t.Errorf("ember at band %.2f is %06x; red must dominate blue", band, got)
+		}
+	}
+	// height runs violet (low) to red (high) in the cell value, so its low end
+	// is the violet one.
+	if got := paletteByName("height").colorFor(0.5, 0, 0); got&0xff <= got>>16&0xff {
+		t.Errorf("height at its low end is %06x; that end of the ramp is violet", got)
+	}
+}
+
 func TestHsvToRGBEndpoints(t *testing.T) {
 	// Zero saturation is a grey regardless of hue, which is the property the
 	// one-pixel colour path relies on when it has nothing to say with colour.

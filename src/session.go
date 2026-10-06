@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -40,13 +41,13 @@ import (
 // failed intermittently because the grant is a cache: whichever consumer opened
 // it first won and the other lost, depending on scheduling.
 //
-// The rule in AGENT.MD is one input, one consumer, and it is a rule about URLs,
+// The rule in AGENTS.md is one input, one consumer, and it is a rule about URLs,
 // not about streams. Two separate yt-dlp calls mint two independent grants, so
 // each consumer genuinely holds its own. See resolveAudioPair.
 type mediaPair struct {
 	videoURL string // empty in music mode: there is no video to decode
 	audioURL string // mpv
-	tapURL   string // music mode only: the level tap's ffmpeg
+	tapURL   string // the level tap's ffmpeg: music mode, and video mode with the strip on
 	dur      float64
 	// chapters comes from the same response as the URLs and the duration, so
 	// chapter navigation costs no extra request on either path.
@@ -115,6 +116,15 @@ type trackSession struct {
 	// decoder: it is rebuilt on every seek so it re-reads from the new offset,
 	// and closing it is part of retiring the old generation.
 	tap *LevelTap
+
+	// wantTap keeps the spectrum strip alive. True in music mode, where the
+	// spectrum is the whole picture, and in video mode only when the strip is on.
+	//
+	// A video-mode tap that fails to start is logged and ignored rather than
+	// fatal: the strip is a decoration on a picture that is already playing, and
+	// killing the track because one optional row would not draw is the wrong
+	// trade. Music mode is the opposite — see startTap.
+	wantTap bool
 }
 
 // newTrackSession resolves a track's streams once and starts playback at pos.
@@ -128,7 +138,7 @@ type trackSession struct {
 // The layout is taken whole rather than as cols/rows/fps because the source
 // resolution travels with it: a re-resolve that forgot l.sourceH would silently
 // downgrade a 1080p session to the 360p default.
-func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMode, glyph GlyphMode, music bool) (*trackSession, error) {
+func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMode, glyph GlyphMode, music, wantTap bool) (*trackSession, error) {
 	var (
 		pair mediaPair
 		err  error
@@ -136,7 +146,7 @@ func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMo
 	if music {
 		pair, err = resolveAudioPair(track)
 	} else {
-		pair, err = resolveMedia(track, l.sourceH)
+		pair, err = resolveMedia(track, l.sourceH, wantTap)
 	}
 	if err != nil {
 		return nil, err
@@ -145,13 +155,14 @@ func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMo
 		return nil, fmt.Errorf("no audio stream in %s", track.Title)
 	}
 	s := &trackSession{
-		track: track,
-		pair:  pair,
-		l:     l,
-		mute:  mute,
-		mode:  mode,
-		glyph: glyph,
-		music: music,
+		track:   track,
+		pair:    pair,
+		l:       l,
+		mute:    mute,
+		mode:    mode,
+		glyph:   glyph,
+		music:   music,
+		wantTap: wantTap || music,
 	}
 	if err := s.start(pos); err != nil {
 		return nil, err
@@ -168,7 +179,7 @@ func (s *trackSession) resolve() (mediaPair, error) {
 	if s.music {
 		return resolveAudioPair(s.track)
 	}
-	return resolveMedia(s.track, s.l.sourceH)
+	return resolveMedia(s.track, s.l.sourceH, s.wantTap)
 }
 
 // start launches the children at a media offset and spawns the decoder.
@@ -205,6 +216,10 @@ func (s *trackSession) start(pos float64) error {
 
 	if s.music {
 		if err := s.startTap(pos); err != nil {
+			// mpv is already running. newTrackSession returning an error means
+			// playTrack never gets a session to Close, so the child has to be
+			// reaped here or it plays on with no owner and no waiter.
+			s.stopDecoder()
 			return err
 		}
 		go s.pumpMusic(p, s.frames, s.stop)
@@ -241,6 +256,20 @@ func (s *trackSession) start(pos float64) error {
 			}
 			close(done)
 		}(p.audio, s.audio)
+	}
+	// The spectrum strip under a video needs its own tap. Started here, per
+	// generation, so a seek or resize re-reads from the new offset exactly as
+	// the music-mode tap does — a tap left at the old position analyses the wrong
+	// part of the track.
+	//
+	// Failure is deliberately not fatal here, the opposite of music mode: the
+	// picture is already playing and the strip is one row of chrome on top of it.
+	if s.wantTap && !s.music {
+		if err := s.startTap(pos); err != nil {
+			if debugQueue {
+				fmt.Fprintf(os.Stderr, "queue: video strip unavailable: %v\n", err)
+			}
+		}
 	}
 	return nil
 }
@@ -307,17 +336,23 @@ func (s *trackSession) pumpMusic(p *SyncPlayer, out chan<- videoFrame, stop <-ch
 // synchronous. Deeper would trade visible lag for memory.
 const frameQueueDepth = 2
 
+// frameBufs recycles decoded-frame byte slices between the decoder goroutine and
+// the render loop. Each slice is owned by exactly one goroutine at a time: the
+// decoder fills one and sends it, the render loop Draws it and returns it. The
+// renderer copies what it needs and does not retain the slice.
+var frameBufs sync.Pool
+
 // decode reads frames and hands them to the render loop.
 //
 // The send selects on the generation's stop channel so retiring a decoder can
 // never leave this goroutine blocked on a channel nobody will read again, which
 // is what a plain send into a full buffer would do.
 //
-// Each frame is copied out of the player's reusable buffer. The player recycles
-// one buffer for speed, and with a buffered channel the decoder can be two frames
-// ahead of the renderer, so handing over the pointer would let the decoder
-// overwrite bytes the renderer is reading. A copy per frame is a few tens of KB
-// at 12fps and removes the race entirely.
+// Each frame is copied out of the player's reusable buffer, because with a
+// buffered channel the decoder can be two frames ahead of the renderer, and
+// handing over the pointer would let the decoder overwrite bytes the renderer is
+// reading. The copy target comes from frameBufs: at 12fps a fresh allocation per
+// frame is steady garbage, and the renderer only borrows the buffer for one Draw.
 func (s *trackSession) decode(p *SyncPlayer, out chan<- videoFrame, stop <-chan struct{}) {
 	// Closing the channel is how end-of-track reaches the render loop. Without it
 	// a finished decoder looks identical to a slow one and the loop waits forever.
@@ -328,11 +363,16 @@ func (s *trackSession) decode(p *SyncPlayer, out chan<- videoFrame, stop <-chan 
 			return
 		}
 		pos := p.Seconds()
-		buf := make([]byte, len(src))
+		buf, _ := frameBufs.Get().([]byte)
+		if cap(buf) < len(src) {
+			buf = make([]byte, len(src))
+		}
+		buf = buf[:len(src)]
 		copy(buf, src)
 		select {
 		case out <- videoFrame{buf: buf, pos: pos}:
 		case <-stop:
+			frameBufs.Put(buf)
 			return
 		}
 	}
@@ -526,8 +566,14 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 
 	l := computeLayout(termCols, termRows, o.aspect, o.quality, chromeRowsFor(strip))
 
-	// The glyph probe round-trips with the terminal, so it must happen after raw
-	// mode is set and before ffmpeg starts: the frame height depends on it.
+	// The glyph probe round-trips with the terminal, so it must happen before
+	// ffmpeg starts: the frame height depends on it.
+	//
+	// playQueue has already resolved it, before the key reader existed, because
+	// the probe reads the Device Status Report straight off `in`. Probing it here
+	// meant two readers on one tty: the report could be swallowed by the key pump
+	// (700ms stall, then a silent downgrade to one pixel per cell), or the probe
+	// could swallow a keystroke the user pressed during startup.
 	glyph := GlyphCell
 	if o.mode != ColorNone {
 		glyph = resolveGlyph(o.glyphPref, o.in, o.out)
@@ -538,7 +584,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	}
 	track := queue[index]
 
-	sess, err := newTrackSession(track, l, 0, o.mute, o.mode, glyph, o.music)
+	sess, err := newTrackSession(track, l, 0, o.mute, o.mode, glyph, o.music, strip)
 	if err != nil {
 		fmt.Fprintf(o.out, "\r\ncannot play %s: %v\r\n", truncate(track.Title, 60), err)
 		return OutcomeError
@@ -592,16 +638,17 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		// own state (waterfall captures a row, particles integrate), and doing it
 		// in this order means the frame drawn is the frame analysed.
 		if sess.tap != nil {
-			f := sess.tap.Frame()
-			viz.Push(&f)
-			if debugViz {
-				alive := -1
-				if p, ok := viz.(*particlesViz); ok {
-					alive = p.alive
+			if f, ok := sess.tap.TryFrame(); ok {
+				viz.Push(&f)
+				if debugViz {
+					alive := -1
+					if p, ok := viz.(*particlesViz); ok {
+						alive = p.alive
+					}
+					fmt.Fprintf(os.Stderr, "viz %s beat=%.3f bpm=%.1f alive=%d band[0]=%.3f band[last]=%.3f\r\n",
+						viz.Name(), f.Beat, f.BPM, alive,
+						f.Bands[0], f.Bands[len(f.Bands)-1])
 				}
-				fmt.Fprintf(os.Stderr, "viz %s beat=%.3f bpm=%.1f alive=%d band[0]=%.3f band[last]=%.3f\r\n",
-					viz.Name(), f.Beat, f.BPM, alive,
-					f.Bands[0], f.Bands[len(f.Bands)-1])
 			}
 		}
 		grid.Clear()
@@ -822,7 +869,36 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				stripViz = Visualizer{level: make([]float64, l.cols), peak: make([]float64, l.cols)}
 			}
 			if !o.music {
+				sess.wantTap = strip
+				// Turning the strip on mid-track is the one moment the tap does not
+				// already exist, because it was only resolved at track start when
+				// the strip was off. It needs a URL of its own — one input, one
+				// consumer — and for a YouTube source that means one more
+				// `yt-dlp -J`, which is why it is done here and not eagerly on
+				// every video track.
+				if strip && sess.tap == nil {
+					pair, err := resolveMedia(track, l.sourceH, true)
+					if err != nil {
+						reportLine("strip needs a second audio stream")
+					} else {
+						sess.pair = pair
+						if err := sess.startTap(sess.Position()); err != nil {
+							reportLine("strip unavailable")
+						}
+					}
+				}
 				sess.Resize(l, sess.Position())
+			} else {
+				// Music mode has no decoder to rebuild, but it still holds a grid,
+				// a style and a renderer sized to the old row count. Toggling the
+				// strip changed the chrome height without any of them being told,
+				// so the HUD drew its extra row over a grid cell. The resize below
+				// is the same recompute SIGWINCH does, minus the process churn.
+				viz.Resize(l.cols, l.rows)
+				grid = NewVizGrid(l.cols, l.rows, o.mode != ColorNone, vizPixPerCell(glyph))
+				grid.SetPalette(paletteAt(prefs.palette))
+				renderer.ForceNext()
+				hudText = ""
 			}
 			reportLine(map[bool]string{true: "spectrum on", false: "spectrum off"}[strip])
 		case CmdVizNext, CmdVizPrev, CmdPalette:
@@ -985,8 +1061,26 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			if err != nil || (c == l.cols && r == l.termRows) {
 				continue
 			}
+			// An explicit --cols/--rows outranks the window, on the resize as well
+			// as at startup. It did not: the recompute used the terminal size, so
+			// one drag of the window edge snapped a deliberately fixed grid back
+			// to whatever the terminal happened to be.
+			if o.cols > 0 {
+				c = o.cols
+			}
+			if o.rows > 0 {
+				r = o.rows
+			}
 			l = computeLayout(c, r, o.aspect, o.quality, chromeRowsFor(strip))
 			sess.Resize(l, sess.Position())
+			if strip {
+				// The strip's own band arrays were sized to the old width, so
+				// after a drag it resampled to the new column count out of a
+				// buffer that was too short and rendered letterboxed for the rest
+				// of the track. It is created once per track and on `s`, never on
+				// SIGWINCH, which is why only this path could fix it.
+				stripViz.Resize(l.cols)
+			}
 			if o.music {
 				// The visualizer has to be told, and so does the grid: both hold
 				// cols*rows state. This is the case the plan flagged as the one
@@ -1035,8 +1129,14 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				if err := paintMusic(); err != nil {
 					return OutcomeError
 				}
-			} else if err := renderer.Draw(fr.buf); err != nil {
-				return OutcomeError
+			} else {
+				drawErr := renderer.Draw(fr.buf)
+				if fr.buf != nil {
+					frameBufs.Put(fr.buf)
+				}
+				if drawErr != nil {
+					return OutcomeError
+				}
 			}
 			if err := bw.Flush(); err != nil {
 				return OutcomeError

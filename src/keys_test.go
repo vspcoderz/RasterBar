@@ -199,6 +199,56 @@ func TestDecodeStreamKeepsIncompleteSequences(t *testing.T) {
 	}
 }
 
+// TestDecodeStreamHandlesApplicationModeArrows is the regression test for SS3.
+//
+// xterm's application cursor mode sends ESC O A rather than ESC [ A. Nothing in
+// this program changes the keypad mode, so whichever mode the terminal is in is
+// whichever it keeps using — and a terminal *started* in application mode sends
+// SS3 for arrows for the whole session. The decoder dropped the ESC and then
+// read O, A as ordinary letters, so the arrows silently did nothing.
+func TestDecodeStreamHandlesApplicationModeArrows(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want Cmd
+	}{
+		{"\x1bOC", CmdSeekFwd},
+		{"\x1bOD", CmdSeekBack},
+		{"\x1b[C", CmdSeekFwd},
+		{"\x1b[D", CmdSeekBack},
+	} {
+		cmds, used := decodeStream([]byte(tc.in))
+		if len(cmds) != 1 || cmds[0] != tc.want {
+			t.Errorf("%q decoded to %v, want [%v]", tc.in, cmds, tc.want)
+		}
+		if used != 3 {
+			t.Errorf("%q consumed %d bytes, want 3", tc.in, used)
+		}
+	}
+}
+
+// A partial SS3 must be held, exactly like a partial CSI: dropping the ESC
+// would turn the introducer into an ordinary letter press.
+func TestDecodeStreamHoldsPartialSS3(t *testing.T) {
+	for _, in := range []string{"\x1b", "\x1bO"} {
+		cmds, used := decodeStream([]byte(in))
+		if len(cmds) != 0 || used != 0 {
+			t.Errorf("%q consumed %d bytes -> %v, want it held", in, used, cmds)
+		}
+	}
+}
+
+// Up and down are unbound, and an unmapped SS3 final must still be swallowed
+// whole rather than decoded as a literal letter.
+func TestDecodeStreamSwallowsUnmappedSS3(t *testing.T) {
+	cmds, used := decodeStream([]byte("\x1bOA"))
+	if used != 3 {
+		t.Errorf("consumed %d bytes, want 3", used)
+	}
+	if len(cmds) != 1 || cmds[0] != CmdNone {
+		t.Errorf("ESC O A decoded to %v, want a single CmdNone", cmds)
+	}
+}
+
 func TestDecodeStreamHandlesPartialThenMore(t *testing.T) {
 	// A real burst: keys before the sequence, the sequence itself, keys after.
 	pending := []byte("n\x1b[D ")

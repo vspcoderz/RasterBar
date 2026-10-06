@@ -15,6 +15,12 @@ type barsViz struct {
 	n          int
 	viz        Visualizer
 	scratch    []float64
+
+	// rowVal and rowRamp cache the x-independent part of a bar cell: how far up
+	// the bar a row sits. Recomputed once per row rather than once per cell,
+	// because the gradient along a bar's length does not depend on the column.
+	rowVal  []float64
+	rowRamp []byte
 }
 
 func (b *barsViz) Name() string { return "bars" }
@@ -29,6 +35,10 @@ func (b *barsViz) Resize(cols, rows int) {
 	b.viz.Resize(b.n)
 	if len(b.scratch) != b.n {
 		b.scratch = make([]float64, b.n)
+	}
+	if len(b.rowVal) < rows {
+		b.rowVal = make([]float64, rows)
+		b.rowRamp = make([]byte, rows)
 	}
 }
 
@@ -71,6 +81,13 @@ func (b *barsViz) Paint(g *VizGrid) {
 		height = 1
 	}
 
+	// The height-dependent part of a cell, once per row.
+	for y := 0; y < height; y++ {
+		v := safeDiv(float64(height-y), float64(height), 0)
+		b.rowVal[y] = v
+		b.rowRamp[y] = rampFor(v)
+	}
+
 	for x := 0; x < b.cols && x < b.n; x++ {
 		lv := clamp01(levels[x])
 		h := int(lv * float64(height))
@@ -93,8 +110,7 @@ func (b *barsViz) Paint(g *VizGrid) {
 			// top of the bar down to dimmer at the base. Brightness by height,
 			// not by time: a bar that fades along its own length reads as depth,
 			// which is not what it is showing.
-			val := safeDiv(float64(height-y), float64(height), 0)
-			g.Set(x, b.rows-1-y, rampFor(val), g.Color(band, val, 0))
+			g.Set(x, b.rows-1-y, b.rowRamp[y], g.Color(band, b.rowVal[y], 0))
 		}
 		// The cap, only where there is room above the bar for it.
 		if pk := clamp01(b.viz.Peak()[x]); pk > 0 {

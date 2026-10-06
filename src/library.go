@@ -142,6 +142,11 @@ func ScanLibrary(root string, probe bool) ([]Track, error) {
 // It returns ok=false for a video whose name carries no episode marker at all.
 // Such a file has no meaningful position in a playlist, and inventing one from
 // readdir order would put it somewhere arbitrary rather than honestly nowhere.
+//
+// It deliberately does NOT probe for a duration. Probing here ran one ffprobe
+// per file *serially* inside the walk, so --no-probe still paid for every probe
+// it was meant to skip. Durations are filled afterwards by probeDurations, which
+// is bounded and concurrent, and only when the caller asked for probing.
 func libraryTrack(path, root string) (Track, bool) {
 	// The path relative to root is the identity. An absolute path in the HUD
 	// eats the whole width, and the leaf is what distinguishes one episode from
@@ -168,7 +173,6 @@ func libraryTrack(path, root string) (Track, bool) {
 		key.Series = cleanTitle(dir)
 	}
 
-	dur := probeDuration(path)
 	tr := Track{
 		Scraper:   "library",
 		ID:        rel,
@@ -178,10 +182,6 @@ func libraryTrack(path, root string) (Track, bool) {
 		Series:    key.Series,
 		Season:    key.Season,
 		Episode:   key.Episode,
-	}
-	if dur > 0 {
-		d := formatDuration(dur)
-		tr.Duration = &d
 	}
 	return tr, true
 }

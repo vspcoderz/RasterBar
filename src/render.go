@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"strconv"
 )
 
 // Rendering: tonal ramp and diff-based painting.
@@ -35,6 +36,19 @@ type DiffRenderer struct {
 	prev  []byte // previous frame, one byte per cell
 	cur   []byte // scratch for partial row writes
 	first bool
+
+	// esc is the reusable cursor-position scratch, so per-run output does not go
+	// through fmt (which boxes args and allocates a pooled buffer each call).
+	esc []byte
+}
+
+// appendCUP appends an absolute cursor-position escape ("ESC[row;colH") to dst.
+func appendCUP(dst []byte, row, col int) []byte {
+	dst = append(dst, "\x1b["...)
+	dst = strconv.AppendInt(dst, int64(row), 10)
+	dst = append(dst, ';')
+	dst = strconv.AppendInt(dst, int64(col), 10)
+	return append(dst, 'H')
 }
 
 func NewDiffRenderer(w io.Writer, cols, rows int) *DiffRenderer {
@@ -45,6 +59,7 @@ func NewDiffRenderer(w io.Writer, cols, rows int) *DiffRenderer {
 		prev:  make([]byte, cols*rows),
 		cur:   make([]byte, cols),
 		first: true,
+		esc:   make([]byte, 0, 24),
 	}
 }
 
@@ -74,7 +89,9 @@ func (d *DiffRenderer) Draw(frame []byte) error {
 			for x, b := range row {
 				d.cur[x] = levelFor(b)
 			}
-			if _, err := fmt.Fprintf(d.w, "\x1b[%d;1H%s", y+1, d.cur); err != nil {
+			d.esc = appendCUP(d.esc[:0], y+1, 1)
+			d.esc = append(d.esc, d.cur...)
+			if _, err := d.w.Write(d.esc); err != nil {
 				return err
 			}
 		}
@@ -107,7 +124,9 @@ func (d *DiffRenderer) Draw(frame []byte) error {
 			for i := start; i < x; i++ {
 				d.cur[i] = levelFor(row[i])
 			}
-			if _, err := fmt.Fprintf(d.w, "\x1b[%d;%dH%s", y+1, start+1, d.cur[start:x]); err != nil {
+			d.esc = appendCUP(d.esc[:0], y+1, start+1)
+			d.esc = append(d.esc, d.cur[start:x]...)
+			if _, err := d.w.Write(d.esc); err != nil {
 				return err
 			}
 		}

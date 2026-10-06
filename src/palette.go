@@ -142,8 +142,8 @@ func spectrumHue(band, val, beat float64) uint32 {
 	// whole spectrum without changing which colour each band is.
 	s := 0.55 + 0.35*clamp01(val)
 	v := 0.45 + 0.45*clamp01(val) + 0.2*clamp01(beat)
-	_, g, b := hsvToRGB(hue, s, v)
-	return rgb(1, g, b)
+	r, g, b := hsvToRGB(hue, s, v)
+	return rgb(r, g, b)
 }
 
 // heightHue colours by how tall the cell is, so every bar is a gradient of its
@@ -157,8 +157,8 @@ func heightHue(band, val, beat float64) uint32 {
 	hue := 0.62 * (1 - clamp01(val))
 	s := 0.85
 	v := 0.30 + 0.60*clamp01(val)
-	_, g, b := hsvToRGB(hue, s, v)
-	return rgb(1, g, b)
+	r, g, b := hsvToRGB(hue, s, v)
+	return rgb(r, g, b)
 }
 
 // oceanHue is a narrow hue range with low saturation, for a dark terminal.
@@ -171,8 +171,8 @@ func oceanHue(band, val, beat float64) uint32 {
 	hue := 0.50 + 0.15*clamp01(band)
 	s := 0.45 + 0.20*clamp01(beat)
 	v := 0.30 + 0.60*clamp01(val)
-	_, g, b := hsvToRGB(hue, s, v)
-	return rgb(1, g, b)
+	r, g, b := hsvToRGB(hue, s, v)
+	return rgb(r, g, b)
 }
 
 // emberHue is the warm counterpart to ocean, for a light-ish terminal scheme.
@@ -184,8 +184,8 @@ func emberHue(band, val, beat float64) uint32 {
 	hue := 0.02 + 0.10*clamp01(band)
 	s := 0.60 + 0.30*clamp01(beat)
 	v := 0.35 + 0.60*clamp01(val)
-	_, g, b := hsvToRGB(hue, s, v)
-	return rgb(1, g, b)
+	r, g, b := hsvToRGB(hue, s, v)
+	return rgb(r, g, b)
 }
 
 // graphiteHue is the black-and-white palette, gradient by value.

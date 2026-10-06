@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/vspcoderz/rasterbar/internal/term"
 )
 
 const usage = `rasterbar - terminal YouTube player: ASCII video or a music visualizer
@@ -392,6 +394,24 @@ func playQueue(opts options, mode ColorMode, tracks []Track, index int, music bo
 	// One key reader for the whole queue. Starting one per track left the
 	// previous goroutine blocked in Read after a queue advance, and the two then
 	// raced for stdin — which showed up as the quit key doing nothing.
+	// Resolve the glyph layout before the key reader starts.
+	//
+	// The probe round-trips with the terminal: it prints the half-block glyph and
+	// reads the Device Status Report back off the same fd the keys come from.
+	// Starting readKeys first put two readers on one tty, and the report went to
+	// whichever won — either a 700ms stall that silently downgraded the frame to
+	// one pixel per cell, or a keystroke the user pressed during startup eaten by
+	// the probe. Probing first makes the race impossible rather than unlikely.
+	//
+	// Raw mode has to be on for the reply to come back cleanly, and playTrack sets
+	// it for the whole render loop, so it is turned on and off just for the probe.
+	if po.glyphPref == GlyphAuto && po.in != nil && po.out != nil {
+		if restore, err := term.MakeRawVT(po.in, 0, 1); err == nil {
+			po.glyphPref = resolveGlyph(GlyphAuto, po.in, po.out)
+			restore()
+		}
+	}
+
 	keys := make(chan []byte, 16)
 	go readKeys(po.in, keys)
 	po.keys = keys

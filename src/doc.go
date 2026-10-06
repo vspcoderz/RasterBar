@@ -57,7 +57,7 @@
 //	            raw-terminal layer: termios, TIOCGWINSZ, and a pty for
 //	            subprocesses that insist on having one
 //
-// AGENT.MD is the rulebook: the conventions, the dead ends not to retry, and
+// AGENTS.md is the rulebook: the conventions, the dead ends not to retry, and
 // the units. It is written for the next person to change this, which is usually
 // whoever is about to repeat one of these mistakes.
 package main

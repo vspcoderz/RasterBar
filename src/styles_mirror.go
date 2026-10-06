@@ -13,6 +13,10 @@ type mirrorViz struct {
 	viz        Visualizer
 	scratch    []float64
 	fold       bool // kaleidoscope: fold the left half onto the right
+
+	// rowVal/rowRamp cache the y-only gradient, as in barsViz.
+	rowVal  []float64
+	rowRamp []byte
 }
 
 func (m *mirrorViz) Name() string { return "mirror" }
@@ -27,6 +31,10 @@ func (m *mirrorViz) Resize(cols, rows int) {
 	m.viz.Resize(m.n)
 	if len(m.scratch) != m.n {
 		m.scratch = make([]float64, m.n)
+	}
+	if len(m.rowVal) < rows {
+		m.rowVal = make([]float64, rows)
+		m.rowRamp = make([]byte, rows)
 	}
 	// Below about 40 columns the fold makes a shape narrower than 20 cells, which
 	// is not a shape. Above it, the closed form is what makes it worth having.
@@ -54,6 +62,13 @@ func (m *mirrorViz) Paint(g *VizGrid) {
 	}
 	levels := m.viz.Level()
 
+	// The mirror gradient depends only on the row, not the column.
+	for y := 0; y < half; y++ {
+		v := safeDiv(float64(y+1), float64(half), 0)
+		m.rowVal[y] = v
+		m.rowRamp[y] = rampFor(v)
+	}
+
 	for x := 0; x < m.cols; x++ {
 		// Kaleidoscope fold: reflect the left half onto the right so the shape
 		// closes on itself.
@@ -69,10 +84,9 @@ func (m *mirrorViz) Paint(g *VizGrid) {
 		h := int(lv * float64(half))
 		band := bandPos(bi, m.n)
 		for y := 0; y < h; y++ {
-			val := safeDiv(float64(y+1), float64(half), 0)
 			// Above the axis and below it, mirrored.
-			g.Set(x, half-1-y, rampFor(val), g.Color(band, val, 0))
-			g.Set(x, half+y, rampFor(val), g.Color(band, val, 0))
+			g.Set(x, half-1-y, m.rowRamp[y], g.Color(band, m.rowVal[y], 0))
+			g.Set(x, half+y, m.rowRamp[y], g.Color(band, m.rowVal[y], 0))
 		}
 	}
 }

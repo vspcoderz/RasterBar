@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -197,6 +197,12 @@ type LevelTap struct {
 	waveBuf []float64
 	beat    float64
 	bpm     float64
+	// gen increments on every new analysis window. The render loop reads it via
+	// TryFrame so a style is folded at the audio's ~11Hz, not the renderer's up
+	// to 30Hz -- otherwise a waterfall scrolls and particles age at the frame
+	// rate and the state runs ~3x faster than the music.
+	gen     uint64
+	readGen uint64
 	an      *SpectrumAnalyzer
 	onsets  *onsetDetector
 	once    sync.Once
@@ -279,6 +285,7 @@ func (l *LevelTap) pump() {
 			l.wave = wave
 			l.beat = beat
 			l.bpm = l.onsets.BPM()
+			l.gen++
 			l.mu.Unlock()
 		}
 		if err != nil {
@@ -287,18 +294,30 @@ func (l *LevelTap) pump() {
 	}
 }
 
-// Bands returns the latest magnitudes. Caller must not retain the slice.
+// Bands returns a copy of the latest magnitudes.
+//
+// A copy, and that is not a habit. The pump goroutine writes into l.bands under
+// this same mutex ~11 times a second, so handing back the header under the lock
+// and letting the caller read it afterwards protects only the assignment -- the
+// pump is free to overwrite the contents while the render loop is still reading
+// them. A half-updated spectrum reads as a glitch in the bars and nothing else
+// would catch it. Copying is a few hundred bytes at 11Hz.
 func (l *LevelTap) Bands() []float64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.bands
+	out := make([]float64, len(l.bands))
+	copy(out, l.bands)
+	return out
 }
 
-// Wave returns the most recent time-domain window. Caller must not retain it.
+// Wave returns a copy of the most recent time-domain window, for the same reason
+// as Bands: the pump owns the backing array.
 func (l *LevelTap) Wave() []float64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.wave
+	out := make([]float64, len(l.wave))
+	copy(out, l.wave)
+	return out
 }
 
 // Beat returns the onset envelope and tempo estimate.
@@ -315,13 +334,36 @@ func (l *LevelTap) Beat() (float64, float64) {
 // drawing a waveform from one moment and an envelope from another, and on a
 // transient the mismatch is visible as the reaction lagging the beat.
 //
-// Caller must not retain Bands or Wave.
+// Caller may retain Bands and Wave: both are copies, because the pump owns the
+// buffers the styles would otherwise be reading.
 func (l *LevelTap) Frame() AudioFrame {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.frameLocked()
+}
+
+// TryFrame is Frame, but reports false when no new analysis has landed since the
+// previous successful call. Callers that mutate per-analysis state on every Push
+// use this so the state advances at the audio's rate, not the renderer's.
+func (l *LevelTap) TryFrame() (AudioFrame, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.gen == l.readGen {
+		return AudioFrame{}, false
+	}
+	l.readGen = l.gen
+	return l.frameLocked(), true
+}
+
+// frameLocked copies Bands and Wave; see Bands for why they are not aliased.
+func (l *LevelTap) frameLocked() AudioFrame {
+	bands := make([]float64, len(l.bands))
+	copy(bands, l.bands)
+	wave := make([]float64, len(l.wave))
+	copy(wave, l.wave)
 	return AudioFrame{
-		Bands: l.bands,
-		Wave:  l.wave,
+		Bands: bands,
+		Wave:  wave,
 		Beat:  l.beat,
 		BPM:   l.bpm,
 	}
@@ -333,7 +375,20 @@ func (l *LevelTap) Close() {
 			l.r.Close()
 		}
 		if l.cmd != nil && l.cmd.Process != nil {
-			l.cmd.Process.Kill()
+			_ = l.cmd.Process.Signal(syscall.SIGCONT)
+			_ = l.cmd.Process.Kill()
+			// Reap it. Killing without waiting leaves a zombie per seek, resize
+			// and track advance for the life of the process. Bounded like
+			// SyncPlayer.Close, because the pump goroutine may still be in Read.
+			reaped := make(chan struct{})
+			go func() {
+				_ = l.cmd.Wait()
+				close(reaped)
+			}()
+			select {
+			case <-reaped:
+			case <-time.After(childReapTimeout):
+			}
 		}
 	})
 }
@@ -363,30 +418,3 @@ func rmsLevel(pcm []byte) float64 {
 	}
 	return level
 }
-
-// watchQuit closes the returned channel on q or ctrl-c. Raw mode required.
-func watchQuit(in *os.File) <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		b := make([]byte, 1)
-		for {
-			n, err := in.Read(b)
-			if err != nil || n == 0 {
-				return
-			}
-			if b[0] == 'q' || b[0] == 'Q' || b[0] == 0x03 {
-				close(ch)
-				return
-			}
-		}
-	}()
-	return ch
-}
-
-// tapTimeout bounds the initial read before ffmpeg is assumed to be dead.
-//
-// Sized against the tap's own read size rather than picked: a full fftSize block
-// at spectrumRate is 93ms, so a third of a second is three windows. Long enough
-// that a slow disk or a cold cache does not trip it, short enough that a dead
-// ffmpeg is reported rather than hanging the mode.
-const tapTimeout = 300 * time.Millisecond

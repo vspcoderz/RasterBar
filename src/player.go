@@ -531,8 +531,25 @@ func decodeOne(pending []byte) (cmds []Cmd, used int, ok bool) {
 		return []Cmd{cmdForByte(c)}, 1, true
 	}
 	// ESC on its own: could be the start of a sequence, or the Escape key.
+	// Pressing Escape and getting nothing is the acceptable failure; swallowing
+	// the next key instead is not.
 	if len(pending) < 2 {
 		return nil, 0, false
+	}
+	// SS3, sent instead of CSI when the terminal is in application cursor mode
+	// (`ESC O A` rather than `ESC [ A`). Nothing here changes the keypad mode, so
+	// whichever the terminal is in is whichever it will keep using — and a
+	// terminal started in application mode sends SS3 for arrows forever. Without
+	// this the ESC was dropped and A/B/C/D were decoded as ordinary letters,
+	// which for the arrows means they silently did nothing.
+	if pending[1] == 'O' {
+		if len(pending) < 3 {
+			return nil, 0, false
+		}
+		if end := ss3Final(pending[2]); end != CmdNone {
+			return []Cmd{end}, 3, true
+		}
+		return []Cmd{CmdNone}, 3, true
 	}
 	if pending[1] != '[' {
 		// Not a CSI. Dropping the ESC keeps the key after it working; holding it
@@ -565,11 +582,8 @@ func decodeOne(pending []byte) (cmds []Cmd, used int, ok bool) {
 		return nil, 0, false // the rest of the sequence has not arrived
 	}
 	if end == 2 {
-		switch pending[2] {
-		case 'C':
-			return []Cmd{CmdSeekFwd}, 3, true
-		case 'D':
-			return []Cmd{CmdSeekBack}, 3, true
+		if cmd := ss3Final(pending[2]); cmd != CmdNone {
+			return []Cmd{cmd}, 3, true
 		}
 	}
 	// Up/down, or a sequence we do not use. Swallowed rather than guessed at, so
@@ -577,6 +591,22 @@ func decodeOne(pending []byte) (cmds []Cmd, used int, ok bool) {
 	// reported as one consumed command, so every byte the decoder eats is
 	// accounted for by exactly one entry.
 	return []Cmd{CmdNone}, end + 1, true
+}
+
+// ss3Final maps the final byte of a cursor sequence to a command.
+//
+// Shared by the CSI (`ESC [ A`) and SS3 (`ESC O A`) forms because they mean the
+// same four keys and differ only in the introducer. Up and down are deliberately
+// absent: nothing binds them, and returning CmdNone for them is what keeps the
+// decoder from inventing a seek.
+func ss3Final(c byte) Cmd {
+	switch c {
+	case 'C':
+		return CmdSeekFwd
+	case 'D':
+		return CmdSeekBack
+	}
+	return CmdNone
 }
 
 // cmdForByte maps one non-escape byte to a command.
@@ -807,6 +837,16 @@ func (r *keyRouter) flush() keyResult {
 type prompt struct {
 	buf  []byte
 	open bool
+
+	// escTail holds the start of an escape sequence split across two reads.
+	//
+	// The burst the render loop hands over is one read, and a read boundary can
+	// land anywhere. `ESC [` with the final byte in the next read is the case that
+	// mattered: the check for a complete arrow sequence needs three bytes, so a
+	// two-byte prefix fell through to the bare-Escape branch and cancelled the
+	// prompt. Someone reaching for an arrow in the jump field lost what they had
+	// typed, and it only happened on a slow terminal or at a buffer boundary.
+	escTail []byte
 }
 
 // promptMax is how many characters the field accepts.
@@ -846,16 +886,33 @@ func (p *prompt) text() string { return string(p.buf) }
 // back to the transport rather than being swallowed by a field that has already
 // closed.
 func (p *prompt) consume(chunk []byte) (int, promptAction) {
+	// A held escape prefix from the previous read goes in front, so the loop
+	// below sees one contiguous burst. Cleared first: whatever it holds has been
+	// consumed by this call either way.
+	if len(p.escTail) > 0 {
+		chunk = append(p.escTail, chunk...)
+		p.escTail = nil
+	}
 	for i := 0; i < len(chunk); {
 		c := chunk[i]
 		switch c {
 		case 0x1b:
-			// Escape dismisses. An arrow key is ESC [ <final> and must not
-			// dismiss the field just because the user reached for a seek that
-			// does not apply here, so a complete sequence is swallowed whole.
-			if i+2 < len(chunk) && chunk[i+1] == '[' {
-				i += 3
-				continue
+			// Escape dismisses, unless it is the start of a cursor sequence. An
+			// arrow is ESC [ <final> or ESC O <final> and must not dismiss the
+			// field just because the user reached for a seek that does not apply
+			// here, so a complete one is swallowed whole and an incomplete one is
+			// held for the next read.
+			if i+1 < len(chunk) && (chunk[i+1] == '[' || chunk[i+1] == 'O') {
+				if end := seqEnd(chunk[i:]); end > 0 {
+					i += end
+					continue
+				}
+				// Incomplete: hold it rather than cancelling. Bounded so a stream
+				// of escape bytes cannot grow this without limit.
+				if len(chunk)-i <= promptEscLimit {
+					p.escTail = append(p.escTail[:0], chunk[i:]...)
+					return len(chunk), promptNone
+				}
 			}
 			p.stop()
 			return i + 1, promptCancel
@@ -889,6 +946,26 @@ func (p *prompt) consume(chunk []byte) (int, promptAction) {
 		}
 	}
 	return len(chunk), promptNone
+}
+
+// seqEnd returns the length of a complete cursor sequence at the front of b, or
+// 0 if it has not fully arrived.
+//
+// CSI and SS3 both end at the first byte in 0x40-0x7E after the introducer, which
+// is the same rule the transport decoder uses; sharing the idea is the point, the
+// two answer different questions (does this *mean* anything vs is this complete).
+const promptEscLimit = 32
+
+func seqEnd(b []byte) int {
+	if len(b) < 3 || (b[1] != '[' && b[1] != 'O') {
+		return 0
+	}
+	for j := 2; j < len(b) && j < promptEscLimit; j++ {
+		if b[j] >= 0x40 && b[j] <= 0x7e {
+			return j + 1
+		}
+	}
+	return 0
 }
 
 // blockCursor is U+2588 FULL BLOCK. The same glyph resolveGlyph probes with, so

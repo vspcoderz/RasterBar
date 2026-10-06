@@ -85,6 +85,11 @@ type onsetDetector struct {
 
 	beat float64
 	bpm  float64
+
+	// scratch buffers so the per-analysis baseline and tempo estimate allocate
+	// nothing. Both are small and fixed-size; see baseline and tempoOfInto.
+	baseScratch []float64
+	tempScratch []float64
 }
 
 // onsetWindow is how many analyses the adaptive baseline is taken over.
@@ -108,7 +113,9 @@ func NewOnsetDetector(nBands int) *onsetDetector {
 		ctx:  make([]float64, onsetCtx),
 		// Negative so the first analysis is already past the refractory period
 		// rather than being swallowed by a zero-valued one.
-		last: -refractoryBlocks - 1,
+		last:        -refractoryBlocks - 1,
+		baseScratch: make([]float64, onsetWindow),
+		tempScratch: make([]float64, 0, onsetHistory),
 	}
 }
 
@@ -186,10 +193,8 @@ func (d *onsetDetector) baseline() float64 {
 	if d.filled == 0 {
 		return 0
 	}
-	v := make([]float64, 0, d.filled)
-	for i := 0; i < d.filled; i++ {
-		v = append(v, d.hist[i])
-	}
+	v := d.baseScratch[:d.filled]
+	copy(v, d.hist[:d.filled])
 	return median(v)
 }
 
@@ -215,7 +220,7 @@ func (d *onsetDetector) record(block int) {
 	if len(d.onsets) > onsetHistory {
 		d.onsets = d.onsets[len(d.onsets)-onsetHistory:]
 	}
-	d.bpm = tempoOf(d.onsets)
+	d.bpm = tempoOfInto(d.onsets, d.tempScratch)
 }
 
 // Beat is the current envelope value.
@@ -239,10 +244,16 @@ func (d *onsetDetector) BPM() float64 { return d.bpm }
 // faster of the two plausible readings is the one that tracks what people tap
 // along to.
 func tempoOf(onsets []int) float64 {
+	return tempoOfInto(onsets, nil)
+}
+
+// tempoOfInto is tempoOf with a caller-owned scratch buffer for the interval
+// list, so the per-onset tempo estimate allocates nothing.
+func tempoOfInto(onsets []int, scratch []float64) float64 {
 	if len(onsets) < 3 {
 		return 0
 	}
-	intervals := make([]float64, 0, len(onsets)-1)
+	intervals := scratch[:0]
 	for i := 1; i < len(onsets); i++ {
 		if gap := onsets[i] - onsets[i-1]; gap > 0 {
 			intervals = append(intervals, float64(gap))
@@ -277,17 +288,20 @@ func tempoOf(onsets []int) float64 {
 }
 
 // median is the middle value, averaging the two in the middle for an even count.
+//
+// It sorts v in place, so callers must pass a buffer they own. The private
+// callers all pass a scratch slice; the tests pass literals, which they do not
+// read again.
 func median(v []float64) float64 {
 	if len(v) == 0 {
 		return 0
 	}
-	c := append([]float64(nil), v...)
-	insertionSortFloats(c)
-	mid := len(c) / 2
-	if len(c)%2 == 1 {
-		return c[mid]
+	insertionSortFloats(v)
+	mid := len(v) / 2
+	if len(v)%2 == 1 {
+		return v[mid]
 	}
-	return (c[mid-1] + c[mid]) / 2
+	return (v[mid-1] + v[mid]) / 2
 }
 
 // insertionSortFloats sorts in place.

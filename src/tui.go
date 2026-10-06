@@ -116,20 +116,45 @@ func (t *TUI) Run() (Action, int) {
 		if err != nil {
 			return ActionQuit, -1
 		}
-		if b == 0x1b { // escape sequence: arrow keys
+		if b == 0x1b { // escape sequence: arrow keys, home/end
+			//
+			// Read to the sequence's final byte rather than a fixed two more, and
+			// key off the final byte alone. Reading exactly two is what made
+			// ESC [ H (home) and ESC [ F (end) dead: the switch saw the '[' as
+			// buf[1], found no case for it, and did nothing — while the switch's
+			// own 0x48/0x46 cases never got the byte that meant home and end. The
+			// introducer is '[' for CSI and 'O' for SS3 (application cursor mode),
+			// and both end at the first byte in 0x40-0x7E.
 			buf = buf[:0]
-			for i := 0; i < 2; i++ {
+			esc := true
+			for i := 0; i < promptEscLimit; i++ {
 				nb, err := r.ReadByte()
 				if err != nil {
 					return ActionQuit, -1
 				}
 				buf = append(buf, nb)
+				if i == 0 && nb != '[' && nb != 'O' {
+					esc = false // not a sequence; the lone Escape press is all it was
+					break
+				}
+				if i >= 1 && nb >= 0x40 && nb <= 0x7e {
+					break
+				}
 			}
-			switch buf[1] {
+			if !esc {
+				continue // a bare Escape: dismiss nothing, there is no prompt here
+			}
+			switch buf[len(buf)-1] {
 			case 'A':
 				t.move(-1)
 			case 'B':
 				t.move(1)
+			case 'H':
+				t.cursor = 0
+				t.clampTop()
+			case 'F':
+				t.cursor = len(t.tracks) - 1
+				t.clampTop()
 			}
 			t.render()
 			continue

@@ -201,7 +201,7 @@ func (g *VizGrid) At(x, y int) byte {
 //
 // The inverse, mapping a luminance back to a ramp index, would lose the
 // distinction between two glyphs whose ink density is within one byte of each
-// other. Going forward only costs one division at paint time.
+// other. Going forward only costs a table lookup at paint time.
 func rampLum(idx int) byte {
 	if idx < 0 {
 		idx = 0
@@ -209,9 +209,19 @@ func rampLum(idx int) byte {
 	if idx >= len(ramp) {
 		idx = len(ramp) - 1
 	}
-	// ceil(idx*256/len): the first luminance whose floor maps back to idx.
-	return byte((idx*256 + len(ramp) - 1) / len(ramp))
+	return rampLumTab[idx]
 }
+
+// rampLumTab is rampLum for every possible ramp index. The mapping is a pure
+// division with only len(ramp) inputs, and rampLum is called once per cell per
+// frame, so the division is hoisted to init.
+var rampLumTab = func() [256]byte {
+	var t [256]byte
+	for i := range t {
+		t[i] = byte((i*256 + len(ramp) - 1) / len(ramp))
+	}
+	return t
+}()
 
 // MonoFrame expands the grid to the byte-per-cell layout DiffRenderer expects.
 //

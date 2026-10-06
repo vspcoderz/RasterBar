@@ -1,32 +1,32 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-// Synced ASCII playback: one ffmpeg process is the single clock for BOTH video
-// and audio.
+// Synced ASCII playback: ffmpeg owns the picture, mpv owns the sound.
 //
-// Why one process: mpv-audio + ffmpeg-video on separate clocks drift from the
-// first second and never recover. A single demux/decode emitting both streams
-// makes sync structural instead of something to correct for. Audio is written
-// to a FIFO that mpv reads; video arrives on our pipe.
+// Why two processes: one ffmpeg writing both a video pipe and an audio FIFO
+// deadlocks — it blocks on the second output while the first pipe waits for a
+// reader (verified: 0 bytes produced). And mpv-audio + ffmpeg-video on separate
+// clocks drift from the first second, so that drift is corrected rather than
+// designed out. See startVideoTap and checkSync.
+//
+// Each child opens its own copy of the stream, which is why googlevideo URLs are
+// effectively single-use and why one URL must never be handed to two consumers.
+// See resolveAudioPair.
 //
 // Why -re: without it ffmpeg decodes and pushes as fast as the CPU allows, so
 // the ASCII ran ahead of the music (reported as "playing fastforward"). -re
 // paces input at native frame rate, which is what makes wall-clock pacing in
 // Next() meaningful.
-//
-// Why we hold the FIFO open O_RDWR: ffmpeg blocks opening a FIFO for write
-// until a reader appears, and mpv sees EOF if the last writer closes. Holding
-// it ourselves keeps both ends alive for the life of the process.
 
 const (
 	videoFps   = 12
@@ -47,14 +47,18 @@ type SyncPlayer struct {
 	frame     []byte
 	primed    []byte // first frame, read before audio started
 	primedSet bool
-	frames    int
-	paused    bool
-	ipc       *mpvIPC
-	sockPath  string
-	cols      int
-	rows      int
-	fps       int
-	startAt   float64 // media offset this player was rebuilt at
+	// frames is written by the decoder goroutine in Next and read by the render
+	// loop in Seconds, so it is atomic. Passing the position along in videoFrame
+	// removed the *use* of a shared counter from the loop, not the counter
+	// itself, and checkSync still calls Seconds from another goroutine.
+	frames   atomic.Int64
+	paused   bool
+	ipc      *mpvIPC
+	sockPath string
+	cols     int
+	rows     int
+	fps      int
+	startAt  float64 // media offset this player was rebuilt at
 
 	musicOnly bool
 	clock     posClock
@@ -115,7 +119,7 @@ func startSyncPlayerAt(videoURL, audioURL string, cols, rows, fps int, mute bool
 // this program is going to throw away is the most expensive thing it could do on
 // a low-end machine. The visualizer gets its audio from a separate LevelTap over
 // a separately resolved URL -- one consumer per grant, since a googlevideo URL
-// is effectively single-use (see AGENT.MD).
+// is effectively single-use (see AGENTS.md).
 func startAudioOnly(audioURL string, mute bool, startAt float64) (*SyncPlayer, error) {
 	audio, ipc, sock, err := startMpv(audioURL, mute, startAt)
 	if err != nil {
@@ -346,7 +350,7 @@ func (s *SyncPlayer) Seconds() float64 {
 	if s.fps <= 0 {
 		return s.startAt
 	}
-	return s.startAt + float64(s.frames)/float64(s.fps)
+	return s.startAt + float64(s.frames.Load())/float64(s.fps)
 }
 
 // pollPosition refreshes the cached position from mpv.
@@ -449,7 +453,7 @@ func (s *SyncPlayer) Next() ([]byte, error) {
 	} else if _, err := io.ReadFull(s.vidOut, s.frame); err != nil {
 		return nil, err
 	}
-	s.frames++
+	s.frames.Add(1)
 	return s.frame, nil
 }
 
@@ -516,17 +520,3 @@ func (s *SyncPlayer) Close() {
 		os.Remove(s.sockPath)
 	}
 }
-
-// makeFifo creates a unique FIFO in $TMPDIR. Uses syscall.Mknod's fifo mode so
-// there is no dependency on mkfifo(1) or a temp-file library.
-func makeFifo() (string, error) {
-	dir := os.TempDir()
-	name := fmt.Sprintf("%s/rasterbar-%d-%d.audio", dir, os.Getpid(), time.Now().UnixNano())
-	if err := syscall.Mkfifo(name, 0o600); err != nil {
-		return "", fmt.Errorf("mkfifo: %w", err)
-	}
-	return name, nil
-}
-
-// ensure bufio stays referenced for future stream helpers
-var _ = bufio.NewReader

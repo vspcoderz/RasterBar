@@ -293,13 +293,17 @@ func pow(base, exp float64) float64 { return math.Pow(base, exp) }
 // Analyze consumes mono float samples in [-1,1] and returns band magnitudes
 // smoothed over time. Fewer than fftSize samples zero-pads.
 func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
-	for i := range s.re {
-		s.re[i] = 0
-		s.im[i] = 0
-	}
 	n := len(samples)
 	if n > fftSize {
 		n = fftSize
+	}
+	// Only the tail of re needs clearing: [0:n) is fully overwritten below, and im
+	// is never written by the sample loop, so it is cleared in full.
+	for i := n; i < len(s.re); i++ {
+		s.re[i] = 0
+	}
+	for i := range s.im {
+		s.im[i] = 0
 	}
 	s.measureLevel(samples[:n])
 	for i := 0; i < n; i++ {
@@ -314,8 +318,10 @@ func (s *SpectrumAnalyzer) Analyze(samples []float64) []float64 {
 		}
 		var sum float64
 		for k := lo; k < hi && k < fftSize/2; k++ {
-			mag := math.Sqrt(s.re[k]*s.re[k] + s.im[k]*s.im[k])
-			sum += mag * mag
+			// re^2 + im^2, summed directly. Taking the Sqrt per bin and
+			// immediately squaring it back was several hundred wasted Sqrts per
+			// window; the only Sqrt needed is the RMS below.
+			sum += s.re[k]*s.re[k] + s.im[k]*s.im[k]
 		}
 		rms := math.Sqrt(sum / float64(hi-lo))
 		db := 20 * math.Log10(rms+1e-12)

@@ -16,6 +16,7 @@ type waterfallViz struct {
 	row        []float64 // the row about to be written
 	hist       []float64 // rows*cols scroll history, owned here; see Paint
 	dirty      bool      // a row has been captured since the last Paint
+	bandX      []float64 // bandPos(x, n) per column, constant down a row
 }
 
 func (w *waterfallViz) Name() string { return "waterfall" }
@@ -26,7 +27,22 @@ func (w *waterfallViz) CapScale(int, int) float64 {
 
 func (w *waterfallViz) Resize(cols, rows int) {
 	w.cols, w.rows = cols, rows
-	w.n = bandCountFor(cols)
+	// One band per column, NOT bandCountFor(cols).
+	//
+	// maxDrawnBands exists because the bar styles read a chart, and a chart with
+	// 48 bars spread over 200 columns looks broken. A waterfall is not that: it
+	// is an image of frequency against time, and it is supposed to cover the
+	// grid. Capping it left the right-hand columns of every history row at their
+	// zero initial value forever, so on a 200-column terminal the spectrogram
+	// occupied the left 128 cells and the rest was empty.
+	//
+	// Growing 48 bands to 200 columns repeats the nearest band rather than
+	// interpolating, which is the rule resampleBands already documents: an
+	// interpolated spectrum invents a peak that was never in the audio.
+	w.n = cols
+	if w.n < 2 {
+		w.n = 2
+	}
 	w.viz.Resize(w.n)
 	if len(w.row) != w.n {
 		w.row = make([]float64, w.n)
@@ -37,6 +53,10 @@ func (w *waterfallViz) Resize(cols, rows int) {
 	// has no correct mapping onto a new one, and pretending otherwise puts rows of
 	// the wrong song in the wrong place.
 	w.hist = make([]float64, cols*rows)
+	w.bandX = make([]float64, cols)
+	for x := range w.bandX {
+		w.bandX[x] = bandPos(x, w.n)
+	}
 }
 
 func (w *waterfallViz) Reset() {
@@ -110,7 +130,7 @@ func (w *waterfallViz) blit(g *VizGrid) {
 		val0 := age * 0.85
 		for x := 0; x < w.cols; x++ {
 			v := clamp01(w.hist[y*w.cols+x]) * val0
-			g.Set(x, y, rampFor(v), g.Color(bandPos(x, w.n), v, 0))
+			g.Set(x, y, rampFor(v), g.Color(w.bandX[x], v, 0))
 		}
 	}
 }

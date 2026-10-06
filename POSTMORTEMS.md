@@ -6,11 +6,149 @@ phase, as it did in the plans these were lifted from.
 The plans themselves — goals, phases, file lists, verification checklists — are
 gone. They were working documents, they had drifted, and `git log` keeps them
 permanently anyway. What was *not* reproducible from the code or from
-`AGENT.MD` is here: the measurement behind each decision, and the wrong turns
+`AGENTS.md` is here: the measurement behind each decision, and the wrong turns
 that led to the right one.
 
-The rules that came out of these live in `AGENT.MD`. Do not add a rule here —
+The rules that came out of these live in `AGENTS.md`. Do not add a rule here —
 add it there, and cross-reference.
+
+---
+
+## Audit pass — a subagent read the whole thing
+
+No feature work. Three agents audited the render path, the analysis path, and
+general correctness; every finding below was then re-verified by reading the code
+before anything was changed. The two races are the interesting part, because
+`go test -race` passes on this repo and never would have caught either.
+
+### Silent, visible-to-everyone
+
+1. **Four palettes threw away red.** `spectrumHue`, `heightHue`, `oceanHue` and
+   `emberHue` all ended `_, g, b := hsvToRGB(hue, s, v); return rgb(1, g, b)`.
+   Past the red-to-yellow arc, HSV's red is the low `p` component, so pinning it
+   to 1 sent every one of those hues to full red. `ocean`, documented as "narrow
+   cyan to blue", rendered pink. `viridisHue` did it correctly in the same file,
+   which is what proves it was a slip and not a choice. Caught by asserting that
+   blue dominates red for a palette that claims to be a blue.
+
+2. **`--no-probe` probed everything.** `libraryTrack` ran `probeDuration` per file
+   *inside the walk*, so the flag skipped nothing — and paid serially, which is
+   worse than the bounded concurrent `probeDurations` it was meant to replace.
+   The flag had never done what `--help` says it does.
+
+### Two races `-race` cannot see
+
+3. **`SyncPlayer.frames`.** Written by the decoder goroutine in `Next`, read by
+   `Seconds` from the render loop every 2s via `checkSync`. Passing the position
+   in `videoFrame` removed the loop's *use* of the counter, not the counter, and
+   the comment claiming otherwise was the reason nobody looked. Now
+   `atomic.Int64`.
+
+4. **`LevelTap.bands` / `waveBuf`.** The pump writes under a mutex ~11 times a
+   second; `Bands`, `Wave` and `Frame` returned the slice *header* under the same
+   lock and let the caller read the contents afterwards. The lock protected the
+   assignment and nothing else. A half-updated spectrum reads as a glitch in the
+   bars and nothing else would catch it. Now copied on hand-out.
+
+   Both are invisible to `-race` because every test runs against `fakeMedia` and
+   never spawns a child. That is the general lesson: a green race detector here
+   means "no test reaches the code", not "no races".
+
+### The strip had never worked
+
+5. **The video-mode spectrum strip was dead.** `startTap` ran only under
+   `if s.music`, so `sess.tap` was permanently nil in video mode and `paintHUD`
+   fell to `miniBars(nil, ...)` forever — the row was reserved and never drawn.
+   `resolveMedia` never set `tapURL` either, so there was no URL to use. It needed
+   its own third grant, because `audioURL` belongs to mpv and one URL has one
+   consumer, so it is resolved lazily on `s` rather than paying a `yt-dlp -J` on
+   every video track. A video-mode tap failure is deliberately not fatal: the
+   picture is already playing and the strip is one row of chrome.
+
+6. **Music-mode `s` left the layout wrong.** The chrome height changed and
+   nothing was resized, so the HUD drew its extra row over a grid cell.
+
+7. **`stripViz` was never resized on SIGWINCH.** Sized once per track, so after a
+   drag it resampled the new column count out of a buffer that was too short and
+   rendered letterboxed for the rest of the session.
+
+### Keys and layout
+
+8. **A split `ESC [` cancelled the jump prompt.** A read boundary can land inside
+   an escape sequence; the "is this a complete arrow" test needed three bytes, so
+   a two-byte prefix fell through to the bare-Escape branch. Reaching for an arrow
+   in the field lost what you had typed, on a slow terminal or at a buffer edge.
+   Incomplete sequences are now held.
+
+9. **Application-mode arrows did nothing.** xterm's application cursor mode sends
+   `ESC O A`, not `ESC [ A`, and nothing here changes the mode — so a terminal
+   *started* in it sent SS3 for the whole session. The ESC was dropped and `A`/`B`
+   read as ordinary letters.
+
+10. **TUI home/end were dead.** `ESC [ H` and `ESC [ F` reached a switch keyed on
+    the introducer, which is always `[`. Reading to the sequence's final byte
+    fixed it, and made a bare Escape a no-op instead of a stray sequence read.
+
+11. **`--cols`/`--rows` were lost on the first resize.** The recompute used the
+    terminal size, so one drag of the window edge snapped a deliberately fixed
+    grid back to whatever the terminal happened to be.
+
+12. **The glyph probe raced the key reader.** It reads the Device Status Report
+    straight off the same tty `readKeys` was already pumping. Whichever won, the
+    loser cost something: a 700ms stall and a silent downgrade to one pixel per
+    cell, or a keystroke eaten during startup. The probe now runs before the
+    reader exists.
+
+13. **The waterfall left the right-hand columns blank.** `bandCountFor` caps at
+    `maxDrawnBands`, which is right for a chart and wrong for a spectrogram: past
+    128 columns only the first 128 cells of every history row were ever written.
+    It now uses one band per column, and growing 48 bands repeats the nearest
+    rather than interpolating — an invented peak is a lie about the music.
+
+### Process lifecycle
+
+14. **mpv leaked when the tap failed.** `start` returned with mpv running, and
+    `newTrackSession` returning an error means `playTrack` never gets a session to
+    `Close`. The child played on with no owner and no waiter.
+
+15. **`LevelTap` never reaped its ffmpeg.** Killed but never waited, so one zombie
+    per seek, resize and track advance for the life of the process. Now reaped
+    under the same bound as `SyncPlayer.Close`.
+
+### The performance half
+
+16. **`fmt` in the per-cell path.** `emitColor` ran `fmt.Sprintf` once per changed
+    cell: 11400 allocations and 492KB per full repaint, ~9.4ms a frame at 200x57.
+    Both renderers now keep a `[]byte` scratch and use `strconv.AppendInt`. Same
+    for the per-run `Fprintf` cursor moves in the mono path.
+
+17. **SGR dedup was defeated every row.** The skip test keyed off `haveLast`, which
+    is cursor-contiguity state and is cleared at the end of each row — so the first
+    changed cell of every row re-emitted a sequence that was still active. Cursor
+    state and SGR state are now separate fields. This one produced no wrong
+    output, which is why nothing would ever have caught it.
+
+18. **Work repeated per cell that was per row, column or spoke.** The gradient
+    along a bar and a mirror shape is a function of the row; the band position in a
+    waterfall is a function of the column; the colour along a radial spoke is
+    constant. Radial paint went 448us -> 58us on its own.
+
+19. **`viz.Push` ran at the render rate, not the analysis rate.** The render tick is
+    up to 30Hz and the FFT is ~11Hz, so the waterfall scrolled and particles aged
+    **~3x faster than the music** — while a comment in the same function stated the
+    opposite, describing the behaviour the code was supposed to have. Gated on a
+    generation counter via `TryFrame`.
+
+20. **Allocation churn per frame.** `decode` allocated a frame buffer per frame;
+    `onsetDetector.baseline` and `tempoOf` allocated twice per analysis;
+    `rampLum` divided once per cell per frame. Now a `sync.Pool` and lookup
+    tables: onset push 1694ns -> 246ns, mono draw 57 allocs -> 0.
+
+21. **And a regression caught by the benchmark itself.** The first mono-Draw
+    rewrite discarded an `append` result, so every row reallocated: 1374 B/op ->
+    11856 B/op while `ns/op` *improved* 3.4x. The allocation count is what exposed
+    it. A faster-looking benchmark that allocates 8x more is a bug wearing a
+    benchmark as a disguise.
 
 ---
 
@@ -30,7 +168,7 @@ The fix is in the decoder, not the table: scan to the CSI final byte (the first 
 one cannot wedge it. Pinned by `TestDigitsDoNotLeakFromUnknownSequences` and
 `TestCsiSequenceIsConsumedWhole`.
 
-This is the same lesson as bug 19 in `PLAN-phase7.md` and it is now in `AGENT.MD`:
+This is the same lesson as bug 19 in `PLAN-phase7.md` and it is now in `AGENTS.md`:
 the decoder's guarantee that an unhandled sequence cannot be mistaken for a command
 
 ---

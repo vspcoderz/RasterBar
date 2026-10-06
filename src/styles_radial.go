@@ -83,12 +83,16 @@ func (r *radialViz) Paint(g *VizGrid) {
 		rad := lv * maxR
 		val := lv
 		band := bandPos(i, r.n)
+		// Along a spoke the ramp index and the palette colour are constant, so
+		// they are resolved once here instead of once per step.
+		rampIdx := rampFor(val)
+		packed := g.Color(band, val, 0)
 		steps := int(rad)
 		if steps < 1 {
 			steps = 1
 		}
 		for d := 0; d <= steps; d++ {
-			g.Set(int(cx+dx*float64(d)), int(cy+dy*float64(d)), rampFor(val), g.Color(band, val, 0))
+			g.Set(int(cx+dx*float64(d)), int(cy+dy*float64(d)), rampIdx, packed)
 		}
 	}
 }

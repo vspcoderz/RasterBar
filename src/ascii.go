@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -157,42 +156,8 @@ func fpsForGrid(cols, rows int) int {
 	}
 }
 
-// sourceHForGrid reports the resolution a grid can actually resolve, for
-// callers that want the automatic value.
-func sourceHForGrid(cols int) int {
-	pixels := float64(cols) * 4.0
-	switch {
-	case pixels < 240:
-		return 240
-	case pixels < 360:
-		return 360
-	case pixels < 480:
-		return 480
-	case pixels < 720:
-		return 720
-	default:
-		return 1080
-	}
-}
-
 // Quality lets the user cap or raise source resolution.
 type Quality int
-
-// playAudio resolves a direct audio URL via yt-dlp and streams it to mpv.
-// The resolve step is mandatory: mpv/ffmpeg cannot open youtube.com URLs
-// themselves (verified: ffmpeg returns "Invalid data found when processing
-// input").
-func playAudio(track Track) error {
-	url, err := resolveURL(track, "140/251/bestaudio")
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command("mpv", "--no-config", "--no-video", url)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
 
 // resolveURL asks yt-dlp for direct media URLs.
 func resolveURL(track Track, format string) (string, error) {
@@ -252,7 +217,7 @@ func resolveAudioURL(track Track) (string, error) {
 // codec metadata, so the progress bar costs no extra request. Getting it any
 // other way would mean ffprobe against a resolved URL, and probing a
 // googlevideo URL burns its grant (see below).
-func resolveMedia(track Track, sourceH int) (mediaPair, error) {
+func resolveMedia(track Track, sourceH int, wantTap bool) (mediaPair, error) {
 	h := sourceH
 	if h <= 0 {
 		h = 360
@@ -267,6 +232,10 @@ func resolveMedia(track Track, sourceH int) (mediaPair, error) {
 		return mediaPair{
 			videoURL: track.LocalPath,
 			audioURL: track.LocalPath,
+			// The strip's tap reads the same path. A filesystem path is not a
+			// signed grant, so it can be opened as many times as there are
+			// readers; no second probe and no second URL are needed.
+			tapURL:   track.LocalPath,
 			dur:      float64(dur),
 			chapters: chaps,
 			silent:   !hasAudio,
@@ -289,12 +258,30 @@ func resolveMedia(track Track, sourceH int) (mediaPair, error) {
 	if err != nil {
 		return mediaPair{}, err
 	}
-	return mediaPair{
+	pair := mediaPair{
 		videoURL: videoURL,
 		audioURL: audioURL,
 		dur:      info.Duration,
 		chapters: chaptersFrom(info.Chapters),
-	}, nil
+	}
+	if wantTap {
+		// A third grant, minted by its own `yt-dlp -J`.
+		//
+		// The strip under a video needs its own audio, and audioURL already
+		// belongs to mpv. Reusing it is precisely the single-use bug above: one
+		// consumer would open the URL and the other would get 403, intermittently,
+		// because the grant is a cache and scheduling decides who wins.
+		//
+		// Only paid when the strip is actually wanted. It is a whole extra yt-dlp
+		// round trip, and the strip is off by default in video mode because it
+		// costs a row of picture.
+		tapURL, _, _, err := audioURLOnce(track)
+		if err != nil {
+			return mediaPair{}, err
+		}
+		pair.tapURL = tapURL
+	}
+	return pair, nil
 }
 
 // resolveAudioPair resolves music mode's streams into a mediaPair with no video.
@@ -550,81 +537,6 @@ func lastURL(out string) string {
 		}
 	}
 	return last
-}
-
-// ASCIIStream decodes frames from ffmpeg and renders them as characters.
-type ASCIIStream struct {
-	cmd    *exec.Cmd
-	stdout io.ReadCloser
-	raw    []byte
-	cols   int
-	rows   int
-	buf    *bufio.Writer
-	out    io.Writer
-}
-
-func NewASCIIStream(mediaURL string, cols, rows, fps int, out io.Writer) (*ASCIIStream, error) {
-	if fps <= 0 {
-		fps = 10
-	}
-	// Sample at 2x the character grid because cells are ~2x tall as wide,
-	// then pick every other pixel in Go. scale does the heavy lifting in C.
-	filter := fmt.Sprintf("fps=%d,scale=%d:%d:flags=fast_bilinear,format=gray", fps, cols*2, rows*2)
-	cmd := exec.Command("ffmpeg",
-		"-hide_banner", "-loglevel", "error", "-nostdin",
-		"-i", mediaURL,
-		"-vf", filter,
-		"-pix_fmt", "gray",
-		"-f", "rawvideo", "-",
-	)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("ffmpeg start: %w", err)
-	}
-	return &ASCIIStream{
-		cmd:    cmd,
-		stdout: stdout,
-		raw:    make([]byte, cols*2*rows*2),
-		cols:   cols,
-		rows:   rows,
-		buf:    bufio.NewWriterSize(out, 64*1024),
-		out:    out,
-	}, nil
-}
-
-// Next renders the next frame. Reuses its buffers: no per-frame allocation,
-// which keeps the GC idle during playback.
-func (s *ASCIIStream) Next() (string, error) {
-	if _, err := io.ReadFull(s.stdout, s.raw); err != nil {
-		return "", err
-	}
-	var sb strings.Builder
-	sb.Grow(s.cols * (s.rows + 1))
-	for y := 0; y < s.rows*2; y += 2 {
-		row := y * s.cols * 2
-		for x := 0; x < s.cols*2; x += 2 {
-			idx := int(s.raw[row+x]) * len(ramp) / 256
-			if idx >= len(ramp) {
-				idx = len(ramp) - 1
-			}
-			sb.WriteByte(ramp[idx])
-		}
-		sb.WriteByte('\n')
-	}
-	return sb.String(), nil
-}
-
-func (s *ASCIIStream) Close() {
-	if s.stdout != nil {
-		s.stdout.Close()
-	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill()
-		s.cmd.Wait()
-	}
 }
 
 // newRenderer picks the mono or colour renderer. Both satisfy FrameRenderer, so
