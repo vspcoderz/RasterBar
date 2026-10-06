@@ -124,9 +124,30 @@ test or an explicit comment.
   URL (its own `yt-dlp -J`) when the strip is on, because `audioURL` belongs to
   mpv and one URL has one consumer. It is resolved lazily on `s` rather than on
   every video track, since it is a whole extra round trip.
-- **A video-mode tap failure is not fatal; a music-mode one is.** The picture is
-  already playing and the strip is one row of chrome; in music mode the spectrum
-  *is* the content.
+- **The split view composites in Go; there is deliberately ONE renderer.** Two
+  renderers would break the colour renderer's SGR elision, which assumes nothing
+  else changed the terminal's colour state since its last cell — pane B repainting
+  in between makes that false, and it produces wrong *colours* with no error.
+  `composeSplitFrame` lays both panes into one frame and the existing whole-screen
+  diff cache covers it, which is also why the no-stale-cells suite covers the split
+  for free. See `splitleak_test.go`.
+- **`videoTapGeometry` is the single source of pane layout.** The live pane and the
+  thumbnail must agree byte-for-byte; two copies of the filter is how they drift and
+  the compositor starts reading noise. `TestVideoTapGeometryMatchesPaneFrames` pins
+  it.
+- **Half-block doubling is colour-only.** `perCellFor` returns 1 in mono regardless
+  of glyph mode. Getting that wrong made `paneFrameBytes` expect twice the bytes
+  ffmpeg sends — noise on screen, not an error.
+- **Split state lives in `splitState`, not in the render loop's locals.** As locals
+  it was unreachable from a test, and the first version shipped with `divider` at 0,
+  where `+1` and `-1` both clamp to the same floor and `{`/`}` silently did nothing.
+  If you add split state, put it in the type so a test can reach it.
+- **The pane's pixel width is ffmpeg's scale target.** Any change to it — resize,
+  divider, side — is a restart, exactly like SIGWINCH restarting the video decoder.
+  Resizing the buffer alone leaves ffmpeg sending frames of the old size.
+- **The pane's URL is resolved lazily on the first `W`** and reused. Music mode
+  already spends two `yt-dlp -J` calls; a third on every track would slow down the
+  common path for a feature that is off by default.
 - **Frame buffers are owned by exactly one goroutine at a time:** decoder fills →
   channel → render loop `Draw`s → `frameBufs.Put`. Neither renderer retains the
   slice (both copy into their caches), so returning it after `Draw` is safe. Any
@@ -182,6 +203,7 @@ render.go    mono diff renderer + overlay          color.go  colour renderer, gl
 flow.go      covered-terminal stall handling      fft.go    FFT, log-spaced bands
 visual.go    LevelTap + display smoother          viz.go    VizGrid, style registry, prefs
 styles_*.go  the six visualisers                  palette.go HSV -> RGB, ten schemes
+split.go     the split view: two panes, one composed frame, splitState
 beat.go      spectral flux, onsets, tempo         doc.go    package docs
 internal/term  termios, TIOCGWINSZ, pty — the one extracted package
 ```

@@ -62,6 +62,19 @@ const (
 	CmdVizNext
 	CmdVizPrev
 	CmdPalette
+	// Split-view keys. All of them are split-view-only and none of them are
+	// transport: the transport is the thing that must keep working while someone
+	// is fiddling with the picture, so `v` (viz cycle) and the arrows (seek) were
+	// left alone and the split got unbound letters instead.
+	//
+	// W toggles the video pane, a/d put it on the left or the right, T switches
+	// between the still thumbnail and live video, and {/} move the divider.
+	CmdSplitToggle
+	CmdPaneLeft
+	CmdPaneRight
+	CmdThumbToggle
+	CmdDividerLeft
+	CmdDividerRight
 	// CmdStrip toggles the spectrum row under the video.
 	//
 	// The only key that changes the layout, and therefore the only one that has to
@@ -646,6 +659,18 @@ func cmdForByte(c byte) Cmd {
 		return CmdPalette
 	case 's':
 		return CmdStrip
+	case 'W':
+		return CmdSplitToggle
+	case 'a':
+		return CmdPaneLeft
+	case 'd':
+		return CmdPaneRight
+	case 'T':
+		return CmdThumbToggle
+	case '{':
+		return CmdDividerLeft
+	case '}':
+		return CmdDividerRight
 	default:
 		// Digits are checked last and only if nothing above claimed the byte.
 		// They were free here: the browse list's 1-9 is a different router

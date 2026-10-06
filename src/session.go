@@ -48,6 +48,9 @@ type mediaPair struct {
 	videoURL string // empty in music mode: there is no video to decode
 	audioURL string // mpv
 	tapURL   string // the level tap's ffmpeg: music mode, and video mode with the strip on
+	// thumbURL is the still image for the split view's thumbnail mode. Free: it
+	// rides along in a `yt-dlp -J` response already being made.
+	thumbURL string
 	dur      float64
 	// chapters comes from the same response as the URLs and the duration, so
 	// chapter navigation costs no extra request on either path.
@@ -125,6 +128,20 @@ type trackSession struct {
 	// killing the track because one optional row would not draw is the wrong
 	// trade. Music mode is the opposite — see startTap.
 	wantTap bool
+
+	// The split view: a video pane beside the visualiser in music mode. Off until
+	// someone asks for it, because it costs a second ffmpeg and half the cells.
+	//
+	// Only the lifetime lives here. The geometry belongs to the render loop, which
+	// is the only place that knows what the grid currently is; duplicating it on
+	// the session is how the strip and the grid ended up disagreeing about height.
+	split bool
+	thumb bool // still thumbnail rather than live video
+	pane  *videoPane
+	// paneURL is the pane's own video URL, minted by its own yt-dlp call on the
+	// first press of W and then reused for the life of the track. A googlevideo URL
+	// is single-use, so this is never shared with mpv or the tap.
+	paneURL string
 }
 
 // newTrackSession resolves a track's streams once and starts playback at pos.
@@ -388,10 +405,64 @@ func (s *trackSession) stopDecoder() {
 		s.tap.Close()
 		s.tap = nil
 	}
+	if s.pane != nil {
+		s.pane.Close()
+		s.pane = nil
+	}
 	if s.cur != nil {
 		s.cur.Close()
 		s.cur = nil
 	}
+}
+
+// startPane opens the split view's video pane at a media offset.
+//
+// Per generation, exactly like the decoder and the tap: after a seek the pane has
+// to be rebuilt from the new offset or it keeps showing the part you left. That is
+// why this is called from start rather than once per track.
+//
+// The URL is resolved lazily and remembered, so the second and later rebuilds cost
+// nothing. Failing here is reported but never fatal for the same reason a
+// video-mode strip failure is: the visualiser is already running and the pane is
+// an extra.
+func (s *trackSession) startPane(sl splitLayout, at float64) error {
+	if !s.split {
+		return nil
+	}
+	cols, rows := sl.video.cols, sl.video.rows
+	if cols <= 0 || rows <= 0 {
+		return nil
+	}
+	p := newVideoPane(cols, rows, s.mode, s.glyph)
+
+	if s.thumb {
+		// The still needs no video stream at all, which is why `T` works even
+		// when the video URL could not be resolved.
+		if s.pair.thumbURL == "" {
+			return fmt.Errorf("no thumbnail for this track")
+		}
+		frame, err := startThumbnail(s.pair.thumbURL, cols, rows, s.mode, s.glyph)
+		if err != nil {
+			return err
+		}
+		p.Set(frame)
+		s.pane = p
+		return nil
+	}
+
+	if s.paneURL == "" {
+		url, err := resolvePaneVideoURL(s.track, s.l.sourceH)
+		if err != nil {
+			return fmt.Errorf("split pane: %w", err)
+		}
+		s.paneURL = url
+	}
+	fps := fpsForGrid(cols, rows)
+	if err := p.startLive(s.paneURL, fps, at, s.mode, s.glyph); err != nil {
+		return fmt.Errorf("split pane: %w", err)
+	}
+	s.pane = p
+	return nil
 }
 
 // --- media interface --------------------------------------------------------
@@ -489,6 +560,7 @@ func (s *trackSession) Resize(l layout, at float64) {
 
 func (s *trackSession) Close() error {
 	s.stopDecoder()
+	s.paneURL = ""
 	return nil
 }
 
@@ -624,11 +696,83 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		viz  Viz
 		grid *VizGrid
 	)
+
+	// Split-view state. sp owns what the user asked for; this closure owns the
+	// geometry, because only the loop knows what the grid currently is.
+	var (
+		sp           splitState
+		sl           splitLayout
+		composite    []byte
+		paneFallback []byte
+	)
+	sp.initDivider(l.cols)
 	if o.music {
 		viz = prefs.makeViz()
-		viz.Resize(l.cols, l.rows)
-		grid = NewVizGrid(l.cols, l.rows, o.mode != ColorNone, vizPixPerCell(glyph))
+	}
+
+	// vizPane is the visualiser's cell rectangle: the whole grid with the split
+	// off, and one side of it with the split on.
+	vizPane := func() paneRect { return sp.vizRect(l.cols, l.rows) }
+
+	// rebuildViz recomputes the split geometry and resizes everything that
+	// depends on it. One closure rather than four copies of the same three
+	// statements, because the alternative is what already went wrong once: the
+	// resize path resized the grid and forgot the strip, and the strip path
+	// resized the chrome and forgot the grid.
+	rebuildViz := func() {
+		sl = computeSplitLayout(l.cols, l.rows, sp.divider, sp.videoLeft)
+		vz := vizPane()
+		if viz == nil {
+			viz = prefs.makeViz()
+		}
+		viz.Resize(vz.cols, vz.rows)
+		grid = NewVizGrid(vz.cols, vz.rows, o.mode != ColorNone, perCellFor(o.mode, glyph))
 		grid.SetPalette(paletteAt(prefs.palette))
+		if sp.on {
+			composite = make([]byte, frameBytesFor(l.cols, l.rows, o.mode, glyph))
+			paneFallback = fillPaneBackground(paneFallback,
+				sl.video.cols, sl.video.rows, o.mode, glyph, paletteAt(prefs.palette))
+		} else {
+			composite = nil
+			paneFallback = nil
+		}
+	}
+	rebuildViz()
+
+	// drawSplit composes both panes into one frame and hands it to the single
+	// renderer.
+	//
+	// One renderer rather than one per pane, deliberately. The colour renderer
+	// elides an SGR when a cell's colour matches the last one it drew, and that
+	// assumption is "nothing else changed the terminal's colour state since my
+	// last cell" -- which the other pane breaks constantly. Pane A decides it can
+	// skip an SGR, pane B repaints in between, and A's next frame inherits B's
+	// colours. Compositing first keeps one diff cache over the whole screen, which
+	// is also what lets the no-stale-cells suite cover this for free.
+	drawSplit := func() error {
+		var vizFrame []byte
+		if o.mode == ColorNone {
+			vizFrame = grid.MonoFrame()
+		} else {
+			vizFrame = grid.ColorFrame()
+		}
+		// The pane's own frame, or the background-filled placeholder while it has
+		// not produced one yet. Never nil: composeSplitFrame refuses a short
+		// buffer rather than trusting the caller's arithmetic.
+		vidFrame := paneFallback
+		if sess.pane != nil {
+			if latest := sess.pane.Latest(); len(latest) > 0 {
+				vidFrame = latest
+			}
+		}
+		if !composeSplitFrame(composite, sl, l.cols, l.rows, o.mode, glyph, vizFrame, vidFrame) {
+			// A pane was resized without being rebuilt. Refuse rather than copy
+			// past the end of a buffer: this runs inside a painter, where a panic
+			// takes the whole player down with it.
+			return fmt.Errorf("split: pane %dx%d does not fit grid %dx%d",
+				sl.video.cols, sl.video.rows, l.cols, l.rows)
+		}
+		return renderer.Draw(composite)
 	}
 
 	// paintMusic draws one spectrum frame. Split out so the render loop's select
@@ -654,9 +798,48 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		grid.Clear()
 		viz.Paint(grid)
 		if o.mode == ColorNone {
-			return renderer.Draw(grid.MonoFrame())
+			if !sp.on {
+				return renderer.Draw(grid.MonoFrame())
+			}
+			return drawSplit()
 		}
-		return renderer.Draw(grid.ColorFrame())
+		if !sp.on {
+			return renderer.Draw(grid.ColorFrame())
+		}
+		return drawSplit()
+	}
+
+	// applySplit rebuilds the geometry and restarts the pane, returning a status
+	// line or "".
+	//
+	// It returns rather than calling reportLine because reportLine is declared
+	// after this point in playTrack, and reaching forward for it is how a closure
+	// ends up capturing a variable that is not what it looks like.
+	//
+	// Restarting rather than resizing is not optional: the pane's pixel width is
+	// ffmpeg's scale target, so a new width is a new decode, exactly as a
+	// SIGWINCH rebuilds the video decoder. Resizing the buffer alone would leave
+	// ffmpeg sending frames of the old size and the compositor would refuse them.
+	applySplit := func() string {
+		rebuildViz()
+		sess.split = sp.on
+		sess.thumb = sp.thumb
+		if sess.pane != nil {
+			sess.pane.Close()
+			sess.pane = nil
+		}
+		if sp.on {
+			if err := sess.startPane(sl, sess.Position()); err != nil {
+				// Back out rather than leave an empty rectangle on screen: a
+				// half-drawn split reads as a broken renderer, not as a failure to
+				// fetch a picture.
+				sp.on = false
+				sess.split = false
+				rebuildViz()
+				return "video pane: " + err.Error()
+			}
+		}
+		return ""
 	}
 
 	// lastKey drives the hint fade: the row shows itself on every keypress and
@@ -857,6 +1040,40 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		case CmdTogglePause:
 			userPaused = !userPaused
 			pl.Do(cmd)
+		case CmdSplitToggle, CmdPaneLeft, CmdPaneRight, CmdThumbToggle, CmdDividerLeft, CmdDividerRight:
+			// Split view. Every one of these changes the grid's geometry or the
+			// pane behind it, so they all go through applySplit, which rebuilds
+			// and restarts -- the pane's pixel width is ffmpeg's scale target, so
+			// there is no cheaper version of this.
+			//
+			// a/d set a side rather than toggling. Idempotent is worth more here
+			// than a single keypress, because the natural mistake is pressing the
+			// same one twice and finding the pane on the other side.
+			switch cmd {
+			case CmdSplitToggle:
+				sp.toggle()
+			case CmdPaneLeft:
+				sp.setSide(true)
+			case CmdPaneRight:
+				sp.setSide(false)
+			case CmdThumbToggle:
+				sp.toggleThumb()
+			case CmdDividerLeft:
+				sp.nudge(l.cols, -1)
+			case CmdDividerRight:
+				sp.nudge(l.cols, +1)
+			}
+			if !o.music {
+				reportLine("split view needs music mode (-M)")
+				return OutcomePlaying
+			}
+			if msg := applySplit(); msg != "" {
+				reportLine(msg)
+			}
+			renderer.ForceNext()
+			hudText = ""
+			paintHUD(true)
+			return OutcomePlaying
 		case CmdStrip:
 			strip = !strip
 			// Recompute the layout and rebuild. In video mode this is mandatory
@@ -892,11 +1109,18 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				// Music mode has no decoder to rebuild, but it still holds a grid,
 				// a style and a renderer sized to the old row count. Toggling the
 				// strip changed the chrome height without any of them being told,
-				// so the HUD drew its extra row over a grid cell. The resize below
-				// is the same recompute SIGWINCH does, minus the process churn.
-				viz.Resize(l.cols, l.rows)
-				grid = NewVizGrid(l.cols, l.rows, o.mode != ColorNone, vizPixPerCell(glyph))
-				grid.SetPalette(paletteAt(prefs.palette))
+				// so the HUD drew its extra row over a grid cell. rebuildViz is the
+				// same recompute SIGWINCH does, minus the process churn.
+				//
+				// The pane restarts with it when the split is on, because its pixel
+				// width is ffmpeg's scale target and the grid just changed shape.
+				if sp.on {
+					if msg := applySplit(); msg != "" {
+						reportLine(msg)
+					}
+				} else {
+					rebuildViz()
+				}
 				renderer.ForceNext()
 				hudText = ""
 			}
@@ -951,7 +1175,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			// same trap the stall-recovery path documents, and a style switch is
 			// another way to reach it.
 			viz = prefs.makeViz()
-			viz.Resize(l.cols, l.rows)
+			viz.Resize(vizPane().cols, vizPane().rows)
 			viz.Reset()
 			renderer.ForceNext()
 			hudText = ""
@@ -1029,6 +1253,16 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				// Keeping it would draw a waterfall of the part you just left.
 				viz.Reset()
 				grid.Clear()
+				// The split pane is per generation like everything else here. It has
+				// to be restarted at the new offset or it keeps showing the part of
+				// the track that was just seeked away from, and it needs a new URL
+				// because a googlevideo grant is single-use.
+				if sp.on {
+					sess.pane = nil // stopDecoder already closed it
+					if err := sess.startPane(sl, pos); err != nil && debugQueue {
+						fmt.Fprintf(os.Stderr, "queue: split pane after seek: %v\n", err)
+					}
+				}
 			}
 			if userPaused {
 				_ = sess.SetPaused(true)
@@ -1088,9 +1322,17 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				// from before the resize paints out of bounds or leaves a band of
 				// stale cells, and neither shows up in a unit test that never
 				// resizes.
-				viz.Resize(l.cols, l.rows)
-				grid = NewVizGrid(l.cols, l.rows, o.mode != ColorNone, vizPixPerCell(glyph))
-				grid.SetPalette(paletteAt(prefs.palette))
+				//
+				// rebuildViz, not the three statements inline, because with the
+				// split on the grid is one pane of the new shape and not the whole
+				// of it -- and the pane itself is a new ffmpeg scale target.
+				if sp.on {
+					if msg := applySplit(); msg != "" && debugQueue {
+						fmt.Fprintf(os.Stderr, "queue: %s\n", msg)
+					}
+				} else {
+					rebuildViz()
+				}
 				renderer.ForceNext()
 			}
 

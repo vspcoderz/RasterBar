@@ -78,6 +78,11 @@ keys (playback, both modes):
                    4 ember, 5 graphite, 6 ink, 7 ice, 8 magma, 9 viridis,
                    0 mono
   s                toggle the spectrum strip under the video
+  W                split view: show video beside the visualiser (music mode,
+                   off by default)
+  a / d            move the video pane to the left / right
+  T                video pane: still thumbnail / live video
+  { / }            move the split divider
   q / ctrl-c       quit
 
   The jump prompt takes 1:30, 1:02:03, a bare 90 (seconds), 90s / 2m / 1h2m3s,
@@ -86,6 +91,12 @@ keys (playback, both modes):
 
   The style and palette you pick carry over to the next track, so v is pressed
   once per session rather than once per song.
+
+  The split view (W) is music mode only, and off until asked for: it starts a
+  second ffmpeg and gives the picture half the grid. T switches the pane between
+  live video and the still thumbnail from yt-dlp, which needs no video stream at
+  all. { and } move the divider, which stops at a quarter each way so neither
+  pane can be squeezed out.
 
   When a track finishes the next result starts on its own; playback stops at the
   end of the list.

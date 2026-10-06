@@ -136,6 +136,10 @@ rasterbar -a -c "tesseract"        # ASCII/colour video mode
 | `c` | next palette |
 | `1`–`9` `0` | pick a palette directly |
 | `s` | toggle the spectrum strip |
+| `W` | split view: video beside the visualiser (music mode, off by default) |
+| `a` `d` | move the video pane left / right |
+| `T` | video pane: still thumbnail / live video |
+| `{` `}` | move the split divider |
 | `q` | quit |
 
 ### Keys while browsing
@@ -151,6 +155,16 @@ rasterbar -a -c "tesseract"        # ASCII/colour video mode
 The `:` prompt takes `1:30`, `1:02:03`, a bare `90` (seconds), `90s` / `2m` /
 `1h2m3s`, `+30` / `-1:30` relative to now, and `50%` of the track. It previews
 where the jump will land before you commit.
+
+### Split view
+
+In music mode, `W` puts the video beside the visualiser instead of replacing it —
+a second pane, on whichever side you want, with `{` and `}` moving the divider.
+It is off by default because it costs a second ffmpeg and half the grid.
+
+`T` swaps the pane between live video and the still thumbnail that `yt-dlp` already
+returned in a response the player had already made, so the still costs no extra
+request and no video stream at all.
 
 ## Notable
 

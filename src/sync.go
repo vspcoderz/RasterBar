@@ -136,11 +136,18 @@ func startAudioOnly(audioURL string, mute bool, startAt float64) (*SyncPlayer, e
 
 // videoTap is the ffmpeg half of video playback: the process, its pipe, and the
 // first frame already read off it.
+//
+// cols and rows are the cell geometry it was started at. Recorded because the
+// split view's pane asks the tap for its own frame size rather than assuming the
+// terminal's, and a tap that reported the wrong size would be read with the wrong
+// stride -- which reads as garbage, not as an error.
 type videoTap struct {
 	cmd   *exec.Cmd
 	out   io.ReadCloser
 	first []byte
 	size  int
+	cols  int
+	rows  int
 }
 
 // kill retires the process without waiting on the pipe.
@@ -177,27 +184,10 @@ func (vt *videoTap) kill() {
 // Colour path: output rgb24 at DOUBLE height, because each cell holds two
 // stacked pixels (the half-block trick). Mono path: gray at cell height.
 func startVideoTap(videoURL string, cols, rows, fps int, startAt float64, mode ColorMode, glyph GlyphMode) (*videoTap, error) {
-	var filter, pixFmt string
-	frameBytes := 0
-	if mode == ColorNone {
-		filter = fmt.Sprintf(
-			"fps=%d,scale=%d:%d:flags=area,unsharp=5:5:0.7:5:5:0.0,format=gray",
-			fps, cols, rows)
-		pixFmt = "gray"
-		frameBytes = cols * rows
-	} else {
-		// Half-block mode gets double height so each cell holds two pixels.
-		// One-pixel mode (used when the terminal renders U+2580 double-width)
-		// matches the grid exactly.
-		outRows := rows
-		if glyph == GlyphHalf {
-			outRows = rows * 2
-		}
-		filter = fmt.Sprintf("fps=%d,scale=%d:%d:flags=area,format=rgb24",
-			fps, cols, outRows)
-		pixFmt = "rgb24"
-		frameBytes = cols * outRows * 3
-	}
+	// Geometry comes from the shared helper so the live tap and the split view's
+	// thumbnail produce byte-identical layouts. Two copies of this is how the
+	// still and the video end up disagreeing about stride.
+	filter, pixFmt, frameBytes := videoTapGeometry(cols, rows, fps, mode, glyph)
 
 	// One ffmpeg, ONE output: the video frames on our stdout pipe.
 	//
@@ -243,12 +233,12 @@ func startVideoTap(videoURL string, cols, rows, fps int, startAt float64, mode C
 	// children at media time 0 together.
 	first := make([]byte, frameBytes)
 	if _, err := io.ReadFull(vidOut, first); err != nil {
-		vt := &videoTap{cmd: ff, out: vidOut, size: frameBytes}
+		vt := &videoTap{cmd: ff, out: vidOut, size: frameBytes, cols: cols, rows: rows}
 		vt.kill()
 		return nil, fmt.Errorf("read first frame: %w", err)
 	}
 
-	return &videoTap{cmd: ff, out: vidOut, first: first, size: frameBytes}, nil
+	return &videoTap{cmd: ff, out: vidOut, first: first, size: frameBytes, cols: cols, rows: rows}, nil
 }
 
 // startMpv launches mpv on the audio stream and connects to its IPC socket.

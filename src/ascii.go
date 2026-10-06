@@ -102,19 +102,7 @@ func computeLayout(termCols, termRows int, aspect float64, quality Quality, chro
 	// Match source height to the grid. Roughly 4 characters of width per 16px
 	// of source height is a reasonable ratio from real captures; the point is
 	// that a small grid does not request a large frame.
-	pixels := float64(cols) * 16.0 / 4.0
-	switch {
-	case pixels < 240:
-		l.sourceH = 240
-	case pixels < 360:
-		l.sourceH = 360
-	case pixels < 480:
-		l.sourceH = 480
-	case pixels < 720:
-		l.sourceH = 720
-	default:
-		l.sourceH = 1080
-	}
+	l.sourceH = sourceHForCols(cols)
 
 	if quality > 0 {
 		// -q is a hard override in both directions. Treat it as the number the
@@ -126,18 +114,34 @@ func computeLayout(termCols, termRows int, aspect float64, quality Quality, chro
 	return l
 }
 
+// sourceHForCols is the automatic source height for a grid this wide.
+//
+// Factored out of computeLayout because the split view asks the same question of
+// a pane that is only half the terminal, and a second copy of this switch is
+// exactly the kind of thing that ends up tuned in one place only.
+func sourceHForCols(cols int) int {
+	pixels := float64(cols) * 16.0 / 4.0
+	switch {
+	case pixels < 240:
+		return 240
+	case pixels < 360:
+		return 360
+	case pixels < 480:
+		return 480
+	case pixels < 720:
+		return 720
+	default:
+		return 1080
+	}
+}
+
 // fpsForGrid picks a frame rate from the grid size.
 //
-// The constraint is characters per second, not frames per second: a 200x57 grid
-// is 11400 cells against 80x21's 1680, nearly 7x the terminal traffic for the
-// same frame rate. Budgeting total output keeps big grids smooth instead of
-// falling behind.
-// fpsForGrid picks a frame rate from the grid size.
-//
-// The constraint is cells per second, not frames per second. Budgeting output
-// keeps big grids smooth instead of falling behind: a 400x200 grid at 6fps is
-// 480k cells/sec, far more than a terminal can absorb, so the rate has to keep
-// dropping as the grid grows.
+// The constraint is cells per second, not frames per second: a 200x57 grid is
+// 11400 cells against 80x21's 1680, nearly 7x the terminal traffic for the same
+// frame rate. Budgeting output keeps big grids smooth instead of falling behind:
+// a 400x200 grid at 6fps is 480k cells/sec, far more than a terminal can absorb,
+// so the rate has to keep dropping as the grid grows.
 func fpsForGrid(cols, rows int) int {
 	cells := cols * rows
 	switch {
@@ -307,7 +311,11 @@ func resolveAudioPair(track Track) (mediaPair, error) {
 		}, nil
 	}
 
-	tapURL, dur, chaps, err := audioURLOnce(track)
+	info, err := ytdlpInfo(track)
+	if err != nil {
+		return mediaPair{}, err
+	}
+	tapURL, err := pickAudio(info.Formats)
 	if err != nil {
 		return mediaPair{}, err
 	}
@@ -318,25 +326,87 @@ func resolveAudioPair(track Track) (mediaPair, error) {
 	return mediaPair{
 		tapURL:   tapURL,
 		audioURL: audioURL,
-		dur:      dur,
-		chapters: chaps,
+		// Free: the still is in the response the tap's URL came from, so the
+		// split view's thumbnail mode costs no request of its own.
+		thumbURL: pickThumbnail(info),
+		dur:      info.Duration,
+		chapters: chaptersFrom(info.Chapters),
 	}, nil
 }
 
-// audioURLOnce is one `yt-dlp -J` call reduced to an audio URL plus the metadata
-// that rides along in the same response.
-func audioURLOnce(track Track) (url string, dur float64, chaps []Chapter, err error) {
+// ytdlpInfo is one `yt-dlp -J` call, parsed.
+//
+// Split out because there were three copies of the exec-plus-unmarshal, and the
+// split view needs metadata out of a call it was not previously using for that.
+// Three copies of a subprocess invocation is three places to fix a flag.
+func ytdlpInfo(track Track) (ytInfo, error) {
 	cmd := exec.Command("yt-dlp", "-J", "--no-warnings", "--no-playlist", track.URL)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", 0, nil, fmt.Errorf("yt-dlp -J: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return ytInfo{}, fmt.Errorf("yt-dlp -J: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-
 	var info ytInfo
 	if err := json.Unmarshal(out, &info); err != nil {
-		return "", 0, nil, fmt.Errorf("parse yt-dlp -J: %w", err)
+		return ytInfo{}, fmt.Errorf("parse yt-dlp -J: %w", err)
+	}
+	return info, nil
+}
+
+// pickThumbnail is the still image the split view's thumbnail mode draws.
+//
+// The widest entry of the `thumbnails` array, which is the one carrying real
+// dimensions. The scalar `thumbnail` field is only a fallback because it is
+// frequently the webp variant, and whether ffmpeg can decode webp depends on how
+// it was built -- verified working on this machine's build, but the array entries
+// are jpegs and are the safer thing to ask for.
+//
+// An empty result is normal, not a failure: plenty of uploads have no thumbnail,
+// and the caller treats that as "no still available".
+func pickThumbnail(info ytInfo) string {
+	best, bestW := "", 0
+	for _, th := range info.Thumbnails {
+		if th.URL == "" || th.Width <= bestW {
+			continue
+		}
+		best, bestW = th.URL, th.Width
+	}
+	if best == "" {
+		return info.Thumbnail
+	}
+	return best
+}
+
+// resolvePaneVideoURL is the video stream for the split view's live pane.
+//
+// Lazy on purpose. Music mode makes two `yt-dlp -J` calls; this would be a third,
+// paid on every track for a feature that is off by default. So it happens the
+// first time someone presses `W`.
+//
+// A local file is its own video, and a filesystem path is not a signed grant, so
+// any number of readers may open it.
+func resolvePaneVideoURL(track Track, sourceH int) (string, error) {
+	if track.IsLocal() {
+		return track.LocalPath, nil
+	}
+	info, err := ytdlpInfo(track)
+	if err != nil {
+		return "", err
+	}
+	videoURL, _, err := pickStreams(info.Formats, sourceH)
+	if err != nil {
+		return "", err
+	}
+	return videoURL, nil
+}
+
+// audioURLOnce is one `yt-dlp -J` call reduced to an audio URL plus the metadata
+// that rides along in the same response.
+func audioURLOnce(track Track) (url string, dur float64, chaps []Chapter, err error) {
+	info, err := ytdlpInfo(track)
+	if err != nil {
+		return "", 0, nil, err
 	}
 	url, err = pickAudio(info.Formats)
 	if err != nil {
@@ -395,6 +465,15 @@ type ytInfo struct {
 	// request. Most uploads have none, which is why an empty list is normal
 	// rather than a failure.
 	Chapters []ytChapter `json:"chapters"`
+	// Thumbnail is yt-dlp's scalar "best guess"; Thumbnails is the full list with
+	// real dimensions. The split view's still mode wants one, and it is already
+	// in a response music mode makes. See pickThumbnail.
+	Thumbnail  string `json:"thumbnail"`
+	Thumbnails []struct {
+		URL    string `json:"url"`
+		Height int    `json:"height"`
+		Width  int    `json:"width"`
+	} `json:"thumbnails"`
 }
 
 // ytChapter is one entry of yt-dlp's chapter list.
