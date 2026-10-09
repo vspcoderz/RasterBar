@@ -48,7 +48,7 @@ func looksLikeFile(arg string) bool {
 	if arg == "" {
 		return false
 	}
-	if _, err := os.Stat(arg); err == nil {
+	if _, err := os.Stat(expandTilde(arg)); err == nil {
 		// A directory counts, deliberately: it is a path the user typed, so it is
 		// not a search query. loadPathArg then says "-l <dir>", which is the
 		// useful answer. Returning false here sent a bare directory to YouTube
@@ -56,6 +56,32 @@ func looksLikeFile(arg string) bool {
 		return true
 	}
 	return hasGlobMeta(arg)
+}
+
+// expandTilde turns a leading ~ into the home directory.
+//
+// Go has no equivalent and neither does filepath.Glob, so `rasterbar
+// "~/Music/*.flac"` — the *quoted* form, which is what someone types when they
+// want the program rather than the shell to expand — matched nothing and reported
+// "no playable files in ~/Music/*.flac". Unquoted, the shell expands it first and
+// the bug never shows, which is why the documented example worked and the other
+// obvious one did not.
+//
+// Only a leading `~` alone or followed by `/`. `~user` is left alone: resolving
+// another user's home means reading passwd, and a path that does not exist is a
+// clearer answer than a wrong one.
+func expandTilde(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return filepath.Join(home, p[2:])
 }
 
 // hasGlobMeta reports whether a path contains a shell wildcard.
@@ -93,6 +119,7 @@ func expandGlob(pattern string) ([]string, error) {
 // search query. More than one means a glob matched, and a playlist means its
 // entries.
 func loadPathArg(arg string, depth int) (paths []string, isFileInput bool, err error) {
+	arg = expandTilde(arg)
 	st, serr := os.Stat(arg)
 	switch {
 	case serr == nil && !st.IsDir():

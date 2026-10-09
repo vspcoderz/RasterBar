@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -256,3 +257,53 @@ func titles(ts []Track) []string {
 var bom = "\ufeff"
 
 func timeoutAfter() <-chan time.Time { return time.After(2 * time.Second) }
+
+// TestExpandTilde covers the quoted form of every path input.
+//
+// A quoted `~/Music/*.flac` is what someone types when they want the program
+// rather than the shell to do the expanding, and Go has no tilde expansion — not
+// in os.Stat, not in filepath.Glob. So the documented example worked (unquoted,
+// the shell expands it first) and the other obvious one silently matched nothing.
+// The bug hides in exactly the shape that "works fine when I try it".
+func TestExpandTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory")
+	}
+	cases := []struct{ in, want string }{
+		{"~", home},
+		{"~/Music", filepath.Join(home, "Music")},
+		{"~/a/b/c.flac", filepath.Join(home, "a/b/c.flac")},
+		{"~notauser/x", "~notauser/x"}, // not resolved: reading passwd is not ours
+		{"/absolute/~/path", "/absolute/~/path"},
+		{"plain", "plain"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := expandTilde(c.in); got != c.want {
+			t.Errorf("expandTilde(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	// The whole point: a glob under a quoted ~ now resolves.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(home, dir)
+	if err != nil || !strings.HasPrefix(rel, "..") {
+		// The temp dir is not under $HOME, which is the normal case and cannot be
+		// exercised with a ~ path. Skip rather than assert something vacuous.
+		t.Skipf("temp dir %q is not under %q", dir, home)
+	}
+	if !looksLikeFile("~/" + filepath.Join(rel, "*.mp3")) {
+		t.Error("a quoted ~/ glob was not recognised as a file intent")
+	}
+	paths, isFile, err := loadPathArg("~/"+filepath.Join(rel, "*.mp3"), 0)
+	if err != nil {
+		t.Fatalf("loadPathArg: %v", err)
+	}
+	if !isFile || len(paths) != 1 {
+		t.Errorf("quoted ~/ glob gave %d paths (isFile=%v), want 1", len(paths), isFile)
+	}
+}
