@@ -139,11 +139,11 @@ func loadPathArg(arg string, depth int) (paths []string, isFileInput bool, err e
 		return []string{arg}, true, nil
 
 	case serr == nil && st.IsDir():
-		// A bare directory is what -l is for: handing it here would duplicate the
-		// walk and the episode parser. Reported as a file intent so the message
+		// A bare directory is what `list` is for: handing it here would duplicate
+		// the walk and the episode parser. Reported as a file intent so the message
 		// names the fix — falling through to a YouTube search for a path the user
 		// typed is the least useful of the three possible answers.
-		return nil, true, fmt.Errorf("%s is a directory: use -l %s", arg, arg)
+		return nil, true, fmt.Errorf("%s is a directory: use `rasterbar list %s`", arg, arg)
 
 	case hasGlobMeta(arg):
 		matches, gerr := expandGlob(arg)

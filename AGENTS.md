@@ -273,7 +273,7 @@ Rules of thumb, each of which was a bug first:
 ## Architecture
 
 ```
-main.go      arg parsing, playQueue (owns the queue index; playTrack never mutates it)
+main.go      verbs + arg parsing, playQueue (owns the queue index; playTrack never mutates it)
 search.go    ytfzf/yt-dlp search -> []Track       library.go  dir scan -> []Track
 playlist.go  file args, globs, .m3u -> []Track    naturalsort.go  filename order
 tui.go       browse list (+ line-mode fallback)   session.go  trackSession, decoder goroutine, render loop
@@ -300,8 +300,23 @@ would force exporting it all.
 - **A positional argument is a file only if it looks like one, and that check
   needs the filesystem — so `parseArgs` collects and `main` decides.** Joining
   them in `parseArgs` is what made `rasterbar ~/Music/song.mp3` a YouTube search
-  for that string. `-l` beats file args outright, since a directory scan has its
-  own walk and parser.
+  for that string. `-l`/`list` beats file args outright, since a directory scan
+  has its own walk and parser.
+- **"No paths" and "not a file intent" are different answers.** `expandFileArgs`
+  returning an empty slice used to be read as "nothing playable", which killed
+  every YouTube search with "no playable files in lofi hip hop radio". It returns
+  the intent as a second value for exactly this reason: three answers, not two.
+- **A test that only covers new paths will not catch a new path breaking the
+  old one.** The whole suite was green with search completely dead, because
+  nothing asked for a path that was *not* a file. `TestSearchStillSearches`.
+- **A verb layer is a front door, not a replacement.** Bare arguments and every
+  flag keep working; a verb only counts when it is the first positional argument
+  AND something follows it, so `rasterbar play` still searches for a song called
+  "play". The verbs that take no value (`help`, `version`) or an optional one
+  (`list`) are the exception, or they would not be verbs.
+- **A fake that disagrees with the protocol fails the test for the wrong
+  reason.** The mpv IPC double replied with a canned sweep of ids instead of the
+  one requested, which went flaky the moment the mutex serialised the calls.
 - **Sync:** ffmpeg (video) and mpv (audio) drift; `checkSync` asks mpv's real
   position every 2s and corrects past 250ms. `VSPZ_YT_CLI_DEBUG_SYNC=1` shows it.
   `Seconds()` must add `startAt` or a resize rewinds audio to the start.

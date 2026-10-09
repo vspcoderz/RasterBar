@@ -113,18 +113,18 @@ go build -ldflags="-s -w" -o rasterbar ./src
 ## Use
 
 ```sh
-rasterbar "lofi hip hop radio"     # search and play
-rasterbar https://youtu.be/...    # a URL
-rasterbar -a -c "tesseract"        # ASCII/colour video mode
+rasterbar "lofi hip hop radio"          # search and play
+rasterbar https://youtu.be/...         # a URL
+rasterbar -a -c "tesseract"            # ASCII/colour video mode
 ```
 
 Or point it at files instead of a search:
 
 ```sh
-rasterbar track.mp3 prelude.opus   # these files, in this order
-rasterbar ~/Music/*.flac           # a glob
-rasterbar roadtrip.m3u             # an m3u/m3u8 playlist
-rasterbar -l ~/Shows --play        # browse a folder, start immediately
+rasterbar play track.mp3 prelude.opus  # these files, in this order
+rasterbar play "~/Music/*.flac"         # a glob
+rasterbar play roadtrip.m3u            # an m3u/m3u8 playlist
+rasterbar list ~/Shows --play          # browse a folder
 ```
 
 An argument is treated as a file when it exists, contains a wildcard, or names a
@@ -132,7 +132,26 @@ playlist — anything else is a YouTube search, so `"lofi hip hop radio"` still
 does what it looks like. A file with no video stream plays as a visualiser no
 matter which mode you asked for, since there is no picture to show.
 
-`-l` orders a directory two ways at once: files with an episode marker sort
+### Verbs
+
+Every flag still works. The verbs are the same flags spelled out, and exist so
+you can find them:
+
+| verb | does |
+|---|---|
+| `play <query\|file...>` | search YouTube, or play files — the default |
+| `search <query>` | force a search, even if an argument looks like a path |
+| `list [DIR]` | browse a directory (was `-l DIR`); defaults to `.` |
+| `viz NAME` | pick a visualizer (was `--viz`) |
+| `palette NAME` | pick a palette (was `--palette`) |
+| `help` | the full usage text |
+| `version` | the version |
+
+`rasterbar play` with nothing after it searches for the word "play", because a
+search is a harmless answer to a mistyped command and "no arguments" is not an
+answer at all.
+
+`list` orders a directory two ways at once: files with an episode marker sort
 series → season → episode, and files without one sort by natural filename order,
 so `track 2` comes before `track 10`. That is what makes a music folder browsable
 here rather than invisible.

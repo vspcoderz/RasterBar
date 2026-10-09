@@ -14,7 +14,31 @@ import (
 const usage = `rasterbar - terminal YouTube player: ASCII video or a music visualizer
 
 usage:
-  rasterbar [options] <query>
+  rasterbar <query>                    search YouTube
+  rasterbar <file>...                  play files
+  rasterbar <verb> [options] [args...] see verbs below
+
+verbs:
+  play <query|file...>   search YouTube, or play files — the default
+  search <query>         force a search, even if an argument looks like a path
+  list [DIR]             browse a directory (was -l DIR); defaults to "."
+  viz NAME               bars scope mirror waterfall radial particles
+  palette NAME           spectrum height ocean ember graphite ink ice magma
+                         viridis mono
+  help                   this text
+  version                print the version
+
+  rasterbar "lofi hip hop radio"          a search
+  rasterbar play "lofi hip hop radio"     the same, said out loud
+  rasterbar play track.mp3 prelude.opus   files, in this order
+  rasterbar play "~/Music/*.flac"          a glob, quoted or not
+  rasterbar play roadtrip.m3u             an m3u/m3u8 playlist
+  rasterbar list ~/Shows --play           browse a directory
+  rasterbar play -a "tesseract"           video mode
+
+  An argument becomes a file when it exists, contains a wildcard, or names a
+  playlist. Anything else is a YouTube search. A file with no video stream plays
+  as a visualiser whichever mode you asked for, because there is no picture.
 
 modes:
   -M, --music       music mode: the visualizer replaces the video (default)
@@ -22,10 +46,8 @@ modes:
 
 options:
   -m, --mute         play audio muted (visualizer still animates)
-      --viz NAME     visualizer style: bars, scope, mirror, waterfall,
-                     radial, particles (default: bars)
-      --palette NAME colour scheme: spectrum, height, ocean, ember, graphite,
-                     ink, ice, magma, viridis, mono (default: spectrum)
+      --viz NAME     visualizer style (same as the viz verb)
+      --palette NAME colour scheme (same as the palette verb)
   -c, --color        force colour (default: auto-detected from the terminal)
       --mono         force plain monochrome ASCII, no colour
       --glyph MODE   cell layout: auto (probe the terminal), half (2 pixels
@@ -37,29 +59,17 @@ options:
                      image looks squashed, lower it if it looks stretched
       --cols N       force ASCII grid width (default: terminal width)
       --rows N       force ASCII grid height (default: from terminal height)
-  -h, --help         this help
+      --no-probe     skip the ffprobe pass on a directory scan
+      --play         with list, start the first track without the browse list
+  -h, --help         this text
 
-playing files (as well as searching):
-  rasterbar song.mp3 b.opus        these files, in this order
-  rasterbar ~/Music/*.flac         a glob, quoted or not
-  rasterbar roadtrip.m3u           an m3u/m3u8 playlist, entries relative to it
+  Every flag still works and every verb is a flag spelled out. The flags are
+  short and several are muscle memory; the verbs are the discoverable front door.
 
-  An argument becomes a file when it exists, contains a wildcard, or names a
-  playlist. Anything else is a YouTube search, so "lofi hip hop radio" still
-  searches. A file with no video stream plays as a visualiser whichever mode you
-  asked for, because there is no picture to show.
-
-library mode (browse a directory instead of searching):
-  -l, --library DIR  scan DIR for media files
-      --no-probe     skip the ffprobe pass (instant scan, "--:--" durations)
-      --play         start the first track without the browse list
-
-  Filenames are parsed for series, season and episode, so "Show S01E02.mkv",
-  "Show - 01x02.mkv", "Show - 07 [1080p].mkv" and "Show Episode 7.mkv" all
-  land in a watchable order. Files with no episode marker are still included,
-  ordered by natural filename order -- so "track 2" precedes "track 10", which
-  is the whole reason a music folder works here at all. Audio containers count:
-  .mp3 .m4a .flac .opus .ogg .oga .wav .aac .wma and the video ones.
+  list orders a directory two ways at once: files with an episode marker sort
+  series -> season -> episode, and files without one sort by natural filename
+  order, so "track 2" precedes "track 10". Audio containers count too:
+  .mp3 .m4a .flac .opus .ogg .oga .wav .aac .wma as well as the video ones.
 
   requires: ffmpeg, mpv  (yt-dlp and ytfzf are needed only for search)
 
@@ -131,9 +141,17 @@ requires: yt-dlp, ffmpeg, mpv  (ytfzf optional, used as the primary scraper)
 `
 
 type options struct {
-	// args holds the positional arguments in the order given. Resolved into
-	// either a file queue or a search query in main.
+	// args holds the positional arguments in the order given, after any leading
+	// verb has been consumed. Resolved into either a file queue or a search query
+	// in main.
 	args []string
+	// forceSearch comes from the `search` verb: the arguments are a query even if
+	// one of them happens to name a file. Without it a directory called
+	// "Discovery" turns `search discovery` into a browse.
+	forceSearch bool
+	// verbErr holds a verb's own argument error. takeVerb has no error return,
+	// so parseArgs hands it over here rather than changing its signature.
+	verbErr error
 	// query is the joined positional text, set only once main has established
 	// that none of the arguments names a file.
 	query    string
@@ -316,7 +334,180 @@ func parseArgs(args []string) (options, error) {
 			o.args = append(o.args, a)
 		}
 	}
+	// A leading verb is consumed here so the rest of the program never sees one.
+	// Doing it after the flag loop rather than during it means `play` and
+	// `--play` cannot be confused: the flag is still parsed as a flag, and only
+	// a bare leading word is a verb.
+	takeVerb(&o)
+	if o.verbErr != nil {
+		return o, o.verbErr
+	}
 	return o, nil
+}
+
+// verbs are the subcommands. A first positional argument that matches one is a
+// verb and is consumed; everything after it means what that verb says it means.
+//
+// Bare arguments still work exactly as they did — `rasterbar lofi hip hop radio`
+// searches, `rasterbar song.mp3` plays the file — because a verb layer that
+// breaks the thing people already type is worse than no verb layer. The verbs
+// exist to say what used to need a flag, and to be explicit when the argument
+// alone is ambiguous.
+//
+//	play            search or play files (the default; stated out loud)
+//	search          force a YouTube search, even if an argument looks like a path
+//	list DIR        browse a directory           (was -l DIR)
+//	viz NAME        pick a visualizer            (was --viz NAME)
+//	palette NAME    pick a palette               (was --palette NAME)
+//	help            this text                    (was --help)
+//	version         print the version
+//
+// The flags all still work. They are short, several are muscle memory, and
+// `-a -q 480` is not worse than `play --video --quality 480`. The verbs are the
+// discoverable front door, not a replacement.
+// Named rather than closures aliasing each other: `verbs["viz"]` inside its own
+// initialiser is an initialization cycle, and Go is right to refuse it.
+func verbViz(o *options, args []string) ([]string, error) {
+	_, rest, err := oneNamed(o, args, "--viz", &o.viz, VizNames())
+	return rest, err
+}
+
+func verbPalette(o *options, args []string) ([]string, error) {
+	_, rest, err := oneNamed(o, args, "--palette", &o.palette, paletteNames())
+	return rest, err
+}
+
+func verbSearch(o *options, args []string) ([]string, error) {
+	o.forceSearch = true
+	return args, nil
+}
+
+func verbPlay(o *options, args []string) ([]string, error) { return args, nil }
+
+func verbList(o *options, args []string) ([]string, error) { return listDirArg(o, args) }
+
+var verbs = map[string]func(o *options, args []string) ([]string, error){
+	"play":       verbPlay,
+	"search":     verbSearch,
+	"find":       verbSearch,
+	"list":       verbList,
+	"library":    verbList,
+	"viz":        verbViz,
+	"visual":     verbViz,
+	"visualize":  verbViz,
+	"visualizer": verbViz,
+	"palette":    verbPalette,
+	"color":      verbPalette,
+	"help":       verbPrintHelp,
+	"version":    verbPrintVersion,
+}
+
+// version is stamped at build time:
+//
+//	go build -ldflags="-X main.version=v1.2.3"
+//
+// Empty when built by hand, and `rasterbar version` says so rather than printing
+// an empty string as though it meant something.
+var version = ""
+
+// helpRequested and versionRequested are set by their verbs and acted on in main.
+// parseArgs cannot print and exit: it returns options.
+var helpRequested, versionRequested bool
+
+func verbPrintHelp(o *options, args []string) ([]string, error) {
+	helpRequested = true
+	return nil, nil
+}
+
+func verbPrintVersion(o *options, args []string) ([]string, error) {
+	versionRequested = true
+	return nil, nil
+}
+
+// oneNamed consumes the value a verb like `viz` or `palette` requires.
+//
+// Shared with the flag form so the two cannot drift: the flag has been the only
+// way to say this for the life of the project, and a verb that accepts a name the
+// flag rejects is two lists to keep in step.
+func oneNamed(o *options, args []string, flagName string, dst *string, valid []string) (string, []string, error) {
+	if len(args) == 0 {
+		return "", nil, fmt.Errorf("needs a value: %s", strings.Join(valid, ", "))
+	}
+	v := args[0]
+	for _, ok := range valid {
+		if strings.EqualFold(ok, v) {
+			*dst = v
+			return v, args[1:], nil
+		}
+	}
+	return "", nil, fmt.Errorf("must be one of %s (got %s)", strings.Join(valid, ", "), v)
+}
+
+func listDirArg(o *options, args []string) ([]string, error) {
+	dir := "."
+	rest := args
+	if len(args) > 0 {
+		dir = expandTilde(args[0])
+		rest = args[1:]
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		return nil, fmt.Errorf("%s is not a directory", dir)
+	}
+	o.library = dir
+	return rest, nil
+}
+
+func paletteNames() []string {
+	names := make([]string, 0, len(palettes))
+	for _, p := range palettes {
+		names = append(names, p.name)
+	}
+	return names
+}
+
+// takeVerb consumes a leading verb, if the first argument is one.
+//
+// Only ever looks at the FIRST positional argument. `rasterbar play something`
+// is a verb followed by a query; `rasterbar lofi hip hop` is a query that happens
+// to start with a word, and someone searching for a song called "Play" should
+// still find it.
+//
+// The exception is a bare verb with nothing after it: `rasterbar play` searches
+// for the word "play" rather than printing usage, because a search is a harmless
+// answer to a mistyped invocation and "no arguments" is not an answer at all.
+//
+// The verbs excluded from that fallback are the ones where the word is not
+// something anyone searches for: `viz` and `palette` need a value and should say
+// which are valid, and `help`/`version` must work with no arguments at all or
+// they are not verbs, they are aliases for a flag that already existed.
+var neverBareVerbs = map[string]bool{
+	"viz": true, "visual": true, "visualize": true, "visualizer": true,
+	"palette": true, "color": true,
+	"help": true, "version": true,
+	"list": true, "library": true, // these take an optional DIR, defaulting to "."
+}
+
+func takeVerb(o *options) (string, bool) {
+	if len(o.args) == 0 {
+		return "", false
+	}
+	fn, ok := verbs[o.args[0]]
+	if !ok {
+		return "", false
+	}
+	if len(o.args) == 1 && !neverBareVerbs[o.args[0]] {
+		return "", false
+	}
+	verb := o.args[0]
+	rest, err := fn(o, o.args[1:])
+	if err != nil {
+		// Surfaced by the caller's error path; stored because takeVerb has no
+		// error return and parseArgs already has one to fill.
+		o.verbErr = err
+		return verb, true
+	}
+	o.args = rest
+	return verb, true
 }
 
 // expandFileArgs turns positional arguments that name files into a queue of
@@ -327,7 +518,20 @@ func parseArgs(args []string) (options, error) {
 // file and searching for the rest would be two players. When any argument looks
 // like a file, all of them are treated as paths and the ones that are not get an
 // error naming them, which is honest. When none does, it is a search.
-func expandFileArgs(args []string) ([]string, error) {
+//
+// The second return value is whether this was a file intent at all, and it is
+// load-bearing. There are three answers, not two:
+//
+//	(nil, false, nil)  no argument names a file -> a YouTube search
+//	(p,  true,  nil)  files resolved          -> play them
+//	(_,  true,  err)  files asked for, none usable -> report why
+//
+// The first version returned only (paths, error) and the caller treated "no
+// paths" as "nothing playable", which made every search die with "no playable
+// files in lofi hip hop radio". The primary feature of the program, gone, and
+// nothing in the suite noticed because no test asked for a path that is NOT a
+// file end to end.
+func expandFileArgs(args []string) (paths []string, isFileIntent bool, err error) {
 	any := false
 	for _, a := range args {
 		if looksLikeFile(a) {
@@ -336,21 +540,21 @@ func expandFileArgs(args []string) ([]string, error) {
 		}
 	}
 	if !any {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	var out []string
 	for _, a := range args {
 		paths, isFile, err := loadPathArg(a, 0)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
 		if !isFile {
-			return nil, fmt.Errorf("%q is not a file, a glob or a playlist", a)
+			return nil, true, fmt.Errorf("%q is not a file, a glob or a playlist", a)
 		}
 		out = append(out, paths...)
 	}
-	return out, nil
+	return out, true, nil
 }
 
 func main() {
@@ -370,21 +574,40 @@ func main() {
 	// -l wins outright when both are given, because a directory scan has its own
 	// walk and its own episode parser and a file list would only duplicate them.
 	var filePaths []string
-	if opts.library == "" && len(opts.args) > 0 {
-		filePaths, err = expandFileArgs(opts.args)
+	if opts.library == "" && len(opts.args) > 0 && !opts.forceSearch {
+		var isFileIntent bool
+		filePaths, isFileIntent, err = expandFileArgs(opts.args)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
-		if len(filePaths) == 0 {
+		if isFileIntent && len(filePaths) == 0 {
 			// Every argument looked like a path and none of them resolved to a
 			// playable file. Saying so beats falling back to a YouTube search for
 			// the user's own filename, which is what used to happen.
 			fmt.Fprintf(os.Stderr, "no playable files in %s\n", strings.Join(opts.args, " "))
 			os.Exit(1)
 		}
-	} else {
+	}
+	if len(filePaths) == 0 && opts.library == "" {
 		opts.query = strings.Join(opts.args, " ")
+	}
+
+	// Before the empty-input check below, not after: `rasterbar help` and
+	// `rasterbar version` legitimately carry nothing else on the command line,
+	// and falling through to "no arguments, here is the usage text" made
+	// `version` print the help and look like it worked.
+	if helpRequested {
+		fmt.Print(usage)
+		return
+	}
+	if versionRequested {
+		if version == "" {
+			fmt.Println("rasterbar (development build, no version stamped)")
+			return
+		}
+		fmt.Println("rasterbar", version)
+		return
 	}
 
 	if len(filePaths) == 0 && opts.library == "" && opts.query == "" {

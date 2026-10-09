@@ -138,9 +138,12 @@ func TestParseArgsFileArgsAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths, ferr := expandFileArgs(o.args)
+	paths, isFile, ferr := expandFileArgs(o.args)
 	if ferr != nil {
 		t.Fatalf("expandFileArgs: %v", ferr)
+	}
+	if !isFile {
+		t.Error("a real file was not a file intent")
 	}
 	if len(paths) != 1 || paths[0] != song {
 		t.Errorf("paths = %v, want [%s]", paths, song)
@@ -151,15 +154,49 @@ func TestParseArgsFileArgsAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2, err2 := expandFileArgs(o2.args)
+	p2, isFile2, err2 := expandFileArgs(o2.args)
 	if err2 != nil {
 		t.Fatalf("expandFileArgs: %v", err2)
+	}
+	if isFile2 {
+		t.Error("a search query claimed to be a file intent")
 	}
 	if len(p2) != 0 {
 		t.Errorf("a search query resolved to files: %v", p2)
 	}
 	if q := strings.Join(o2.args, " "); q != "lofi hip hop" {
 		t.Errorf("query = %q", q)
+	}
+}
+
+// TestSearchStillSearches is the regression that shipped with the file arguments
+// and broke the primary feature: every YouTube search died with "no playable
+// files in lofi hip hop radio".
+//
+// It is here because the whole suite passed with search broken. Nothing asked for
+// a path that is *not* a file and then checked the search branch, so the one
+// feature every user touches first had no test at all.
+func TestSearchStillSearches(t *testing.T) {
+	for _, q := range [][]string{
+		{"lofi", "hip", "hop", "radio"},
+		{"play"},
+		{"play", "something"},
+		{"a", "search", "for", "play"},
+	} {
+		o, err := parseArgs(q)
+		if err != nil {
+			t.Fatalf("parseArgs(%v): %v", q, err)
+		}
+		paths, isFile, ferr := expandFileArgs(o.args)
+		if ferr != nil {
+			t.Fatalf("expandFileArgs(%v): %v", q, ferr)
+		}
+		if isFile {
+			t.Errorf("%v was treated as files (%v), want a search", q, paths)
+		}
+		if len(o.args) == 0 {
+			t.Errorf("%v left nothing to search for", q)
+		}
 	}
 }
 
@@ -172,7 +209,7 @@ func TestExpandFileArgsRejectsMixedInput(t *testing.T) {
 	if err := os.WriteFile(song, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := expandFileArgs([]string{song, "lofi"}); err == nil {
+	if _, _, err := expandFileArgs([]string{song, "lofi"}); err == nil {
 		t.Fatal("want an error for a mixed file/search argument list")
 	}
 }

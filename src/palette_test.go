@@ -177,14 +177,6 @@ func TestDefaultPaletteIsNotMono(t *testing.T) {
 // on a terminal that cannot do colour -- or on one where the user does not want it
 // -- leaves the visualizer readable instead of turning it into a black rectangle.
 
-func paletteNames() []string {
-	out := make([]string, 0, len(palettes))
-	for _, p := range palettes {
-		out = append(out, p.name)
-	}
-	return out
-}
-
 // TestBaselineIsAboveTheBackground pins the axis at the contrast it claims.
 //
 // baselineInk is documented as "above the background, well below anything a bar

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -98,7 +99,14 @@ func TestIPCIsSafeFromTwoGoroutines(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Stands in for mpv: answers every request, whatever its id.
+	// Stands in for mpv: answers each request with the id it asked for.
+	//
+	// The first version replied with a fixed sweep of 1..64 to every request,
+	// which is not what mpv does and made the test fail on its own once the
+	// mutex serialised the calls: after the 64 replies were consumed, the next
+	// request had nothing left to read and the caller timed out. A fake that
+	// disagrees with the protocol fails the test for the wrong reason, which is
+	// worse than no fake.
 	go func() {
 		c, aerr := ln.Accept()
 		if aerr != nil {
@@ -106,15 +114,20 @@ func TestIPCIsSafeFromTwoGoroutines(t *testing.T) {
 		}
 		r := bufio.NewReader(c)
 		for {
-			if _, rerr := r.ReadBytes('\n'); rerr != nil {
+			line, rerr := r.ReadBytes('\n')
+			if rerr != nil {
 				return
 			}
-			for id := 1; id <= 64; id++ {
-				_, werr := c.Write([]byte(`{"error":"success","data":1.5,"request_id":` +
-					strconv.Itoa(id) + "}\n"))
-				if werr != nil {
-					return
-				}
+			var req struct {
+				RequestID int `json:"request_id"`
+			}
+			if json.Unmarshal(line, &req) != nil {
+				return
+			}
+			_, werr := c.Write([]byte(`{"error":"success","data":1.5,"request_id":` +
+				strconv.Itoa(req.RequestID) + "}\n"))
+			if werr != nil {
+				return
 			}
 		}
 	}()

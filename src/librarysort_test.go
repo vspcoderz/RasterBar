@@ -241,7 +241,7 @@ func TestLooksLikeFileKeepsSearchQueriesAsQueries(t *testing.T) {
 		t.Error("a directory was treated as a search query")
 	}
 	if _, _, err := loadPathArg(dir, 0); err == nil {
-		t.Error("a bare directory was accepted without pointing at -l")
+		t.Error("a bare directory was accepted without pointing at the list verb")
 	}
 }
 
