@@ -307,3 +307,33 @@ func TestExpandTilde(t *testing.T) {
 		t.Errorf("quoted ~/ glob gave %d paths (isFile=%v), want 1", len(paths), isFile)
 	}
 }
+
+// TestMusicModeForFallsBackOnlyForVideoLessFiles pins the one place the two
+// modes are chosen.
+//
+// It is a function rather than a line inside newTrackSession because the answer
+// changes the grid, the chrome height, the tap and every `if o.music` in the
+// render loop. When it lived in the session, a local mp3 in video mode produced
+// nil-buffer frames that the loop handed to the *video* renderer, which rejects
+// them as "frame too small" and ends the track with no message: `-a` on an mp3
+// painted nothing at all.
+//
+// The non-local case is asserted without a network: a YouTube result is never
+// videoLess, so the decision must be a pure pass-through there and the function
+// must not shell out.
+func TestMusicModeForFallsBackOnlyForVideoLessFiles(t *testing.T) {
+	// Returns true for "plays as a visualiser".
+	remote := Track{URL: "https://youtu.be/x"}
+	if musicModeFor(remote, false) {
+		t.Error("a remote track asked for video fell back to music")
+	}
+	if !musicModeFor(remote, true) {
+		t.Error("a remote track asked for music left music mode")
+	}
+	if musicModeFor(Track{}, false) {
+		t.Error("an empty track fell back to music without a probe")
+	}
+	if !musicModeFor(Track{}, true) {
+		t.Error("an empty track asked for music left music mode")
+	}
+}

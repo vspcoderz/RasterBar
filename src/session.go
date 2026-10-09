@@ -167,6 +167,40 @@ type trackSession struct {
 	vizCap atomic.Value // float64
 }
 
+// musicModeFor decides which mode a track can actually play in.
+//
+// `wantMusic` is what was asked for. The answer can be music regardless, because
+// an mp3 has no video stream: asking for video hands the path to ffmpeg with
+// `-map 0:v:0`, which is a hard error ("Stream map ” matches no streams"), then
+// EOF on the pipe, then "cannot play ...: read first frame: EOF" — with ffmpeg's
+// own stderr landing in the middle of the screen. `rasterbar -l ~/Music --play`
+// hit this on track one and OutcomeError exited the whole queue.
+//
+// Falling back rather than refusing is the call: there is no mode the user could
+// switch to, because "no picture" is not a failure they can act on. `silent` is
+// the mirror and stays fatal in music mode — the spectrum is the content there,
+// and a silent video behind a flat grid is worse than a refusal.
+//
+// Probed only for local files. A YouTube result always has video in at least one
+// format, and resolveMedia has to ask for the probe anyway; branching on IsLocal
+// keeps the network path paying nothing.
+//
+// Deliberately NOT done inside newTrackSession, even though that is where the
+// original version put it. The answer changes the grid, the chrome height, the
+// tap, and every `if o.music` in the render loop. A session that quietly decided
+// for itself produced nil-buffer frames while the loop handed them to the video
+// renderer, which rejects them as "frame too small" and ends the track without a
+// word — so `-a` on an mp3 painted nothing at all.
+func musicModeFor(track Track, wantMusic bool) bool {
+	if wantMusic || !track.IsLocal() {
+		return wantMusic
+	}
+	// An unreadable file is not a reason to change mode; the resolver will say so
+	// with a real message a moment later.
+	info, err := probeMedia(track.LocalPath)
+	return err == nil && !info.HasVideo
+}
+
 // newTrackSession resolves a track's streams once and starts playback at pos.
 //
 // Resolution happens exactly once per track. The obvious alternative —
@@ -178,28 +212,10 @@ type trackSession struct {
 // The layout is taken whole rather than as cols/rows/fps because the source
 // resolution travels with it: a re-resolve that forgot l.sourceH would silently
 // downgrade a 1080p session to the 360p default.
+//
+// `music` must already be the decided mode — musicModeFor, not the caller's
+// preference. See musicModeFor for why the answer cannot be discovered here.
 func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMode, glyph GlyphMode, music, wantTap bool) (*trackSession, error) {
-	// A local file decides its own mode. An mp3 has no video stream, so asking
-	// for video mode hands the path to ffmpeg with `-map 0:v:0`, which is a hard
-	// error ("Stream map '' matches no streams"), then EOF on the pipe, then
-	// "cannot play ...: read first frame: EOF" -- with ffmpeg's own stderr landing
-	// in the middle of the screen. `rasterbar -l ~/Music --play` hit this on track
-	// one, and OutcomeError then exited the whole queue.
-	//
-	// Probed only for local files. A YouTube result always has video in at least
-	// one format, and resolveMedia would have to ask for the probe anyway; the
-	// branch is on IsLocal so the network path pays nothing.
-	//
-	// Falling back rather than refusing is the call: there is no mode the user
-	// could switch to, because "no picture" is not a failure they can act on.
-	// silent is the mirror and stays fatal in music mode -- the spectrum is the
-	// content there, and a silent video behind a flat grid is worse than a refusal.
-	if track.IsLocal() {
-		if info, err := probeMedia(track.LocalPath); err == nil && !info.HasVideo {
-			music = true
-		}
-	}
-
 	var (
 		pair mediaPair
 		err  error
@@ -752,15 +768,26 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	signal.Notify(quitSig, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(quitSig)
 
-	// Synchronized output, on for the whole session and ended by restoreTerminal.
-	// Emitted unconditionally: DEC private mode 2026 makes the terminal buffer a
-	// frame and present it atomically instead of showing a half-painted grid
-	// mid-repaint, and a terminal that does not know the mode ignores an unknown
-	// private mode. No detection, no flag — there is nothing to detect that would
-	// change what we emit.
-	fmt.Fprint(o.out, syncOn)
+	// Synchronized output is emitted PER FRAME, not once per session. See syncOn.
 	fmt.Fprint(o.out, "\x1b[?25l")
 
+	if index < 0 || index >= len(queue) {
+		return OutcomeEnded
+	}
+	track := queue[index]
+
+	// Decide the mode BEFORE anything that depends on it.
+	//
+	// A local file with no video stream plays as a visualiser whatever was asked
+	// for, and that answer changes the grid, the chrome height, the tap and every
+	// `if o.music` in the loop below. Deciding it inside newTrackSession — which
+	// is where it was — left the session pushing nil-buffer frames while the loop
+	// handed them to the video renderer, which rejects them as "frame too small"
+	// and ends the track with no message at all.
+	o.music = musicModeFor(track, o.music)
+	// The strip rides on the mode: in music mode it costs nothing, because there
+	// is no video for it to take a row from.
+	strip = o.strip || o.music
 	l := computeLayout(termCols, termRows, o.aspect, o.quality, chromeRowsFor(strip))
 
 	// The glyph probe round-trips with the terminal, so it must happen before
@@ -775,11 +802,6 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	if o.mode != ColorNone {
 		glyph = resolveGlyph(o.glyphPref, o.in, o.out)
 	}
-
-	if index < 0 || index >= len(queue) {
-		return OutcomeEnded
-	}
-	track := queue[index]
 
 	sess, err := newTrackSession(track, l, 0, o.mute, o.mode, glyph, o.music, strip)
 	if err != nil {
@@ -1567,6 +1589,11 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			// is what keeps the prompt, the stall handler and the HUD working
 			// identically in both modes -- which is the entire reason music mode is
 			// a flag on trackSession and not a second player.
+			//
+			// The synchronized-output pair brackets everything painted for this
+			// frame: the grid, the HUD at the bottom of the loop, and the prompt
+			// overlay. One frame to the user is one begin and one end.
+			fmt.Fprint(bw, syncOn)
 			if o.music {
 				if err := paintMusic(); err != nil {
 					return OutcomeError
@@ -1631,6 +1658,17 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			// overlay is inside it. Drawing it first would have the frame's own
 			// cells win, which is the same as not drawing it.
 			paintOverlay()
+
+			// End of frame. Everything painted since the matching syncOn is now
+			// presented in one go, so a viewer never sees the grid half-updated.
+			//
+			// Flushed here rather than at the top of the next iteration because the
+			// `l` has to reach the terminal after this frame's bytes, not before the
+			// next frame's. Leaving it open across the select would hold the frame
+			// for however long the loop waits on a channel, which on a slow track is
+			// most of a second.
+			fmt.Fprint(bw, syncOff)
+			_ = bw.Flush()
 
 			if time.Since(lastSync) > syncCheckInterval {
 				lastSync = time.Now()
@@ -1707,14 +1745,20 @@ func chromeRowsFor(strip bool) int {
 // on, is a fourth row above the footer.
 const hudStripRows = 3
 
-// Synchronized output, DEC private mode 2026. Tells the terminal to buffer a
-// frame and present it in one go rather than painting each write as it arrives,
-// which is what stops a half-updated grid being visible mid-repaint.
+// Synchronized output, DEC private mode 2026: the terminal buffers what is
+// written after `h` and presents it in one go when it sees `l`, which is what
+// stops a half-updated grid being visible mid-repaint.
 //
-// Emitted unconditionally. A terminal that does not implement the mode ignores an
-// unknown private mode, so there is nothing to detect and no reason to branch —
-// and a terminal that does implement it is exactly the one worth being correct
-// for, since it is also the one fast enough to tear.
+// IT IS A PAIR, NOT A MODE. Sending `h` at startup and `l` at exit — reading it
+// as a mode you switch on, which is the obvious mistake and the one made here —
+// means a terminal that actually implements it buffers the whole track and
+// presents nothing until the program exits: a black screen for the entire video.
+// On a terminal that ignores unknown private modes, which is every pty harness
+// and most CI, that version looks perfect. Every test passed and the feature was
+// broken on the terminals it was written for.
+//
+// Emitted unconditionally and unconditionally closed per frame: a terminal that
+// does not know the mode ignores it, and there is nothing to detect.
 const (
 	syncOn  = "\x1b[?2026h"
 	syncOff = "\x1b[?2026l"

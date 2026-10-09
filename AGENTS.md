@@ -149,9 +149,13 @@ test or an explicit comment.
 - **Recompute from the live window, not the size captured at entry.**
   `CmdStrip` used the entry-time `termCols`/`termRows`, so a strip toggle after a
   resize snapped the grid back to the pre-resize geometry.
-- **Wrap frames in DEC 2026.** `\x1b[?2026h` / `\x1b[?2026l`, unconditionally:
-  a terminal that does not know the mode ignores it, and the ones that do are the
-  ones fast enough to tear.
+- **Wrap frames in DEC 2026, per frame.** `\x1b[?2026h` before the frame's
+  first write, `\x1b[?2026l` after the last one, in the *same* loop iteration.
+  It is a begin/end pair, not a mode you switch on: sending `h` at startup and
+  `l` at exit makes a terminal that implements it buffer the whole track and
+  present nothing until the program exits — a black screen for the entire video,
+  on exactly the terminals it was written for. A pty ignores the mode, so every
+  test passes. `tools/ptysync.py` is the only harness that catches it.
 - **A threshold has to sit inside the range the code around it can produce.**
   `miniBars`'s peak cap tested `peak > level+0.5`, but `Visualizer.Push` decays
   level by 0.82 and peak by 0.93, which caps the achievable gap at ~0.36
@@ -169,6 +173,13 @@ test or an explicit comment.
 - **A track ends when *both* streams end**, not when the first does. And note the
   `hasAudio` bug masked this for the project's whole life — fix a bug in the same
   commit that removes what hid it.
+- **Decide the mode before anything that depends on it.** `musicModeFor` is
+  called in `playTrack` *before* `computeLayout`, the glyph probe and the strip,
+  because a video-less local file plays as a visualiser whatever was asked for
+  and that changes the grid, the chrome height and every `if o.music` in the
+  loop. Deciding it inside `newTrackSession` looked tidier and left the session
+  pushing nil-buffer frames into the *video* renderer, which rejected them as
+  "frame too small" and ended the track silently.
 - **SGR dedup state is separate from cursor state, on purpose.** `haveLast` is
   about cursor contiguity and is cleared at the end of every row; the emitted SGR
   survives that. `emitColor` keys off `sgrValid`/`sgrFG`/`sgrBG` instead, so a
@@ -347,8 +358,20 @@ wired wrong.
 ### Driving it without a real TTY
 
 Piped stdin gives misleading results (reopened `/dev/stdin` competes with fd 0).
-Use a pty: `/tmp/opencode/{ptydrive,termscreen,musiccheck,leakdecide,videockeck,
-silentcheck,hanghunt,leakhunt}.py` (recreate if wiped). Hard-won rules:
+Use a pty: `tools/ptysync.py` is in the repo, the rest live in
+`/tmp/opencode/{ptydrive,termscreen,musiccheck,leakdecide,videockheck,
+silentcheck,hanghunt,leakhunt}.py` (recreate if wiped).
+
+**`tools/ptysync.py` implements DEC 2026 and nothing else does.** It holds every
+byte written between `?2026h` and `?2026l` and only presents it at the `l`,
+which is what Ghostty does. A plain pty ignores the mode, so a program that opens
+it and never closes it looks *perfect* in every test and shows a black screen for
+the entire track in real use — which is exactly what happened. It prints
+`frames presented: N` and `still buffering at exit:` on stderr; N == 1 means the
+picture only appeared at exit.
+
+Never leave 2026 open across a select. Emit `syncOn` before the frame's first
+write and `syncOff` after the last one in the same iteration, then flush.
 
 - **Never run two at once** — they spawn/kill ffmpeg+mpv and reap each other's kids.
 - **A synthetic clip needs an audio stream** or mpv exits instantly.
