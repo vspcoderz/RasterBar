@@ -48,14 +48,34 @@ func looksLikeFile(arg string) bool {
 	if arg == "" {
 		return false
 	}
+	// A URL is never a file, whatever it contains.
+	//
+	// `hasGlobMeta` looks for `*?[`, and a YouTube link is full of question
+	// marks: `https://www.youtube.com/watch?v=ahx2kdqMWYE` read as a glob that
+	// matches nothing, so the answer was "no playable files in <the URL>". Short
+	// links like `https://youtu.be/x` have no query string and happened to work,
+	// which is why the documented example looked fine.
+	if looksLikeURL(arg) {
+		return false
+	}
 	if _, err := os.Stat(expandTilde(arg)); err == nil {
 		// A directory counts, deliberately: it is a path the user typed, so it is
-		// not a search query. loadPathArg then says "-l <dir>", which is the
+		// not a search query. loadPathArg then says "use list <dir>", which is the
 		// useful answer. Returning false here sent a bare directory to YouTube
 		// search, and the user got ten unrelated videos for a folder path.
 		return true
 	}
 	return hasGlobMeta(arg)
+}
+
+// looksLikeURL reports whether an argument is a link rather than a path.
+//
+// A scheme check rather than a contains-check on "://": a filename is allowed to
+// contain those characters, and a Windows path never has a scheme. http and https
+// only, because those are the two a media player has anything to do with.
+func looksLikeURL(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
 }
 
 // expandTilde turns a leading ~ into the home directory.

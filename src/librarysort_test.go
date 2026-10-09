@@ -337,3 +337,27 @@ func TestMusicModeForFallsBackOnlyForVideoLessFiles(t *testing.T) {
 		t.Error("an empty track asked for music left music mode")
 	}
 }
+
+// TestLooksLikeFileTreatsURLsAsURLs pins the query-string bug.
+//
+// hasGlobMeta looks for `*?[`, and a YouTube link is full of question marks:
+// `https://www.youtube.com/watch?v=ahx2kdqMWYE` read as a glob that matches
+// nothing, so the answer was "no playable files in <the URL>". Short links like
+// https://youtu.be/x have no query string and happened to work, which is why the
+// documented example looked fine and the real one never did.
+func TestLooksLikeFileTreatsURLsAsURLs(t *testing.T) {
+	for _, u := range []string{
+		"https://www.youtube.com/watch?v=ahx2kdqMWYE",
+		"https://youtu.be/dQw4w9WgXcQ",
+		"http://example.com/a?b=[c]",
+		"HTTPS://EXAMPLE.COM/x",
+	} {
+		if looksLikeFile(u) {
+			t.Errorf("looksLikeFile(%q) = true, want false: a URL is not a path", u)
+		}
+	}
+	// And a glob is still a glob.
+	if !looksLikeFile("/tmp/*.mp3") {
+		t.Error("a real glob stopped being a file intent")
+	}
+}

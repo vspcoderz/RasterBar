@@ -46,6 +46,12 @@ modes:
 
 options:
   -m, --mute         play audio muted (visualizer still animates)
+      --cookies FILE      a Netscape cookies.txt for yt-dlp
+      --cookies-from-browser NAME
+                          firefox, chrome, chromium, brave, edge, safari,
+                          opera. YouTube bot-checks by IP, and a signed-in
+                          browser is the only cure; see "yt-dlp and YouTube"
+                          below.
       --viz NAME     visualizer style (same as the viz verb)
       --palette NAME colour scheme (same as the palette verb)
   -c, --color        force colour (default: auto-detected from the terminal)
@@ -70,6 +76,17 @@ options:
   series -> season -> episode, and files without one sort by natural filename
   order, so "track 2" precedes "track 10". Audio containers count too:
   .mp3 .m4a .flac .opus .ogg .oga .wav .aac .wma as well as the video ones.
+
+  yt-dlp and YouTube: YouTube decides by IP whether you are a person. When it
+  decides you are not, every request — search and playback alike — comes back
+  "Sign in to confirm you're not a bot". The cure is yt-dlp's cookies:
+
+      rasterbar --cookies-from-browser brave "lofi"
+      export VSPZ_YT_CLI_COOKIES_FROM_BROWSER=brave   # once per shell
+
+  A cookies.txt also works, with --cookies FILE. Name a browser you are actually
+  signed into YouTube in — a profile with no session makes things worse rather
+  than better, and the error says so when that is what happened.
 
   requires: ffmpeg, mpv  (yt-dlp and ytfzf are needed only for search)
 
@@ -172,6 +189,11 @@ type options struct {
 	// use so a typo is an argument error instead of a silently ignored flag.
 	viz     string
 	palette string
+
+	// cookies hand yt-dlp a signed-in session. Needed on any machine YouTube has
+	// decided is a scraper, which is most machines eventually — see ytdlpAuth.
+	cookies     string
+	cookiesFrom string
 
 	// vizPrefs caches the resolved style/palette across the queue. Built by
 	// prefs() on demand and shared, so the `v` and `c` keys mutate one value.
@@ -322,6 +344,18 @@ func parseArgs(args []string) (options, error) {
 			o.noProbe = true
 		case "--play", "--now":
 			o.playOnly = true
+		case "--cookies":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--cookies needs a file (a Netscape cookies.txt)")
+			}
+			i++
+			o.cookies = expandTilde(args[i])
+		case "--cookies-from-browser", "--from-browser":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--cookies-from-browser needs a name: firefox, chrome, chromium, brave, edge, safari, opera")
+			}
+			i++
+			o.cookiesFrom = args[i]
 		default:
 			if strings.HasPrefix(a, "-") {
 				return o, fmt.Errorf("unknown flag: %s", a)
@@ -614,6 +648,18 @@ func main() {
 		fmt.Print(usage)
 		return
 	}
+
+	// The flag wins over the environment, and the file wins over the browser: the
+	// one that was stated most precisely. The environment is what makes this
+	// usable at all, because a machine under a bot check needs it on every single
+	// invocation and typing a flag each time is how people end up not doing it.
+	auth := ytdlpAuthFromEnv(os.Environ())
+	if opts.cookies != "" {
+		auth = ytdlpAuthConfig{FromFile: opts.cookies}
+	} else if opts.cookiesFrom != "" {
+		auth = ytdlpAuthConfig{FromBrowser: opts.cookiesFrom}
+	}
+	ytdlpAuth = auth
 
 	// Resolve colour mode: explicit flag wins, otherwise ask the terminal.
 	colorMode := opts.color

@@ -286,6 +286,7 @@ Rules of thumb, each of which was a bug first:
 ```
 main.go      verbs + arg parsing, playQueue (owns the queue index; playTrack never mutates it)
 search.go    ytfzf/yt-dlp search -> []Track       library.go  dir scan -> []Track
+ytdlpauth.go yt-dlp cookies + actionable errors
 playlist.go  file args, globs, .m3u -> []Track    naturalsort.go  filename order
 tui.go       browse list (+ line-mode fallback)   session.go  trackSession, decoder goroutine, render loop
 player.go    Player: transport, byte routing, : prompt   sync.go  SyncPlayer: ffmpeg video + mpv audio
@@ -313,6 +314,16 @@ would force exporting it all.
   them in `parseArgs` is what made `rasterbar ~/Music/song.mp3` a YouTube search
   for that string. `-l`/`list` beats file args outright, since a directory scan
   has its own walk and parser.
+- **A URL is never a path, whatever it contains.** `hasGlobMeta` looks for
+  `*?[`, and `https://www.youtube.com/watch?v=X` is full of question marks, so it
+  read as a glob that matched nothing. `https://youtu.be/x` has no query string
+  and happened to work, which is why the documented example was fine and the real
+  one never was.
+- **One yt-dlp argument list, or a setting that only reaches some paths.** There
+  are three yt-dlp invocations (search, metadata, playback) and they all build
+  their args through `ytdlpAuth.run`. YouTube bot-checks by IP, so a flagged
+  machine needs cookies *everywhere*; a flag added to one call site is a bug
+  report that depends on which path the user was on.
 - **"No paths" and "not a file intent" are different answers.** `expandFileArgs`
   returning an empty slice used to be read as "nothing playable", which killed
   every YouTube search with "no playable files in lofi hip hop radio". It returns

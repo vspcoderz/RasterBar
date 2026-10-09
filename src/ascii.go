@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os/exec"
-	"strings"
 )
 
 // ASCII video + visualizer. No image libraries: ffmpeg emits raw grayscale
@@ -211,12 +209,9 @@ func resolveMedia(track Track, sourceH int, wantTap bool) (mediaPair, error) {
 		}, nil
 	}
 
-	cmd := exec.Command("yt-dlp", "-J", "--no-warnings", "--no-playlist", track.URL)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := ytdlpAuth.run("-J", "--no-warnings", "--no-playlist", track.URL)
 	if err != nil {
-		return mediaPair{}, fmt.Errorf("yt-dlp -J: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return mediaPair{}, fmt.Errorf("yt-dlp -J: %w", err)
 	}
 
 	var info ytInfo
@@ -309,12 +304,9 @@ func resolveAudioPair(track Track) (mediaPair, error) {
 // split view needs metadata out of a call it was not previously using for that.
 // Three copies of a subprocess invocation is three places to fix a flag.
 func ytdlpInfo(track Track) (ytInfo, error) {
-	cmd := exec.Command("yt-dlp", "-J", "--no-warnings", "--no-playlist", track.URL)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := ytdlpAuth.run("-J", "--no-warnings", "--no-playlist", track.URL)
 	if err != nil {
-		return ytInfo{}, fmt.Errorf("yt-dlp -J: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return ytInfo{}, fmt.Errorf("yt-dlp -J: %w", err)
 	}
 	var info ytInfo
 	if err := json.Unmarshal(out, &info); err != nil {

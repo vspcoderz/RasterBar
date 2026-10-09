@@ -110,6 +110,24 @@ go build -ldflags="-s -w" -o rasterbar ./src
 **Requires** `ffmpeg` and `mpv` on `$PATH`. Searching YouTube additionally wants
 `yt-dlp` and `ytfzf`.
 
+### If YouTube says "Sign in to confirm you're not a bot"
+
+YouTube decides by IP whether you are a person, and a flagged machine gets that
+error on *every* request — search and playback alike. Nothing in this program can
+work around it; `yt-dlp` needs the cookies of a browser you are signed into.
+
+```sh
+rasterbar --cookies-from-browser chromium "lofi hip hop"
+export VSPZ_YT_CLI_COOKIES_FROM_BROWSER=chromium   # once per shell, done
+```
+
+A `cookies.txt` also works: `rasterbar --cookies FILE`.
+
+Name a browser you are actually logged into YouTube in. A profile with no
+session — Brave and Chrome on this machine have none, for instance — fails with
+"could not find cookies database", and the program says so rather than sending
+you round in circles.
+
 ## Use
 
 ```sh

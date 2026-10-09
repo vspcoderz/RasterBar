@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 
 	"github.com/vspcoderz/rasterbar/internal/term"
@@ -119,14 +118,11 @@ func Search(query string) ([]Track, error) {
 }
 
 func searchYtDlp(query string) ([]Track, error) {
-	cmd := exec.Command("yt-dlp",
+	out, err := ytdlpAuth.run(
 		fmt.Sprintf("ytsearch10:%s", query),
 		"--dump-json", "--flat-playlist", "--no-warnings")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("yt-dlp search: %w: %s", err, stderr.String())
+		return nil, fmt.Errorf("yt-dlp search: %w", err)
 	}
 	return parseYtdlp(out)
 }
