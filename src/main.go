@@ -18,7 +18,7 @@ usage:
 
 modes:
   -M, --music       music mode: the visualizer replaces the video (default)
-  -a, --ascii       video mode: ASCII/colour video with a spectrum strip
+  -a, --ascii       video mode: ASCII/colour video (the strip is off; press s)
 
 options:
   -m, --mute         play audio muted (visualizer still animates)
@@ -39,15 +39,27 @@ options:
       --rows N       force ASCII grid height (default: from terminal height)
   -h, --help         this help
 
+playing files (as well as searching):
+  rasterbar song.mp3 b.opus        these files, in this order
+  rasterbar ~/Music/*.flac         a glob, quoted or not
+  rasterbar roadtrip.m3u           an m3u/m3u8 playlist, entries relative to it
+
+  An argument becomes a file when it exists, contains a wildcard, or names a
+  playlist. Anything else is a YouTube search, so "lofi hip hop radio" still
+  searches. A file with no video stream plays as a visualiser whichever mode you
+  asked for, because there is no picture to show.
+
 library mode (browse a directory instead of searching):
-  -l, --library DIR  scan DIR for video files, ordered series/season/episode
+  -l, --library DIR  scan DIR for media files
       --no-probe     skip the ffprobe pass (instant scan, "--:--" durations)
-      --play         start the first episode without the browse list
+      --play         start the first track without the browse list
 
   Filenames are parsed for series, season and episode, so "Show S01E02.mkv",
   "Show - 01x02.mkv", "Show - 07 [1080p].mkv" and "Show Episode 7.mkv" all
-  land in a watchable order. A file with no episode marker is skipped rather
-  than placed arbitrarily.
+  land in a watchable order. Files with no episode marker are still included,
+  ordered by natural filename order -- so "track 2" precedes "track 10", which
+  is the whole reason a music folder works here at all. Audio containers count:
+  .mp3 .m4a .flac .opus .ogg .oga .wav .aac .wma and the video ones.
 
   requires: ffmpeg, mpv  (yt-dlp and ytfzf are needed only for search)
 
@@ -70,20 +82,25 @@ keys (playback, both modes):
   < / >            seek -60s / +60s
   [ / ]            previous / next chapter
   :                jump to a timestamp
-  n / p            next / previous result
+  n / p            next / previous track
   + / -            volume up / down
+  q / ctrl-c       quit
+
+  s                toggle the spectrum strip (video mode: off by default.
+                   In music mode the strip is part of the visualiser, and s
+                   gives its row back to the grid)
+
+keys (playback, music mode only):
   v / V            next / previous visualizer style
   c                next colour palette
   1 - 0            pick a palette directly: 1 spectrum, 2 height, 3 ocean,
                    4 ember, 5 graphite, 6 ink, 7 ice, 8 magma, 9 viridis,
                    0 mono
-  s                toggle the spectrum strip under the video
-  W                split view: show video beside the visualiser (music mode,
-                   off by default)
+  W                split view: show video beside the visualiser (off by
+                   default; needs a source with a video stream)
   a / d            move the video pane to the left / right
   T                video pane: still thumbnail / live video
   { / }            move the split divider
-  q / ctrl-c       quit
 
   The jump prompt takes 1:30, 1:02:03, a bare 90 (seconds), 90s / 2m / 1h2m3s,
   +30 / -1:30 (relative to now), and 50% (of the track). It previews where the
@@ -103,15 +120,22 @@ keys (playback, both modes):
 
 tuned for low-end machines: video mode requests a 360p h264 source because
 ffmpeg decode cost scales with resolution, and an 80x22 character grid cannot
-show the difference between 360p and 1080p. The spectrum is computed in-process
-with a hand-rolled FFT, so there are no third-party Go modules. The expensive
-styles (radial, particles) are capped rather than disabled: particles never
-exceed 400, and both styles cost the same on a large terminal as on a small one.
+show the difference between 360p and 1080p. Video is letterboxed rather than
+stretched, so the picture keeps its own shape whatever shape your window is. The
+spectrum is computed in-process with a hand-rolled FFT, so there are no
+third-party Go modules. The expensive styles (radial, particles) are capped
+rather than disabled: particles never exceed 400, and on a large grid radial
+draws at a fraction of the frame rate rather than at none.
 
 requires: yt-dlp, ffmpeg, mpv  (ytfzf optional, used as the primary scraper)
 `
 
 type options struct {
+	// args holds the positional arguments in the order given. Resolved into
+	// either a file queue or a search query in main.
+	args []string
+	// query is the joined positional text, set only once main has established
+	// that none of the arguments names a file.
 	query    string
 	mute     bool
 	ascii    bool
@@ -162,6 +186,13 @@ func (o *options) prefs() *vizPrefs {
 // colorAuto requests terminal capability detection.
 const colorAuto ColorMode = -1
 
+// parseArgs turns argv into options.
+//
+// The positional arguments land in o.args and are NOT joined into a query. That
+// split is the whole reason `rasterbar song.mp3 b.opus` can be a queue: deciding
+// between "three search terms" and "two files" needs the filesystem, which this
+// function has no business touching. main joins them into a query only when none
+// of them names a file.
 func parseArgs(args []string) (options, error) {
 	o := options{color: colorAuto}
 	for i := 0; i < len(args); i++ {
@@ -277,14 +308,49 @@ func parseArgs(args []string) (options, error) {
 			if strings.HasPrefix(a, "-") {
 				return o, fmt.Errorf("unknown flag: %s", a)
 			}
-			if o.query != "" {
-				o.query += " " + a
-			} else {
-				o.query = a
-			}
+			// Positional arguments are collected, not joined. Whether they are a
+			// search query or a list of files is decided in main, because it needs
+			// the filesystem: joining them here would turn `song.mp3 b.opus` into
+			// the single string "song.mp3 b.opus" and then into a YouTube search
+			// for that string, which is what used to happen.
+			o.args = append(o.args, a)
 		}
 	}
 	return o, nil
+}
+
+// expandFileArgs turns positional arguments that name files into a queue of
+// paths, in order.
+//
+// The decision is "does at least one argument look like a file", not "does every
+// argument" — `rasterbar b.opus lofi hip hop` is a mixed intent, and taking the
+// file and searching for the rest would be two players. When any argument looks
+// like a file, all of them are treated as paths and the ones that are not get an
+// error naming them, which is honest. When none does, it is a search.
+func expandFileArgs(args []string) ([]string, error) {
+	any := false
+	for _, a := range args {
+		if looksLikeFile(a) {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return nil, nil
+	}
+
+	var out []string
+	for _, a := range args {
+		paths, isFile, err := loadPathArg(a, 0)
+		if err != nil {
+			return nil, err
+		}
+		if !isFile {
+			return nil, fmt.Errorf("%q is not a file, a glob or a playlist", a)
+		}
+		out = append(out, paths...)
+	}
+	return out, nil
 }
 
 func main() {
@@ -297,7 +363,31 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
 		os.Exit(2)
 	}
-	if opts.query == "" && opts.library == "" {
+
+	// Decide what the positional arguments are before anything else needs to know:
+	// a list of files, or text to search YouTube for.
+	//
+	// -l wins outright when both are given, because a directory scan has its own
+	// walk and its own episode parser and a file list would only duplicate them.
+	var filePaths []string
+	if opts.library == "" && len(opts.args) > 0 {
+		filePaths, err = expandFileArgs(opts.args)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if len(filePaths) == 0 {
+			// Every argument looked like a path and none of them resolved to a
+			// playable file. Saying so beats falling back to a YouTube search for
+			// the user's own filename, which is what used to happen.
+			fmt.Fprintf(os.Stderr, "no playable files in %s\n", strings.Join(opts.args, " "))
+			os.Exit(1)
+		}
+	} else {
+		opts.query = strings.Join(opts.args, " ")
+	}
+
+	if len(filePaths) == 0 && opts.library == "" && opts.query == "" {
 		fmt.Print(usage)
 		return
 	}
@@ -308,12 +398,14 @@ func main() {
 		colorMode = detectColor(envSlice())
 	}
 
-	// Two sources, one Track shape: a network search or a directory scan. The
-	// library branch deliberately skips Search entirely rather than both
-	// filling a slice, because there is no query to hand a scraper.
+	// Three sources, one Track shape: a network search, a directory scan, or a
+	// list of files the user named. The library branch deliberately skips Search
+	// entirely rather than both filling a slice, because there is no query to hand
+	// a scraper; the same goes for explicit files.
 	var tracks []Track
 	label := opts.query
-	if opts.library != "" {
+	switch {
+	case opts.library != "":
 		label = opts.library
 		fmt.Fprintf(os.Stderr, "scanning library: %s\n", opts.library)
 		tracks, err = ScanLibrary(opts.library, !opts.noProbe)
@@ -322,11 +414,17 @@ func main() {
 			os.Exit(1)
 		}
 		if len(tracks) == 0 {
-			fmt.Fprintf(os.Stderr, "no playable files with an episode number under %s\n", opts.library)
+			fmt.Fprintf(os.Stderr, "no playable files under %s\n", opts.library)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "%d episodes\n", len(tracks))
-	} else {
+		fmt.Fprintf(os.Stderr, "%d tracks\n", len(tracks))
+
+	case len(filePaths) > 0:
+		tracks = tracksFromPaths(filePaths)
+		label = fmt.Sprintf("%d files", len(tracks))
+		fmt.Fprintf(os.Stderr, "%d files: %s\n", len(tracks), strings.Join(opts.args, " "))
+
+	default:
 		fmt.Fprintf(os.Stderr, "searching: %s\n", opts.query)
 		tracks, err = Search(opts.query)
 		if err != nil {
@@ -351,8 +449,15 @@ func main() {
 	}
 
 	// --play skips the browse list, so there is no keypress to request video mode.
-	// Default it on: asking for a library episode and getting a spectrum alone
-	// would not be what anyone wanted.
+	// Default it on for a library: asking for a library episode and getting a
+	// spectrum alone would not be what anyone wanted.
+	//
+	// NOT for an explicit file list. A file named on the command line is a
+	// deliberate act, and the common case is a song: `rasterbar track.mp3` asking
+	// for ASCII video of a file with no video stream used to kill playback on the
+	// first track and take the rest of the queue with it. newTrackSession also
+	// falls back per-track on a probe, so this is belt and braces — but the
+	// default should be right for the folder it is applied to, not repaired later.
 	wantVideo := opts.ascii || (opts.playOnly && opts.library != "")
 	if action == ActionASCII {
 		wantVideo = true

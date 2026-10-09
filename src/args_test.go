@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,8 +21,11 @@ func TestParseArgsQualityAndLayout(t *testing.T) {
 	if o.cols != 120 {
 		t.Errorf("cols = %d, want 120", o.cols)
 	}
-	if o.query != "lofi" {
-		t.Errorf("query = %q", o.query)
+	// Positional arguments are NOT joined here any more. Whether they are a search
+	// query or a list of files needs the filesystem, so parseArgs collects them and
+	// main decides. TestParseArgsFileArgsAndQuery pins the joining.
+	if len(o.args) != 1 || o.args[0] != "lofi" {
+		t.Errorf("args = %v, want [lofi]", o.args)
 	}
 
 	// Reject nonsense values instead of silently ignoring them.
@@ -98,8 +104,8 @@ func TestParseArgs(t *testing.T) {
 	if !o.mute {
 		t.Error("-m not set")
 	}
-	if o.query != "lofi hip hop" {
-		t.Errorf("query = %q", o.query)
+	if got := strings.Join(o.args, " "); got != "lofi hip hop" {
+		t.Errorf("args joined = %q", got)
 	}
 	if _, err := parseArgs([]string{"-x", "q"}); err == nil {
 		t.Error("want error on unknown flag")
@@ -108,7 +114,65 @@ func TestParseArgs(t *testing.T) {
 		t.Error("-h should signal help")
 	}
 	o2, _ := parseArgs([]string{"-a", "song"})
-	if !o2.ascii || o2.query != "song" {
+	if !o2.ascii || len(o2.args) != 1 || o2.args[0] != "song" {
 		t.Errorf("got %+v", o2)
+	}
+}
+
+// TestParseArgsFileArgsAndQuery pins the decision main makes with the collected
+// arguments: a name that exists on disk becomes a file, and anything else stays
+// text to search YouTube for.
+//
+// This is the behaviour that regressed before. The arguments used to be joined
+// inside parseArgs, so `rasterbar ~/Music/song.mp3` searched YouTube for that
+// string and returned ten unrelated videos.
+func TestParseArgsFileArgsAndQuery(t *testing.T) {
+	dir := t.TempDir()
+	song := filepath.Join(dir, "nocturne.opus")
+	if err := os.WriteFile(song, []byte("not really audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A real file: files, not a query.
+	o, err := parseArgs([]string{song})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, ferr := expandFileArgs(o.args)
+	if ferr != nil {
+		t.Fatalf("expandFileArgs: %v", ferr)
+	}
+	if len(paths) != 1 || paths[0] != song {
+		t.Errorf("paths = %v, want [%s]", paths, song)
+	}
+
+	// Plain words: no file, so the query path stays intact.
+	o2, err := parseArgs([]string{"lofi", "hip", "hop"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err2 := expandFileArgs(o2.args)
+	if err2 != nil {
+		t.Fatalf("expandFileArgs: %v", err2)
+	}
+	if len(p2) != 0 {
+		t.Errorf("a search query resolved to files: %v", p2)
+	}
+	if q := strings.Join(o2.args, " "); q != "lofi hip hop" {
+		t.Errorf("query = %q", q)
+	}
+}
+
+// TestExpandFileArgsRejectsMixedInput pins the mixed case: once any argument
+// names a file, every argument is a path, and the one that is not gets named in
+// the error rather than silently becoming a search.
+func TestExpandFileArgsRejectsMixedInput(t *testing.T) {
+	dir := t.TempDir()
+	song := filepath.Join(dir, "a.mp3")
+	if err := os.WriteFile(song, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := expandFileArgs([]string{song, "lofi"}); err == nil {
+		t.Fatal("want an error for a mixed file/search argument list")
 	}
 }

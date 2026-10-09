@@ -240,15 +240,6 @@ func (g *VizGrid) MonoFrame() []byte {
 	return out
 }
 
-// vizPixPerCell maps the glyph layout to the renderer's pixel count, so the grid
-// writes the frame in the layout the renderer is going to read.
-func vizPixPerCell(glyph GlyphMode) int {
-	if glyph == GlyphHalf {
-		return 2
-	}
-	return 1
-}
-
 // ColorFrame expands the grid to the rgb24 layout ColorDiffRenderer expects.
 //
 // The layout is the one startVideoTap's filter produces, which is what the

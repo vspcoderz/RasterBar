@@ -115,10 +115,27 @@ go build -ldflags="-s -w" -o rasterbar ./src
 ```sh
 rasterbar "lofi hip hop radio"     # search and play
 rasterbar https://youtu.be/...    # a URL
-rasterbar -l ~/Music -M            # browse a folder as a visualiser
-rasterbar -l ~/Music --play       # start playing immediately
 rasterbar -a -c "tesseract"        # ASCII/colour video mode
 ```
+
+Or point it at files instead of a search:
+
+```sh
+rasterbar track.mp3 prelude.opus   # these files, in this order
+rasterbar ~/Music/*.flac           # a glob
+rasterbar roadtrip.m3u             # an m3u/m3u8 playlist
+rasterbar -l ~/Shows --play        # browse a folder, start immediately
+```
+
+An argument is treated as a file when it exists, contains a wildcard, or names a
+playlist — anything else is a YouTube search, so `"lofi hip hop radio"` still
+does what it looks like. A file with no video stream plays as a visualiser no
+matter which mode you asked for, since there is no picture to show.
+
+`-l` orders a directory two ways at once: files with an episode marker sort
+series → season → episode, and files without one sort by natural filename order,
+so `track 2` comes before `track 10`. That is what makes a music folder browsable
+here rather than invisible.
 
 ### Keys while playing
 
@@ -130,17 +147,22 @@ rasterbar -a -c "tesseract"        # ASCII/colour video mode
 | `<` `>` | seek ∓60s |
 | `[` `]` | previous / next chapter |
 | `:` | jump to a timestamp |
-| `n` `p` | next / previous result |
+| `n` `p` | next / previous track |
 | `+` `-` | volume |
+| `s` | toggle the spectrum strip |
+| `q` / `ctrl-c` | quit |
+
+Music mode only — there is no visualiser in video mode:
+
+| key | |
+|---|---|
 | `v` `V` | next / previous visualiser |
 | `c` | next palette |
 | `1`–`9` `0` | pick a palette directly |
-| `s` | toggle the spectrum strip |
-| `W` | split view: video beside the visualiser (music mode, off by default) |
+| `W` | split view: video beside the visualiser (off by default) |
 | `a` `d` | move the video pane left / right |
 | `T` | video pane: still thumbnail / live video |
 | `{` `}` | move the split divider |
-| `q` | quit |
 
 ### Keys while browsing
 
@@ -186,6 +208,15 @@ earlier versions of that gate passed on synthesised tones and were wrong on musi
 **It fits your terminal.** Grid width, height, source resolution and frame rate
 are all derived from the window size, so a small window doesn't ask ffmpeg for a
 4K stream. `TIOCGWINSZ` is watched, and a resize rebuilds the decoder.
+
+**Video is letterboxed, not stretched.** The picture keeps its own proportions
+whatever shape your window is. It didn't used to: the filter scaled straight to
+the cell grid, so a square in a 16:9 frame rendered 0.57:1 on screen — squashed
+by 43%, which is invisible in a shot and glaring in a title card.
+
+**Frames are presented atomically.** Every frame is wrapped in DEC mode 2026, so
+the terminal shows a finished picture rather than a half-painted one. Terminals
+that don't implement it ignore it.
 
 ## License
 

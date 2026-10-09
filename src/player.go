@@ -803,6 +803,17 @@ func (r *keyRouter) feed(chunk []byte, pos, dur float64) keyResult {
 	for len(r.buf) > 0 {
 		if r.pr.open {
 			used, act := r.pr.consume(r.buf)
+			// consume counts against the slice it was handed, so used <= len(r.buf)
+			// is an invariant. Clamped anyway: this slicing happens inside the
+			// render loop with children running, and the cost of a wrong count here
+			// is a panic rather than a dropped key. A clamp that can only ever
+			// trigger on a bug is the right kind of paranoia at this boundary.
+			if used < 0 {
+				used = 0
+			}
+			if used > len(r.buf) {
+				used = len(r.buf)
+			}
 			r.buf = append(r.buf[:0], r.buf[used:]...)
 			switch act {
 			case promptSubmit:
@@ -910,13 +921,32 @@ func (p *prompt) text() string { return string(p.buf) }
 // `:1:30<CR>` arrives as one chunk, and the bytes after the Enter have to go
 // back to the transport rather than being swallowed by a field that has already
 // closed.
+//
+// The returned count is always measured against **chunk**, the slice the caller
+// passed, never against the escape prefix this may have prepended. The caller
+// advances its own buffer by that count, and the held prefix is not in the
+// caller's buffer to advance past. Counting the combined length made `:` followed
+// by an arrow whose three bytes split as `ESC [` / `C` return 3 against a
+// one-byte buffer — `slice bounds out of range [3:1]`, a panic inside the render
+// loop with ffmpeg and mpv still running. `held` is therefore subtracted on every
+// path out.
 func (p *prompt) consume(chunk []byte) (int, promptAction) {
 	// A held escape prefix from the previous read goes in front, so the loop
 	// below sees one contiguous burst. Cleared first: whatever it holds has been
 	// consumed by this call either way.
-	if len(p.escTail) > 0 {
+	held := len(p.escTail)
+	if held > 0 {
 		chunk = append(p.escTail, chunk...)
 		p.escTail = nil
+	}
+	// used maps a position in the combined slice back onto the caller's slice.
+	// Positions before the prefix are already gone, so they clamp to 0.
+	used := func(i int) int {
+		n := i - held
+		if n < 0 {
+			return 0
+		}
+		return n
 	}
 	for i := 0; i < len(chunk); {
 		c := chunk[i]
@@ -936,19 +966,19 @@ func (p *prompt) consume(chunk []byte) (int, promptAction) {
 				// of escape bytes cannot grow this without limit.
 				if len(chunk)-i <= promptEscLimit {
 					p.escTail = append(p.escTail[:0], chunk[i:]...)
-					return len(chunk), promptNone
+					return used(len(chunk)), promptNone
 				}
 			}
 			p.stop()
-			return i + 1, promptCancel
+			return used(i + 1), promptCancel
 
 		case '\r', '\n':
 			p.stop()
-			return i + 1, promptSubmit
+			return used(i + 1), promptSubmit
 
 		case 0x03: // ctrl-c
 			p.stop()
-			return i + 1, promptCancel
+			return used(i + 1), promptCancel
 
 		case 0x7f, 0x08: // backspace, and the ctrl-h some terminals send
 			if len(p.buf) > 0 {
@@ -970,7 +1000,7 @@ func (p *prompt) consume(chunk []byte) (int, promptAction) {
 			i++
 		}
 	}
-	return len(chunk), promptNone
+	return used(len(chunk)), promptNone
 }
 
 // seqEnd returns the length of a complete cursor sequence at the front of b, or

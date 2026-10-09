@@ -117,6 +117,66 @@ func TestHudStripAddsARow(t *testing.T) {
 //
 // Widths are swept because the ramp index that a given level maps to depends on
 // the value, so a single level would only ever expose one control character.
+// TestMiniBarsPeakCapsAreReachable pins the peak-cap threshold against the decay
+// rates it has to beat.
+//
+// The old test was `p > v+0.5`. Visualizer.Push decays level by 0.82 and peak by
+// 0.93 per analysis, so after a transient the gap converges to (peak-level) where
+// 0.93p - 0.82v = p - v, i.e. p*(1-0.93) = v*(1-0.82) -> p/v = 0.18/0.07 = 2.57.
+// Starting level from peak, the gap peaks at about 0.36 and then decays — it
+// never reaches 0.5, so the cap glyph was unreachable and the strip never drew
+// one. It looked like a working feature because the code was there and correct
+// apart from a threshold nobody had checked against the decay it lives with.
+func TestMiniBarsPeakCapsAreReachable(t *testing.T) {
+	const cols = 200
+	peakOnly := make([]float64, cols)
+	for i := range peakOnly {
+		peakOnly[i] = 1
+	}
+	v := &Visualizer{level: make([]float64, cols), peak: make([]float64, cols)}
+	v.Push(peakOnly)
+
+	drewCap := false
+	maxGap := 0.0
+	// 40 analyses is well past the point the gap stops growing.
+	for step := 0; step < 40; step++ {
+		// No new input: this is pure decay, the case a cap has to survive.
+		v.PushScalar(0)
+		bar := miniBars(v.Level(), cols, v.Peak())
+		for _, c := range bar {
+			if c == rune(ramp[rampBright]) {
+				drewCap = true
+			}
+		}
+		peaks, levels := v.Peak(), v.Level()
+		for i := range levels {
+			if g := peaks[i] - levels[i]; g > maxGap {
+				maxGap = g
+			}
+		}
+	}
+	if !drewCap {
+		t.Errorf("no peak cap drawn in 40 decay steps; peak-level peaked at %.3f, "+
+			"which the cap threshold never reaches", maxGap)
+	}
+}
+
+// TestMiniBarsCapsOnASilentTrack is the same question asked of the case that
+// matters: a cap should not be drawn where there is nothing to cap. A guard the
+// other way round — one that fires on silence — would be its own bug, and this is
+// the assertion that catches loosening the threshold too far.
+func TestMiniBarsCapsOnASilentTrack(t *testing.T) {
+	const cols = 64
+	level := make([]float64, cols)
+	peak := make([]float64, cols)
+	bar := miniBars(level, cols, peak)
+	for _, c := range bar {
+		if c == rune(ramp[rampBright]) {
+			t.Fatal("a silent track drew a peak cap")
+		}
+	}
+}
+
 func TestHudLinesCarryNoControlCharacters(t *testing.T) {
 	for _, width := range []int{20, 80, 192} {
 		for _, level := range []float64{0, 0.15, 0.5, 0.85, 1} {

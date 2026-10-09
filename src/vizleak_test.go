@@ -127,7 +127,7 @@ func TestVisualizerGridScreenMatchesLastFrameColor(t *testing.T) {
 				r := newColorRenderer(sc, cols, rows, mode, glyph)
 				viz := &barsViz{}
 				viz.Resize(cols, rows)
-				g := NewVizGrid(cols, rows, true, vizPixPerCell(glyph))
+				g := NewVizGrid(cols, rows, true, perCellFor(ColorTrue, glyph))
 				g.SetPalette(paletteAt(0))
 
 				var last []byte

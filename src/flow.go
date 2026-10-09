@@ -27,12 +27,18 @@ import (
 // when the answer is no.
 func fdWritable(f *os.File) bool {
 	fd := int(f.Fd())
-	if fd < 0 || fd >= 64*64 {
-		// Beyond the FdSet bitmap, or not a real fd. Assume writable rather than
-		// stalling playback on a technicality.
+	// Beyond the FdSet bitmap, or not a real fd. Assume writable rather than
+	// stalling playback on a technicality.
+	//
+	// The bound is len(set.Bits)*64 and not a round number: FdSet.Bits is
+	// [16]int64 on linux/amd64, so it holds 1024 fds. The old 64*64 guard let
+	// fds 1024..4095 through to set.Bits[fd/64], which indexes past the array and
+	// panics in the render loop. Unreachable with a normal stdout, which is
+	// exactly why it survived — the constant was wrong rather than the code.
+	var set syscall.FdSet
+	if fd < 0 || fd >= len(set.Bits)*64 {
 		return true
 	}
-	var set syscall.FdSet
 	set.Bits[fd/64] |= 1 << (uint(fd) % 64)
 	var tv syscall.Timeval // zero: return immediately
 	n, err := syscall.Select(fd+1, nil, &set, nil, &tv)

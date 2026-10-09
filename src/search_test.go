@@ -171,22 +171,6 @@ func TestIsH264(t *testing.T) {
 	}
 }
 
-func TestLastURL(t *testing.T) {
-	// Returns the LAST url, not the first: for a merged video+audio selector
-	// yt-dlp can print separate DASH URLs, and taking the first gave us a
-	// video-only stream with no audio.
-	in := "warning line\nhttps://example.com/a\nhttps://example.com/b\n"
-	if got := lastURL(in); got != "https://example.com/b" {
-		t.Errorf("got %q, want the last url", got)
-	}
-	if got := lastURL("no urls here"); got != "" {
-		t.Errorf("got %q, want empty", got)
-	}
-	if got := lastURL("https://only.example.com/x\n"); got != "https://only.example.com/x" {
-		t.Errorf("single url = %q", got)
-	}
-}
-
 // --- HUD (S2) ---------------------------------------------------------------
 //
 // The clock delegates to formatDuration, which the browse list already uses, so

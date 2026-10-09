@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // splitMinFrac and splitMaxFrac bound the divider.
@@ -438,11 +439,27 @@ func startThumbnail(thumbURL string, cols, rows int, mode ColorMode, glyph Glyph
 		return nil, fmt.Errorf("thumbnail start: %w", err)
 	}
 	frame := make([]byte, size)
-	// One frame only, so this cannot block indefinitely; the read is bounded by
-	// the image size rather than by a duration.
+	// One frame only, so the read is bounded by the image size rather than by a
+	// duration. The Wait is still bounded: a thumbnail fetch that hangs — a
+	// network image URL that stops responding, an ffmpeg wedged on a decode — used
+	// to block the render-loop goroutine forever, which parks the render loop and
+	// takes `q` with it. SyncPlayer.Close and LevelTap.Close are both bounded by
+	// childReapTimeout for the same reason; this is the third child and it was the
+	// only one that was not.
 	_, readErr := io.ReadFull(out, frame)
 	_ = out.Close()
-	_ = cmd.Wait()
+	reaped := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(reaped)
+	}()
+	select {
+	case <-reaped:
+	case <-time.After(childReapTimeout):
+		if debugQueue {
+			fmt.Fprintf(os.Stderr, "thumbnail ffmpeg did not exit within %v\n", childReapTimeout)
+		}
+	}
 	if readErr != nil {
 		return nil, fmt.Errorf("thumbnail read: %w", readErr)
 	}
@@ -485,24 +502,80 @@ func fillPaneBackground(buf []byte, cols, rows int, mode ColorMode, glyph GlyphM
 // videoTapGeometry is the ffmpeg filter, pixel format and frame size for a grid or
 // pane of this geometry. Shared with startVideoTap so the live pane and the
 // thumbnail cannot disagree about layout.
+//
+// Aspect is preserved, not fitted. A bare `scale=W:H` stretches the source to
+// whatever shape the grid happens to be, which is never the source's shape:
+// measured on a 16:9 frame containing a centred square, `scale=100:50` renders
+// that square 0.57:1 on screen — squashed by 43%. Nothing noticed, because a shot
+// rarely has a straight edge to measure against, and `--aspect` had been the
+// workaround: a flag that guesses a cell ratio so the picture comes out roughly
+// right.
+//
+// force_original_aspect_ratio=decrease fits the picture inside the grid and the
+// pad centres it on black. Both halves are needed. The scale alone letterboxes on
+// the sides only; the pad alone would stretch whatever did not fit.
+//
+// The output is still exactly cols*rows (or cols*outRows) pixels, so every byte
+// count here, and TestVideoTapGeometryMatchesPaneFrames, hold unchanged.
 func videoTapGeometry(cols, rows, fps int, mode ColorMode, glyph GlyphMode) (filter, pixFmt string, frameBytes int) {
+	pixFmt = "rgb24"
+	if mode == ColorNone {
+		pixFmt = "gray"
+	}
+	outRows := rows
+	if mode != ColorNone && glyph == GlyphHalf {
+		outRows = rows * 2
+	}
+
 	var parts []string
 	if fps > 0 {
 		parts = append(parts, fmt.Sprintf("fps=%d", fps))
 	}
-	if mode == ColorNone {
-		parts = append(parts,
-			fmt.Sprintf("scale=%d:%d:flags=area", cols, rows),
-			"unsharp=5:5:0.7:5:5:0.0",
-			"format=gray")
-		return strings.Join(parts, ","), "gray", cols * rows
+	parts = append(parts, letterbox(cols, outRows, pixFmt),
+		// The same edge contrast the mono path has had all along. The colour
+		// branch was written without it and nothing caught the asymmetry,
+		// because both paths look plausible on their own.
+		"unsharp=5:5:0.7:5:5:0.0")
+
+	frameBytes = cols * outRows
+	if pixFmt == "rgb24" {
+		frameBytes *= 3
 	}
-	outRows := rows
-	if glyph == GlyphHalf {
-		outRows = rows * 2
-	}
-	parts = append(parts,
-		fmt.Sprintf("scale=%d:%d:flags=area", cols, outRows),
-		"format=rgb24")
-	return strings.Join(parts, ","), "rgb24", cols * outRows * 3
+	return strings.Join(parts, ","), pixFmt, frameBytes
+}
+
+// letterbox is the fit-and-pad half of videoTapGeometry, sized to this grid.
+//
+// The filter ORDER is load-bearing, and getting it wrong is quiet: ffmpeg fails
+// with "Padded dimensions cannot be smaller than input dimensions", the video
+// tap reports that as "read first frame: EOF", and the split pane simply never
+// appears. Three things have to be in this order, each for its own reason.
+//
+//	setsar=1
+//	  Fitting with force_original_aspect_ratio picks a scale that leaves a
+//	  *fractional* pixel aspect: a 320x180 source into a 49x70 grid becomes
+//	  49x28 with sar 64/63. pad compares display dimensions — 49 * 64/63 =
+//	  49.78, which rounds up to 50 — and refuses to pad a 50-wide image into
+//	  49 columns. Resetting the SAR is also just correct: the cell grid *is*
+//	  the pixel grid, and a non-square sample aspect there would stretch the
+//	  picture a second time after all.
+//
+//	format=<pixFmt>
+//	  Must land BETWEEN setsar and pad. With `pad,unsharp,format` the pad
+//	  refuses to configure; with `format,pad,unsharp` it configures and emits
+//	  exactly the right byte count. Verified across 24 geometry/format
+//	  combinations — see TestVideoTapFilterByteCountAcrossGeometries, which
+//	  exists because the first version of this filter was tested at one
+//	  geometry and 100x50 happened to be the one that worked.
+//
+//	pad=W:H:(ow-iw)/2:(oh-ih)/2
+//	  The fit alone letterboxes on the sides only; the pad alone would stretch
+//	  whatever did not fit. Together they make the output exactly WxH, which is
+//	  the contract the compositor and the diff cache are written against.
+func letterbox(cols, rows int, pixFmt string) string {
+	return fmt.Sprintf(
+		"scale=%d:%d:force_original_aspect_ratio=decrease:flags=area,setsar=1,"+
+			"format=%s,"+
+			"pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black",
+		cols, rows, pixFmt, cols, rows)
 }

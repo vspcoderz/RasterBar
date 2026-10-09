@@ -448,7 +448,15 @@ func miniBars(bands []float64, width int, peak []float64) string {
 		// It read as a renderer bug and was not one.
 		v := clamp01(scratch[i])
 		if pk != nil {
-			if p := clamp01(pk[i]); p > v+0.5 {
+			// peakCapGap, not a literal. A peak that has fallen well clear of the
+			// level is what a cap *is*: the bar has dropped away from where it
+			// reached. The threshold has to sit inside the gap Visualizer.Push can
+			// actually produce, and that gap is bounded by the two decay rates —
+			// level falls 0.82 per analysis and peak 0.93, so after a transient the
+			// ratio converges at (1-0.93)/(1-0.82) = 2.57 and the gap peaks around
+			// 0.36 (measured: 0.317). The old `p > v+0.5` sat above that ceiling, so
+			// the cap was unreachable and the strip never drew one.
+			if p := clamp01(pk[i]); p > v+peakCapGap {
 				cells[i] = ramp[rampBright]
 				continue
 			}
@@ -457,6 +465,17 @@ func miniBars(bands []float64, width int, peak []float64) string {
 	}
 	return string(cells)
 }
+
+// peakCapGap is how far a falling peak must clear the level before the strip
+// draws a cap there.
+//
+// Derived from Visualizer.Push's decay rates, not chosen: 0.82 for the level and
+// 0.93 for the peak put a ceiling of about 0.36 on the achievable gap, and 0.12
+// sits under it with room for resampling error between the analysed band and the
+// drawn column. Any threshold above ~0.36 is dead code. See
+// TestMiniBarsPeakCapsAreReachable, which measures the ceiling rather than trusting
+// this comment.
+const peakCapGap = 0.12
 
 // pad2 zero-pads to two digits, for the queue counter.
 func pad2(n int) string {

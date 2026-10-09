@@ -203,9 +203,11 @@ type LevelTap struct {
 	// rate and the state runs ~3x faster than the music.
 	gen     uint64
 	readGen uint64
-	an      *SpectrumAnalyzer
-	onsets  *onsetDetector
-	once    sync.Once
+	// dead is the pump's exit error, or nil while it is running. See Dead.
+	dead   error
+	an     *SpectrumAnalyzer
+	onsets *onsetDetector
+	once   sync.Once
 }
 
 // spectrumRate is higher than the old RMS tap on purpose: an FFT needs
@@ -289,6 +291,13 @@ func (l *LevelTap) pump() {
 			l.mu.Unlock()
 		}
 		if err != nil {
+			// A tap that dies silently is a frozen spectrum: the styles keep
+			// drawing the last frame for the rest of the track, which reads as a
+			// hung process with no way to tell it from one. Record the exit so
+			// TryFrame can report it.
+			l.mu.Lock()
+			l.dead = err
+			l.mu.Unlock()
 			return
 		}
 	}
@@ -346,13 +355,38 @@ func (l *LevelTap) Frame() AudioFrame {
 // previous successful call. Callers that mutate per-analysis state on every Push
 // use this so the state advances at the audio's rate, not the renderer's.
 func (l *LevelTap) TryFrame() (AudioFrame, bool) {
+	return l.TryFrameAt(&l.readGen)
+}
+
+// TryFrameAt is TryFrame against a caller-owned cursor.
+//
+// Two consumers share one tap: the visualiser and the spectrum strip under the
+// HUD. They need the same "has anything new landed" gate but they must not share
+// one cursor — a single cursor means whichever asks first takes the frame and the
+// other is told there is nothing new, so a consumer silently stops updating
+// depending on draw order. Each one holds its own uint64.
+func (l *LevelTap) TryFrameAt(readGen *uint64) (AudioFrame, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.gen == l.readGen {
+	if l.gen == *readGen {
 		return AudioFrame{}, false
 	}
-	l.readGen = l.gen
+	*readGen = l.gen
 	return l.frameLocked(), true
+}
+
+// Dead reports why the tap's ffmpeg stopped producing audio, if it has.
+//
+// StartLevelTapAt only fails when ffmpeg cannot be *started*. A tap that starts
+// and then dies — an expired googlevideo grant, a container it cannot demux —
+// gives pump an EOF on the first ReadFull and the goroutine simply returns.
+// Nothing observed that, so music mode kept drawing the last spectrum it had for
+// the rest of the track, which is indistinguishable from a hung process. The
+// render loop reports this through the status line once per tap.
+func (l *LevelTap) Dead() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.dead
 }
 
 // frameLocked copies Bands and Wave; see Bands for why they are not aliased.
@@ -371,9 +405,12 @@ func (l *LevelTap) frameLocked() AudioFrame {
 
 func (l *LevelTap) Close() {
 	l.once.Do(func() {
-		if l.r != nil {
-			l.r.Close()
-		}
+		// Kill first, close second — the ordering SyncPlayer.Close documents and
+		// the one this got wrong. Closing a pipe with a read in flight waits for
+		// that read to finish, and the read is waiting on ffmpeg, which is
+		// blocked writing into a pipe nobody is draining. That is a hang on every
+		// seek, resize and track advance for the life of the process, not a
+		// theoretical one: pump is in ReadFull on exactly this pipe.
 		if l.cmd != nil && l.cmd.Process != nil {
 			_ = l.cmd.Process.Signal(syscall.SIGCONT)
 			_ = l.cmd.Process.Kill()
@@ -389,6 +426,12 @@ func (l *LevelTap) Close() {
 			case <-reaped:
 			case <-time.After(childReapTimeout):
 			}
+		}
+		// Now that ffmpeg is gone, nothing is writing to the pipe, so closing the
+		// read end releases pump's ReadFull immediately instead of waiting for a
+		// writer that will never come.
+		if l.r != nil {
+			l.r.Close()
 		}
 	})
 }

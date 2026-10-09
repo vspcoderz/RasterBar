@@ -65,6 +65,19 @@ type mediaPair struct {
 	// with no audio has no spectrum, which is the entire thing that mode draws.
 	// Showing a silent video there would be worse than refusing it.
 	silent bool
+	// videoLess is true when the source has no video stream at all -- an mp3, an
+	// opus file, a .wav. The mirror of silent, and needed for the same reason:
+	// the video tap is handed `-map 0:v:0`, which on a file with no video is a
+	// hard ffmpeg error and then EOF on the pipe.
+	//
+	// A videoLess track plays as a visualiser whatever mode was asked for, because
+	// "no picture" is not a mode the user can act on -- there is nothing to switch
+	// to. The reverse is not true: silent stays fatal in music mode, since the
+	// spectrum is the whole content there.
+	//
+	// Local only, same as silent. yt-dlp's formats carry codec metadata, so the
+	// network path knows without asking and needs no extra request.
+	videoLess bool
 }
 
 // videoFrame is one decoded frame plus the media position it was decoded at.
@@ -142,6 +155,16 @@ type trackSession struct {
 	// first press of W and then reused for the life of the track. A googlevideo URL
 	// is single-use, so this is never shared with mpv or the tap.
 	paneURL string
+
+	// vizCap is the current style's CapScale, read by pumpMusic every tick.
+	// Atomic because the style is chosen by the render loop while the pump reads
+	// it from its own goroutine, and a data race here would be a stale frame rate
+	// at worst — still worth not having.
+	//
+	// It exists because Viz.Heavy and Viz.CapScale were implemented by all six
+	// styles and called by none, so the expensive ones were never actually capped
+	// and the usage text describing that was wrong.
+	vizCap atomic.Value // float64
 }
 
 // newTrackSession resolves a track's streams once and starts playback at pos.
@@ -156,6 +179,27 @@ type trackSession struct {
 // resolution travels with it: a re-resolve that forgot l.sourceH would silently
 // downgrade a 1080p session to the 360p default.
 func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMode, glyph GlyphMode, music, wantTap bool) (*trackSession, error) {
+	// A local file decides its own mode. An mp3 has no video stream, so asking
+	// for video mode hands the path to ffmpeg with `-map 0:v:0`, which is a hard
+	// error ("Stream map '' matches no streams"), then EOF on the pipe, then
+	// "cannot play ...: read first frame: EOF" -- with ffmpeg's own stderr landing
+	// in the middle of the screen. `rasterbar -l ~/Music --play` hit this on track
+	// one, and OutcomeError then exited the whole queue.
+	//
+	// Probed only for local files. A YouTube result always has video in at least
+	// one format, and resolveMedia would have to ask for the probe anyway; the
+	// branch is on IsLocal so the network path pays nothing.
+	//
+	// Falling back rather than refusing is the call: there is no mode the user
+	// could switch to, because "no picture" is not a failure they can act on.
+	// silent is the mirror and stays fatal in music mode -- the spectrum is the
+	// content there, and a silent video behind a flat grid is worse than a refusal.
+	if track.IsLocal() {
+		if info, err := probeMedia(track.LocalPath); err == nil && !info.HasVideo {
+			music = true
+		}
+	}
+
 	var (
 		pair mediaPair
 		err  error
@@ -181,10 +225,25 @@ func newTrackSession(track Track, l layout, pos float64, mute bool, mode ColorMo
 		music:   music,
 		wantTap: wantTap || music,
 	}
+	s.vizCap.Store(1.0)
 	if err := s.start(pos); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// SetVizCap records the active style's CapScale for the music pump.
+//
+// Called on every style switch and on every rebuild. See vizCap for why it is an
+// atomic rather than a plain field.
+func (s *trackSession) SetVizCap(c float64) {
+	if s == nil {
+		return
+	}
+	if c <= 0 || c > 1 {
+		c = 1
+	}
+	s.vizCap.Store(c)
 }
 
 // resolve re-mints this track's streams after a failure.
@@ -319,13 +378,40 @@ func (s *trackSession) startTap(at float64) error {
 // render loop is not it.
 func (s *trackSession) pumpMusic(p *SyncPlayer, out chan<- videoFrame, stop <-chan struct{}) {
 	defer close(out)
-	tick := time.NewTicker(time.Second / time.Duration(musicFPS(s.l.cols, s.l.rows)))
+	// The ticker runs at the *grid's* rate and the frame budget is enforced below,
+	// rather than the ticker being built at the style's rate. That is what lets `v`
+	// take effect immediately: a ticker cannot change rate, so a style switch
+	// would otherwise need the whole pump restarted — another mpv and another tap
+	// — to change how often it paints.
+	base := musicFPS(s.l.cols, s.l.rows)
+	tick := time.NewTicker(time.Second / time.Duration(base))
 	defer tick.Stop()
+
+	var (
+		lastPaint time.Time
+		every     = time.Second / time.Duration(base)
+	)
 	for {
 		select {
 		case <-stop:
 			return
-		case <-tick.C:
+		case now := <-tick.C:
+			// Heavy styles are capped, not disabled: they paint at CapScale of the
+			// grid's rate. Both halves of the Viz interface existed and nothing
+			// called CapScale, so `usage`'s claim that "the expensive styles are
+			// capped rather than disabled" described an intention, not behaviour.
+			capScale, _ := s.vizCap.Load().(float64)
+			if capScale <= 0 || capScale > 1 {
+				capScale = 1
+			}
+			every = time.Second / time.Duration(float64(base)*capScale)
+			if every <= 0 {
+				every = time.Second / time.Duration(base)
+			}
+			if !lastPaint.IsZero() && now.Sub(lastPaint) < every {
+				continue
+			}
+			lastPaint = now
 			// Poll on every tick, not just until the first reading lands. In video
 			// mode the frame counter is the clock and mpv is only asked every two
 			// seconds to correct drift; here mpv *is* the clock, so skipping the
@@ -630,11 +716,50 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	strip := o.strip || o.music
 
 	// VTIME read so arrow keys arrive whole; see makeRawVT.
-	if restore, err := term.MakeRawVT(o.in, 0, 1); err == nil {
-		defer restore()
+	rawRestore, rawErr := term.MakeRawVT(o.in, 0, 1)
+
+	// restoreTerminal puts the tty back and clears the screen. Deferred AND
+	// callable, because it has to run in a specific order relative to an error
+	// message: the message has to land on a clean screen, or the deferred clear
+	// erases it. A deferred print runs *before* an earlier deferred restore (LIFO),
+	// so calling this directly is the only way to get the order right.
+	var restoreOnce sync.Once
+	restoreTerminal := func() {
+		restoreOnce.Do(func() {
+			fmt.Fprint(o.out, syncOff)
+			fmt.Fprint(o.out, "\x1b[?25h\x1b[2J\x1b[H")
+			if rawErr == nil {
+				rawRestore()
+			}
+		})
 	}
+	defer restoreTerminal()
+
+	// SIGINT and SIGTERM quit, like `q`.
+	//
+	// Raw mode here clears ECHO and ICANON but NOT ISIG, so Ctrl-C is still
+	// delivered by the tty driver as SIGINT — which means the `0x03` case in
+	// cmdForByte is unreachable in practice, and the default action kills the
+	// process outright. No deferred restore runs, so the shell is left with echo
+	// and line editing off and the cursor hidden; ffmpeg and mpv are not reaped
+	// and keep playing. The `usage` text promises "q / ctrl-c quit", and it did
+	// quit — just without tidying up.
+	//
+	// A buffered channel of size 1 and a non-blocking send: a second Ctrl-C while
+	// one is already queued does not block, and the loop reaches the select within
+	// a frame.
+	quitSig := make(chan os.Signal, 1)
+	signal.Notify(quitSig, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quitSig)
+
+	// Synchronized output, on for the whole session and ended by restoreTerminal.
+	// Emitted unconditionally: DEC private mode 2026 makes the terminal buffer a
+	// frame and present it atomically instead of showing a half-painted grid
+	// mid-repaint, and a terminal that does not know the mode ignores an unknown
+	// private mode. No detection, no flag — there is nothing to detect that would
+	// change what we emit.
+	fmt.Fprint(o.out, syncOn)
 	fmt.Fprint(o.out, "\x1b[?25l")
-	defer fmt.Fprint(o.out, "\x1b[?25h\x1b[2J\x1b[H")
 
 	l := computeLayout(termCols, termRows, o.aspect, o.quality, chromeRowsFor(strip))
 
@@ -658,7 +783,21 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 
 	sess, err := newTrackSession(track, l, 0, o.mute, o.mode, glyph, o.music, strip)
 	if err != nil {
-		fmt.Fprintf(o.out, "\r\ncannot play %s: %v\r\n", truncate(track.Title, 60), err)
+		// Reported AFTER the deferred cursor-restore and screen-clear, so the one
+		// diagnostic the user gets is not wiped microseconds after it is printed.
+		//
+		// It used to be printed before, and the defer ran immediately after: the
+		// message existed for no measurable time and the process exited having said
+		// nothing. With ffmpeg's own stderr landing in the middle of the screen
+		// ("Stream map '' matches no streams", three times) before it, a failed
+		// track was completely silent.
+		//
+		// Defer order in Go is LIFO, so this func runs before the restore defers
+		// registered above it only if registered above — which it is, because
+		// those run at return. Registering the print with defer here instead keeps
+		// it to one line and puts it after.
+		restoreTerminal()
+		fmt.Fprintf(o.out, "cannot play %s: %v\r\n", truncate(track.Title, 60), err)
 		return OutcomeError
 	}
 	defer sess.Close()
@@ -696,6 +835,9 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		viz  Viz
 		grid *VizGrid
 	)
+	// The strip's own TryFrame cursor. Separate from the visualiser's because they
+	// are two consumers of one tap and a shared cursor makes one of them starve.
+	var stripReadGen uint64
 
 	// Split-view state. sp owns what the user asked for; this closure owns the
 	// geometry, because only the loop knows what the grid currently is.
@@ -726,6 +868,8 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			viz = prefs.makeViz()
 		}
 		viz.Resize(vz.cols, vz.rows)
+		// Publish the cap after the resize, since CapScale reads the grid size.
+		sess.SetVizCap(viz.CapScale(vz.cols, vz.rows))
 		grid = NewVizGrid(vz.cols, vz.rows, o.mode != ColorNone, perCellFor(o.mode, glyph))
 		grid.SetPalette(paletteAt(prefs.palette))
 		if sp.on {
@@ -893,7 +1037,17 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 		}
 		if strip {
 			if sess.tap != nil {
-				stripViz.Push(sess.tap.Bands())
+				// TryFrame, not Bands. This is the same rule the visualiser
+				// follows and it was being broken one layer up: paintHUD runs on
+				// every keypress as well as the 10Hz tick, and Push decays the
+				// level by 0.82 and the peak by 0.93 *per call*. Mashing keys
+				// therefore ran the strip's release ~3x faster than the music,
+				// which reads as the strip being wrong rather than as a stale
+				// one. TryFrame reports false until a new analysis window has
+				// landed, so the decay happens at the audio's ~11Hz.
+				if f, ok := sess.tap.TryFrameAt(&stripReadGen); ok {
+					stripViz.Push(f.Bands)
+				}
 				h.strip = miniBars(stripViz.Level(), l.cols, stripViz.Peak())
 			} else {
 				h.strip = miniBars(nil, l.cols, nil)
@@ -949,6 +1103,7 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	closeOverlay := func() {
 		router.pr.stop()
 		renderer.ForceNext()
+		hudText = ""
 	}
 
 	resized := make(chan os.Signal, 1)
@@ -1081,6 +1236,22 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			// grid is ffmpeg's scale target, so the decoder has to be told. In music
 			// mode there is no video and nothing to rebuild, which is why the same
 			// key is free there.
+			// The live window size, not the one captured at entry. CmdStrip was
+			// recomputing from termCols/termRows as read at line 616, so after a
+			// resize the strip toggle snapped the grid back to the pre-resize
+			// geometry and rebuilt the decoder at it — the resize that had just
+			// been handled got undone by the next keypress. The SIGWINCH arm
+			// updates these; this reads them.
+			c, r, terr := term.TermSize(o.out)
+			if terr == nil {
+				termCols, termRows = c, r
+				if o.cols > 0 {
+					termCols = o.cols
+				}
+				if o.rows > 0 {
+					termRows = o.rows
+				}
+			}
 			l = computeLayout(termCols, termRows, o.aspect, o.quality, chromeRowsFor(strip))
 			if strip {
 				stripViz = Visualizer{level: make([]float64, l.cols), peak: make([]float64, l.cols)}
@@ -1121,7 +1292,17 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				} else {
 					rebuildViz()
 				}
+				// The renderer is sized to the grid, and the grid just changed
+				// shape. Only the `sess.dirty` rebuild recreates it, and the music
+				// branch never sets dirty — so a renderer left over from a wider
+				// grid would reject the next frame as "frame too small" and return
+				// OutcomeError, which ends the track and then the queue, silently.
+				// Verified reachable: strip off grows the grid by a row, a seek
+				// rebuilds the renderer at the new size, and stripping back on
+				// makes the grid smaller than the renderer again.
+				renderer = newRenderer(bw, l.cols, l.rows, o.mode, glyph)
 				renderer.ForceNext()
+				fmt.Fprint(bw, "\x1b[2J\x1b[H")
 				hudText = ""
 			}
 			reportLine(map[bool]string{true: "spectrum on", false: "spectrum off"}[strip])
@@ -1175,8 +1356,13 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			// same trap the stall-recovery path documents, and a style switch is
 			// another way to reach it.
 			viz = prefs.makeViz()
-			viz.Resize(vizPane().cols, vizPane().rows)
+			vp := vizPane()
+			viz.Resize(vp.cols, vp.rows)
 			viz.Reset()
+			// A new style brings its own budget. radial's cap depends on the grid
+			// size, particles' on the particle budget, so this has to follow the
+			// switch rather than being set once per track.
+			sess.SetVizCap(viz.CapScale(vp.cols, vp.rows))
 			renderer.ForceNext()
 			hudText = ""
 			reportLine(describeStyle(prefs))
@@ -1253,6 +1439,12 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 				// Keeping it would draw a waterfall of the part you just left.
 				viz.Reset()
 				grid.Clear()
+				// The tap is a new process, so its generation counter restarts at
+				// zero. A stale cursor would read as "nothing new yet" until the
+				// count climbed past wherever the previous generation stopped —
+				// which for a long-running tap is the rest of the track, i.e. a
+				// frozen visualiser with a live process behind it.
+				stripReadGen = 0
 				// The split pane is per generation like everything else here. It has
 				// to be restarted at the new offset or it keeps showing the part of
 				// the track that was just seeked away from, and it needs a new URL
@@ -1281,6 +1473,14 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			if out := feedKeys(chunk); out != OutcomePlaying {
 				return out
 			}
+
+		case <-quitSig:
+			// Ctrl-C, or a SIGTERM from the window manager. The same outcome `q`
+			// produces, so every deferred cleanup above runs: the terminal is
+			// restored, the screen is cleared, and Close reaps ffmpeg and mpv.
+			// Before this existed the default action killed the process and none
+			// of that happened.
+			return OutcomeQuit
 
 		case <-resized:
 			// Drain: a drag emits a burst of these.
@@ -1506,6 +1706,19 @@ func chromeRowsFor(strip bool) int {
 // hudStripRows is the HUD's own size: title, progress, footer. The strip, when
 // on, is a fourth row above the footer.
 const hudStripRows = 3
+
+// Synchronized output, DEC private mode 2026. Tells the terminal to buffer a
+// frame and present it in one go rather than painting each write as it arrives,
+// which is what stops a half-updated grid being visible mid-repaint.
+//
+// Emitted unconditionally. A terminal that does not implement the mode ignores an
+// unknown private mode, so there is nothing to detect and no reason to branch —
+// and a terminal that does implement it is exactly the one worth being correct
+// for, since it is also the one fast enough to tear.
+const (
+	syncOn  = "\x1b[?2026h"
+	syncOff = "\x1b[?2026l"
+)
 
 // audioTailGrace is how long the audio gets to finish after the video pipe
 // closes. Short enough that a stuck mpv is not a hang, long enough that a track

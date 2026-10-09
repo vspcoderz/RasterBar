@@ -163,45 +163,6 @@ func fpsForGrid(cols, rows int) int {
 // Quality lets the user cap or raise source resolution.
 type Quality int
 
-// resolveURL asks yt-dlp for direct media URLs.
-func resolveURL(track Track, format string) (string, error) {
-	// ffmpeg and mpv both open a filesystem path directly, so a library track
-	// resolves to itself. Running yt-dlp here would fail on every seek: it finds
-	// no extractor for a path and the format selector is never consulted.
-	if track.IsLocal() {
-		return track.LocalPath, nil
-	}
-	out, err := runYtdlp(format, track.URL)
-	if err != nil {
-		return "", err
-	}
-	url := lastURL(out)
-	if url == "" {
-		return "", fmt.Errorf("yt-dlp returned no url for %s (%s)", track.ID, track.Title)
-	}
-	return url, nil
-}
-
-// resolveVideoURL picks the cheapest source that still looks acceptable in
-// ASCII. Caps height at 360p and prefers h264 (cheapest decode) over AV1/VP9.
-// This is the single biggest low-end win: decode cost scales with resolution
-// and codec, and ASCII output at 80x22 cannot show the difference between
-// 360p and 1080p.
-//
-// Video-only on purpose: the DASH video formats carry no audio track, so audio
-// is resolved separately by resolveAudioURL. Feeding a video-only URL to
-// `mpv --no-video` exits 0 instantly and silently (verified), which looks like
-// a successful play but plays nothing.
-func resolveVideoURL(track Track) (string, error) {
-	format := "bestvideo[height<=360][vcodec^=avc1]/bestvideo[height<=360]/best"
-	return resolveURL(track, format)
-}
-
-// resolveAudioURL gets a standalone audio stream for playback alongside ASCII.
-func resolveAudioURL(track Track) (string, error) {
-	return resolveURL(track, "bestaudio")
-}
-
 // resolveMedia returns the video and audio URLs for a track, plus its duration.
 //
 // They are two SEPARATE URLs: `yt-dlp -g` never muxes, no matter what
@@ -232,17 +193,21 @@ func resolveMedia(track Track, sourceH int, wantTap bool) (mediaPair, error) {
 	// container already holds both streams, so this is the same shape
 	// pickStreams returns for a progressive format — one ref used twice.
 	if track.IsLocal() {
-		dur, chaps, hasAudio := probeMedia(track.LocalPath)
+		info, err := probeMedia(track.LocalPath)
+		if err != nil {
+			return mediaPair{}, err
+		}
 		return mediaPair{
 			videoURL: track.LocalPath,
 			audioURL: track.LocalPath,
 			// The strip's tap reads the same path. A filesystem path is not a
 			// signed grant, so it can be opened as many times as there are
 			// readers; no second probe and no second URL are needed.
-			tapURL:   track.LocalPath,
-			dur:      float64(dur),
-			chapters: chaps,
-			silent:   !hasAudio,
+			tapURL:    track.LocalPath,
+			dur:       float64(info.Duration),
+			chapters:  info.Chapters,
+			silent:    !info.HasAudio,
+			videoLess: !info.HasVideo,
 		}, nil
 	}
 
@@ -301,13 +266,17 @@ func resolveMedia(track Track, sourceH int, wantTap bool) (mediaPair, error) {
 // So local playback is one probe and two copies of the same path.
 func resolveAudioPair(track Track) (mediaPair, error) {
 	if track.IsLocal() {
-		dur, chaps, hasAudio := probeMedia(track.LocalPath)
+		info, err := probeMedia(track.LocalPath)
+		if err != nil {
+			return mediaPair{}, err
+		}
 		return mediaPair{
-			tapURL:   track.LocalPath,
-			audioURL: track.LocalPath,
-			dur:      float64(dur),
-			chapters: chaps,
-			silent:   !hasAudio,
+			tapURL:    track.LocalPath,
+			audioURL:  track.LocalPath,
+			dur:       float64(info.Duration),
+			chapters:  info.Chapters,
+			silent:    !info.HasAudio,
+			videoLess: !info.HasVideo,
 		}, nil
 	}
 
@@ -588,34 +557,6 @@ func betterAudio(cand, cur ytFormat) bool {
 		return true
 	}
 	return cand.TBR > cur.TBR
-}
-
-func runYtdlp(format, url string) (string, error) {
-	cmd := exec.Command("yt-dlp", "-f", format, "-g", url)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("yt-dlp -g: %w: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	return string(out), nil
-}
-
-// lastURL returns the last http line from `yt-dlp -g`.
-//
-// "Last", not "first": for a merged `video+audio` selector yt-dlp may print two
-// URLs (separate DASH streams) or one muxed URL. Taking the first silently gave
-// us a video-only stream, and the ASCII player then failed with "Output file
-// does not contain any stream" because there was no audio to map. Verified.
-func lastURL(out string) string {
-	last := ""
-	for _, l := range strings.Split(out, "\n") {
-		l = strings.TrimSpace(l)
-		if strings.HasPrefix(l, "http") {
-			last = l
-		}
-	}
-	return last
 }
 
 // newRenderer picks the mono or colour renderer. Both satisfy FrameRenderer, so

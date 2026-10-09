@@ -926,23 +926,24 @@ const ffprobeSilentJSON = `{
 // TestFfprobeDetectsASilentFile: mpv exits instantly on a video-only file, and the
 // render loop reads that exit as the end of the track. Detecting it is the whole
 // difference between a silent video playing for its full length and stopping dead.
+//
+// Calls parseProbeOutput — the function production uses — rather than
+// unmarshalling and re-implementing the stream loop. The original version did the
+// latter, which meant it passed without probeMedia ever being correct: dropping
+// `-show_streams` (the regression it exists for) left it green.
 func TestFfprobeDetectsASilentFile(t *testing.T) {
-	var p ffprobeOutput
-	if err := json.Unmarshal([]byte(ffprobeSilentJSON), &p); err != nil {
-		t.Fatalf("silent response does not fit ffprobeOutput: %v", err)
+	info, err := parseProbeOutput([]byte(ffprobeSilentJSON))
+	if err != nil {
+		t.Fatalf("silent response does not fit: %v", err)
 	}
-	hasAudio := false
-	for _, st := range p.Streams {
-		if st.CodecType == "audio" {
-			hasAudio = true
-			break
-		}
-	}
-	if hasAudio {
+	if info.HasAudio {
 		t.Error("a video-only file reported an audio stream")
 	}
-	if len(p.Chapters) != 0 {
-		t.Errorf("read %d chapters from a file with none", len(p.Chapters))
+	if !info.HasVideo {
+		t.Error("a video-only file did not report a video stream")
+	}
+	if len(info.Chapters) != 0 {
+		t.Errorf("read %d chapters from a file with none", len(info.Chapters))
 	}
 }
 
@@ -952,17 +953,50 @@ func TestFfprobeFindsAudioInTheFixture(t *testing.T) {
 	withAudio := strings.Replace(ffprobeJSON,
 		`"format": {`, `"streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
   "format": {`, 1)
-	var p ffprobeOutput
-	if err := json.Unmarshal([]byte(withAudio), &p); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	info, err := parseProbeOutput([]byte(withAudio))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
 	}
-	found := false
-	for _, st := range p.Streams {
-		if st.CodecType == "audio" {
-			found = true
-		}
-	}
-	if !found {
+	if !info.HasAudio {
 		t.Error("a file with an audio stream did not report one")
+	}
+	if !info.HasVideo {
+		t.Error("a file with a video stream did not report one")
+	}
+}
+
+// TestFfprobeReportsNoVideoForAnAudioOnlyFile is the fixture that killed the
+// library path: an mp3 handed to the video tap gets `-map 0:v:0`, ffmpeg exits
+// with "Stream map ” matches no streams", the pipe EOFs, and playback dies with
+// "read first frame: EOF". Nothing could notice because nothing asked.
+func TestFfprobeReportsNoVideoForAnAudioOnlyFile(t *testing.T) {
+	audioOnly := `{
+  "streams": [
+    { "index": 0, "codec_type": "audio", "codec_name": "mp3" }
+  ],
+  "format": { "filename": "song.mp3", "duration": "143.500000" }
+}`
+	info, err := parseProbeOutput([]byte(audioOnly))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if info.HasVideo {
+		t.Error("an audio-only file reported a video stream")
+	}
+	if !info.HasAudio {
+		t.Error("an audio-only file did not report an audio stream")
+	}
+	if info.Duration != 143 {
+		t.Errorf("duration = %d, want 143", info.Duration)
+	}
+}
+
+// TestParseProbeOutputReportsRealFailures: a probe that cannot read the file used
+// to return hasAudio=false, which music mode reported as "no audio stream in
+// <title>" — a confident wrong answer to the only question the user can act on.
+// An unreadable file is now an error.
+func TestParseProbeOutputReportsRealFailures(t *testing.T) {
+	if _, err := parseProbeOutput([]byte("not json at all")); err == nil {
+		t.Error("garbage from ffprobe parsed without an error")
 	}
 }

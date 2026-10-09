@@ -139,9 +139,16 @@ func ScanLibrary(root string, probe bool) ([]Track, error) {
 
 // libraryTrack builds a Track from one path.
 //
-// It returns ok=false for a video whose name carries no episode marker at all.
-// Such a file has no meaningful position in a playlist, and inventing one from
-// readdir order would put it somewhere arbitrary rather than honestly nowhere.
+// A file whose name carries no episode marker is still a track, and it used to be
+// dropped: `nocturne.opus` and `celestial.wav` parsed to ok=false and a music
+// folder scanned to *zero* tracks, with "no playable files with an episode number
+// under ..." as the only output. Every extension was already in mediaExts -- the
+// episode rule was the gate, and it is a rule about television.
+//
+// So an unnumbered file gets Season/Episode 0 and a title that is its own name,
+// and sortLibrary puts it in natural filename order among the other unnumbered
+// ones. A numbered file in the same folder keeps its series/season/episode
+// position, so a mixed directory still plays in a watchable order.
 //
 // It deliberately does NOT probe for a duration. Probing here ran one ffprobe
 // per file *serially* inside the walk, so --no-probe still paid for every probe
@@ -158,9 +165,12 @@ func libraryTrack(path, root string) (Track, bool) {
 	rel = filepath.ToSlash(rel)
 
 	name := filepath.Base(rel)
-	key, ok := classifyMedia(name)
-	if !ok {
-		return Track{}, false
+	key, numbered := classifyMedia(name)
+	if !numbered {
+		// The whole name is the title. stripTags, because a music release is
+		// routinely "01 - Artist - Song [2024].mp3" and the browse list should
+		// show the parts of that which mean something.
+		key = mediaKey{Series: cleanTitle(filepath.Base(filepath.Dir(rel))), Title: stripTags(stripExt(name))}
 	}
 
 	dir := filepath.Base(filepath.Dir(rel))
@@ -328,12 +338,28 @@ func cleanTitle(s string) string {
 // appended when the release had one, which is the difference between a list of
 // "S01E07 Cowboy Bebop" rows and a list you can actually scan for the one you
 // want.
+//
+// An unnumbered file gets no prefix at all. "E00  Song" is not a worse version of
+// "Song", it is a lie about a number the file never had, and it is what made a
+// music folder look like a broken television library.
 func displayTitle(name string, key mediaKey) string {
 	var prefix string
-	if key.Season > 0 {
+	switch {
+	case key.Episode == 0:
+		prefix = ""
+	case key.Season > 0:
 		prefix = fmt.Sprintf("S%02dE%02d", key.Season, key.Episode)
-	} else {
+	default:
 		prefix = fmt.Sprintf("E%02d", key.Episode)
+	}
+	// No episode number: the name is the whole title. Prefixing the series would
+	// duplicate the channel column, which already shows it — "songs - nocturne"
+	// beside "songs" is the same word twice.
+	if prefix == "" {
+		if key.Title != "" {
+			return key.Title
+		}
+		return key.Series
 	}
 	switch {
 	case key.Series == "":
@@ -350,9 +376,23 @@ func displayTitle(name string, key mediaKey) string {
 // Season and episode numerically, series alphabetically, then full path as the
 // final tiebreak: two copies of one episode at different qualities parse to
 // identical numbers, and a fixed order beats filesystem readdir order.
+//
+// Unnumbered files (Episode == 0) sort by natural filename order instead, by
+// path. They carry no position in a series, so comparing their Series would
+// alphabetise "celestial" against "Some Show" on a case difference and bury the
+// music under the television. Within the numbered set the old order is untouched,
+// which is what keeps a TV library behaving exactly as it did.
 func sortLibrary(ts []Track) {
 	sort.SliceStable(ts, func(i, j int) bool {
 		a, b := ts[i], ts[j]
+		if (a.Episode == 0) != (b.Episode == 0) {
+			// Numbered first. A show's episodes are the reason someone pointed
+			// the player at the directory; the un-numbered extras come after.
+			return a.Episode != 0
+		}
+		if a.Episode == 0 {
+			return naturalLess(normalFold(a.LocalPath), normalFold(b.LocalPath))
+		}
 		if a.Series != b.Series {
 			return a.Series < b.Series
 		}
@@ -423,19 +463,59 @@ type ffprobeOutput struct {
 	} `json:"chapters"`
 }
 
-// probeMedia returns a local file's length in seconds and its chapters.
+// mediaInfo is what a probe establishes about a local file.
+type mediaInfo struct {
+	Duration int
+	Chapters []Chapter
+	HasAudio bool
+	// HasVideo is the other half, and it is not cosmetic. An audio-only file
+	// handed to the video tap gets `-map 0:v:0`, which is a hard ffmpeg error:
+	// "Stream map '' matches no streams", then EOF on the pipe, then "cannot
+	// play …: read first frame: EOF" with ffmpeg's own stderr landing in the
+	// middle of the screen. Nothing knew to ask, because nothing had ever asked.
+	HasVideo bool
+}
+
+// probeMedia returns a local file's duration, chapters and stream kinds.
 //
 // Probing a local path is safe in a way probing a resolved googlevideo URL is
 // not: a local file has no single-use grant to burn, so the usual reason this
 // project avoids ffprobe (see resolveMedia) does not apply here.
-// probeMedia returns a file's length in seconds, its chapters, and whether it
-// has an audio stream.
 //
-// The third answer is not cosmetic. A video-only file handed to
-// `mpv --no-video` exits instantly with nothing played, and the render loop reads
-// that exit as "the track finished" — so a silent video stopped about two seconds
-// in and looked like a broken player rather than a file with no sound.
-func probeMedia(path string) (dur int, chapters []Chapter, hasAudio bool) {
+// hasAudio is not cosmetic either. A video-only file handed to `mpv --no-video`
+// exits instantly with nothing played, and the render loop reads that exit as "the
+// track finished" — so a silent video stopped about two seconds in and looked
+// like a broken player rather than a file with no sound.
+//
+// The error is returned rather than folded into a zero value. Reporting an
+// unreadable file as `hasAudio == false` made music mode say "no audio stream in
+// <title>" about a corrupt download, which is a confident wrong answer to the
+// only question the user can act on.
+func probeMedia(path string) (mediaInfo, error) {
+	out, err := exec.Command("ffprobe",
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		"-show_chapters",
+		path).Output()
+	if err != nil {
+		return mediaInfo{}, fmt.Errorf("ffprobe %s: %w", path, err)
+	}
+	return parseProbeOutput(out)
+}
+
+// parseProbeOutput turns ffprobe's JSON into mediaInfo, with no subprocess.
+//
+// Split out so the parse is testable against a literal. The first version of
+// these tests unmarshalled the fixture and then re-implemented the loop that
+// reads Streams — which meant they tested their own copy of the logic, and
+// passing them required nothing of the real function. Dropping `-show_streams`
+// from probeMedia (the regression they were written for) left both green.
+//
+// Now the same entry point production uses, so a fixture with no `streams` key
+// genuinely fails here.
+func parseProbeOutput(out []byte) (mediaInfo, error) {
 	// -show_streams is not optional and its absence was invisible for a long time.
 	//
 	// Without it ffprobe returns format and chapters but no `streams` key, so the
@@ -446,24 +526,17 @@ func probeMedia(path string) (dur int, chapters []Chapter, hasAudio bool) {
 	// mode it is fatal, because refusing a source with no audio stream is exactly
 	// the check this flag was supposed to inform -- and it refused the audio-only
 	// file that music mode exists to play.
-	out, err := exec.Command("ffprobe",
-		"-v", "quiet",
-		"-print_format", "json",
-		"-show_format",
-		"-show_streams",
-		"-show_chapters",
-		path).Output()
-	if err != nil {
-		return 0, nil, false
-	}
 	var p ffprobeOutput
 	if err := json.Unmarshal(out, &p); err != nil {
-		return 0, nil, false
+		return mediaInfo{}, fmt.Errorf("parse ffprobe output: %w", err)
 	}
+	info := mediaInfo{}
 	for _, st := range p.Streams {
-		if st.CodecType == "audio" {
-			hasAudio = true
-			break
+		switch st.CodecType {
+		case "audio":
+			info.HasAudio = true
+		case "video":
+			info.HasVideo = true
 		}
 	}
 	chaps := make([]Chapter, 0, len(p.Chapters))
@@ -480,16 +553,24 @@ func probeMedia(path string) (dur int, chapters []Chapter, hasAudio bool) {
 	if len(chaps) == 0 {
 		chaps = nil
 	}
+	info.Chapters = chaps
 	// ffprobe reports fractional seconds ("1437.218000").
 	f, err := strconv.ParseFloat(strings.TrimSpace(p.Format.Duration), 64)
 	if err != nil || f <= 0 {
-		return 0, chaps, hasAudio
+		// A stream with no readable duration is still a playable stream. The
+		// zero means "unknown length", not "broken", and callers already treat it
+		// that way -- the HUD falls back to elapsed-only.
+		return info, nil
 	}
-	return int(f), chaps, hasAudio
+	info.Duration = int(f)
+	return info, nil
 }
 
 // probeDuration returns a file's length in seconds, or 0 if unreadable.
 func probeDuration(path string) int {
-	d, _, _ := probeMedia(path)
-	return d
+	info, err := probeMedia(path)
+	if err != nil {
+		return 0
+	}
+	return info.Duration
 }

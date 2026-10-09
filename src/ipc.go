@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -24,7 +25,23 @@ import (
 // was initially backwards, which showed up as mpv never connecting and the
 // corrector silently doing nothing.
 
+// mu serialises every request/reply pair.
+//
+// Load-bearing, and not defensive: a connection is one socket, one bufio.Reader
+// and one request_id counter, and mpv matches replies to requests by that id.
+// Music mode polls timePos from pumpMusic on every render tick (up to 30Hz) while
+// the render loop handles `+`/`-`, so without this there are genuinely two
+// goroutines on one conn. `go test -race` with a real unix socket shows the
+// write of `next` at setProperty racing the read at timePos; worse than the race
+// itself, a lost increment hands the same request_id to two calls and each reads
+// the other's reply.
+//
+// Held across the round trip, so a seek waits out a position poll rather than
+// interleaving with it. That is already the case in practice — there is only ever
+// one caller wanting the socket at a time — so the lock costs contention nothing
+// and removes the whole class of bug.
 type mpvIPC struct {
+	mu   sync.Mutex
 	conn net.Conn
 	r    *bufio.Reader
 	next int
@@ -112,6 +129,8 @@ func (i *mpvIPC) timePos(timeout time.Duration) (float64, bool) {
 		setIpcErr("no connection")
 		return 0, false
 	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.next++
 	id := i.next
 	req, _ := json.Marshal(ipcRequest{
@@ -151,10 +170,13 @@ func (i *mpvIPC) seek(sec float64) error {
 	if i == nil || i.conn == nil {
 		return fmt.Errorf("no ipc connection")
 	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.next++
+	id := i.next
 	payload := map[string]interface{}{
 		"command":    []interface{}{"seek", sec, "absolute+exact"},
-		"request_id": i.next,
+		"request_id": id,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -165,13 +187,17 @@ func (i *mpvIPC) seek(sec float64) error {
 	}
 	_ = i.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	// Drain the ack so the buffer does not fill with replies.
+	//
+	// A read error returns the error, not nil. Returning nil here reported a
+	// correction that never reached mpv: SyncReport.Corrected came back true and
+	// the drift corrector believed it had done its job.
 	for {
 		line, err := i.r.ReadBytes('\n')
 		if err != nil {
-			return nil
+			return fmt.Errorf("seek: %w", err)
 		}
 		var rep ipcReply
-		if json.Unmarshal(line, &rep) == nil && rep.RequestID == i.next {
+		if json.Unmarshal(line, &rep) == nil && rep.RequestID == id {
 			if rep.Error != "" && rep.Error != "success" {
 				return fmt.Errorf("seek: %s", rep.Error)
 			}
@@ -182,7 +208,9 @@ func (i *mpvIPC) seek(sec float64) error {
 
 func (i *mpvIPC) close() {
 	if i != nil && i.conn != nil {
+		i.mu.Lock()
 		i.conn.Close()
+		i.mu.Unlock()
 	}
 }
 
@@ -243,6 +271,8 @@ func (i *mpvIPC) setProperty(name string, value interface{}, timeout time.Durati
 		setIpcErr("no connection")
 		return fmt.Errorf("no ipc connection")
 	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.next++
 	id := i.next
 	req, err := marshalCommand("set_property", []interface{}{name, value}, id)

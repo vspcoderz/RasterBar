@@ -241,7 +241,14 @@ func (c *ColorDiffRenderer) Draw(frame []byte) error {
 			// Move the cursor only when this cell does not follow the last one
 			// written. Contiguous runs need no positioning at all.
 			if !c.haveLast || y != c.lastY || x != c.lastX+1 {
-				if _, err := fmt.Fprintf(c.w, "\x1b[%d;%dH", y+1, x+1); err != nil {
+				// appendCUP, not fmt.Fprintf. Both are zero-alloc for this shape
+				// (measured), so this is not a leak fix — it is that AGENTS.md
+				// forbids fmt in a per-cell path and render.go already grew the
+				// scratch that does it properly. Two ways to build the same escape
+				// is how the mono path ends up with an optimisation the colour path
+				// never got.
+				c.esc = appendCUP(c.esc[:0], y+1, x+1)
+				if _, err := c.w.Write(c.esc); err != nil {
 					return err
 				}
 			}

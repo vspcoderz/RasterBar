@@ -40,6 +40,15 @@ These bugs do not crash — they misbehave somewhere else, so each is pinned by 
 test or an explicit comment.
 
 **Media / streams**
+- **Ask what streams a local file has, and act on both answers.** `hasAudio` and
+  `hasVideo`. An audio-only file handed to the video tap gets `-map 0:v:0`, which
+  is a hard ffmpeg error, then EOF, then "read first frame: EOF" — and because
+  `-l DIR --play` defaulted to video mode, a music folder died on track 1 and
+  took the queue with it. A track with no video stream plays as a visualiser;
+  `silent` stays fatal in music mode, because the spectrum is the content there.
+- **An episode marker is not a requirement for being playable.** `classifyMedia`
+  returning false used to drop `nocturne.opus` and scan a music folder to zero
+  tracks. Unnumbered files are included and sorted by natural filename order.
 - **Never pass an audio URL to ffmpeg as an input.** It is unused but ffmpeg
   opens it anyway; googlevideo grants are single-use, so mpv then gets `403`.
   One input, one consumer. Music mode resolving the audio stream *twice* is
@@ -58,14 +67,40 @@ test or an explicit comment.
 - **ffprobe JSON does not match the struct you would guess:** `start_time` /
   `end_time` are strings, a chapter title nests under `tags`. Pinned by
   `TestFfprobeOutputShape`.
+- **A test that re-implements the parse proves nothing.** The `-show_streams`
+  tests unmarshalled the fixture and looped over `Streams` themselves, so
+  dropping `-show_streams` again — the exact regression they were written for —
+  left them green. They call `parseProbeOutput` now, which is the entry point
+  production uses.
+- **A failed probe is an error, not `hasAudio == false`.** Folding ffprobe's
+  failure into "no audio" reported a corrupt download as "no audio stream in
+  <title>", which is a confident wrong answer to the only question the user can
+  act on.
 
 **Concurrency / lifecycle**
 - **Never close the video pipe before killing ffmpeg, and never `Wait` on mpv.**
   Both hang the render loop (which then ignores `q`). `Close` signals `SIGCONT`
   before `SIGKILL`; ffmpeg wait is bounded by `childReapTimeout`. `mpv` is reaped
-  by the goroutine `start` launches.
+  by the goroutine `start` launches. `LevelTap.Close` had it backwards (pipe
+  first) and hung on every seek, resize and track advance.
 - **Decode keys in the render loop, never in the reader goroutine.** `readKeys`
   is a byte pump; `keyRouter` owns routing so a `:` prompt is testable.
+- **`used` is a count against the caller's slice, never a longer one built
+  internally.** `prompt.consume` prepends a held `escTail`; returning
+  `len(chunk)` of the combined slice made `:` + an arrow split across two reads
+  panic with `slice bounds out of range` inside the render loop.
+- **`mpvIPC` has a mutex because music mode really has two goroutines on it.**
+  `pumpMusic` polls `timePos` every tick while `+`/`-` calls `setVolume`; a lost
+  `next++` hands one `request_id` to two calls.
+- **A terminal stops reading before you notice, so check the fd before the
+  write.** `fdWritable`'s guard is `len(set.Bits)*64`, not a round number:
+  `FdSet` holds 1024 fds.
+- **Ctrl-C is SIGINT, so handle it.** Raw mode here keeps `ISIG`, meaning the
+  `0x03` case in `cmdForByte` is unreachable and the default action kills the
+  process with the tty still raw and the children unreaped. `playTrack` turns it
+  into `OutcomeQuit`.
+- **Print a failure after the terminal is restored, not before.** The deferred
+  clear erases it (defer is LIFO).
 - **Nil a channel once you have consumed its close.** A closed channel stays
   ready and spins a `select` forever; nil blocks forever.
 
@@ -87,6 +122,40 @@ test or an explicit comment.
   band read full scale.
 
 **Rendering / layout**
+- **Letterbox, never stretch.** `videoTapGeometry` emitted a bare `scale=W:H`,
+  which stretches the source to the grid's shape. Measured: a square in a 16:9
+  frame rendered 0.57:1 on screen — 43% out. `force_original_aspect_ratio=decrease`
+  plus `pad` fixes it and still emits exactly `cols*rows` bytes, so the compositor
+  contract is untouched. `--aspect` is a guess about the *cell* ratio; the filter
+  is the one that knows the *source's*.
+- **The letterbox's filter ORDER is load-bearing, and the failure is silent.**
+  `scale=…:force_original_aspect_ratio=decrease,setsar=1,format=X,pad=W:H` works;
+  moving `format` after `pad` makes ffmpeg fail with "Padded dimensions cannot be
+  smaller than input dimensions" on most geometries, which the video tap reports
+  as "read first frame: EOF" and the split pane just never appears. `setsar=1` is
+  equally required — the fit leaves `sar 64/63` and pad compares *display*
+  dimensions.
+- **Test a filter across geometries, not one.** 100×50 was the single geometry
+  the first version of this test used, and it is the one that worked.
+  `TestVideoTapFilterByteCountAcrossGeometries` sweeps 13 shapes × 4 modes.
+- **Build test fixtures nobody can actually get and they will agree with your
+  bug.** The same test passed against a broken filter because the fixture encoded
+  as `yuv444p`, which pad accepts; every real source is `yuv420p`, which it
+  refuses. Pin the pixel format, and check the fixture is what production sees.
+- **Recreate the renderer whenever the grid's shape changes.** It is built once
+  and rebuilt only in the `sess.dirty` path, so the music branch of `CmdStrip`
+  left it sized to the old row count and a later smaller frame failed the
+  `frame too small` check — `OutcomeError`, silent exit.
+- **Recompute from the live window, not the size captured at entry.**
+  `CmdStrip` used the entry-time `termCols`/`termRows`, so a strip toggle after a
+  resize snapped the grid back to the pre-resize geometry.
+- **Wrap frames in DEC 2026.** `\x1b[?2026h` / `\x1b[?2026l`, unconditionally:
+  a terminal that does not know the mode ignores it, and the ones that do are the
+  ones fast enough to tear.
+- **A threshold has to sit inside the range the code around it can produce.**
+  `miniBars`'s peak cap tested `peak > level+0.5`, but `Visualizer.Push` decays
+  level by 0.82 and peak by 0.93, which caps the achievable gap at ~0.36
+  (measured 0.317). The cap never drew.
 - **A ramp index is not a character.** `rampFor` returns an index; string builders
   must do `ramp[rampFor(...)]`. An index below 32 is a control char, and LF in
   the chrome is a scroll. `TestHudLinesCarryNoControlCharacters` catches it.
@@ -109,7 +178,17 @@ test or an explicit comment.
   which reports false until a new FFT window lands. `Frame()` plus an
   unconditional `Push` makes the waterfall scroll, particles age and the smoother
   release ~3x faster than the music, because the render tick is up to 30Hz and the
-  analysis is ~11Hz.
+  analysis is ~11Hz. The HUD strip broke this one layer up: `paintHUD` runs on
+  every keypress too, so its `Push` decayed the strip 3x faster when you mashed
+  keys. Two consumers need **two cursors** — `TryFrameAt` — or one starves.
+- **Two consumers of one tap starve each other.** `readGen` is per-consumer, not
+  per-tap. Reset the cursor when the tap is replaced, or a stale one reads as
+  "nothing new yet" until the count climbs past the old generation.
+- **A heavy style is capped, so call `CapScale`.** All six styles implemented
+  `Heavy`/`CapScale` and nothing called them, so `usage`'s claim that expensive
+  styles are capped described an intention. The pump reads the cap each tick
+  rather than baking it into the ticker, because a ticker cannot change rate and
+  `v` must take effect without restarting mpv.
 - **`LevelTap` hands out copies, deliberately.** `Bands`/`Wave`/`Frame` copy under
   the mutex. The lock protects the *slice header*, not the contents, so returning
   the header and letting the caller read it let the pump overwrite the spectrum
@@ -196,6 +275,7 @@ Rules of thumb, each of which was a bug first:
 ```
 main.go      arg parsing, playQueue (owns the queue index; playTrack never mutates it)
 search.go    ytfzf/yt-dlp search -> []Track       library.go  dir scan -> []Track
+playlist.go  file args, globs, .m3u -> []Track    naturalsort.go  filename order
 tui.go       browse list (+ line-mode fallback)   session.go  trackSession, decoder goroutine, render loop
 player.go    Player: transport, byte routing, : prompt   sync.go  SyncPlayer: ffmpeg video + mpv audio
 ipc.go       mpv JSON IPC                         hud.go    title / progress / parseTimestamp / miniBars
@@ -217,6 +297,11 @@ would force exporting it all.
   `videoFrame` with a nil buffer. The one structural difference is **where the
   position comes from**: video counts frames on two clocks, music asks its one
   child (`SyncPlayer.Seconds()` branches; `checkSync` is a no-op).
+- **A positional argument is a file only if it looks like one, and that check
+  needs the filesystem — so `parseArgs` collects and `main` decides.** Joining
+  them in `parseArgs` is what made `rasterbar ~/Music/song.mp3` a YouTube search
+  for that string. `-l` beats file args outright, since a directory scan has its
+  own walk and parser.
 - **Sync:** ffmpeg (video) and mpv (audio) drift; `checkSync` asks mpv's real
   position every 2s and corrects past 250ms. `VSPZ_YT_CLI_DEBUG_SYNC=1` shows it.
   `Seconds()` must add `startAt` or a resize rewinds audio to the start.
