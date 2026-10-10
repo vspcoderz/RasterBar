@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // ytdlpauth.go teaches yt-dlp who you are.
@@ -88,6 +91,28 @@ func (a ytdlpAuthConfig) withArgs(base ...string) []string {
 	return append(append([]string{}, base...), a.args()...)
 }
 
+// ytdlpBin is the binary to run. A variable rather than a literal so a test can
+// point it at a script that fails the way a crash fails; there is no other reason
+// to run anything else.
+var ytdlpBin = "yt-dlp"
+
+// ytdlpCrashRetries is how many extra attempts a *crashed* yt-dlp gets.
+//
+// Zero tolerance is wrong here and infinite is worse. Observed: `yt-dlp -J` on a
+// real URL segfaulting intermittently -- "signal: segmentation fault (core
+// dumped)" -- while the identical command run five times by hand succeeded every
+// time. A crash is not a refusal: the same invocation works, so retrying is
+// correct rather than papering over.
+//
+// Two attempts is enough to ride out a transient and not enough to turn a genuinely
+// broken install into a hang, and the failure is reported with what to do about it
+// rather than swallowed.
+//
+// Deliberately *not* retried: the bot check. AGENTS.md is explicit that no amount
+// of retrying fixes it, and a retry loop there would turn a one-second answer
+// into a five-second one with the same text at the end.
+const ytdlpCrashRetries = 2
+
 // run executes yt-dlp and returns its stdout.
 //
 // stderr is captured rather than inherited, for two reasons. The subprocess runs
@@ -96,7 +121,30 @@ func (a ytdlpAuthConfig) withArgs(base ...string) []string {
 // picture. And the error text is the only way to recognise the bot check, which
 // needs to be turned into an instruction instead of being passed through.
 func (a ytdlpAuthConfig) run(args ...string) ([]byte, error) {
-	cmd := exec.Command("yt-dlp", a.withArgs(args...)...)
+	var last error
+	for attempt := 0; attempt <= ytdlpCrashRetries; attempt++ {
+		out, err := a.runOnce(args...)
+		if err == nil {
+			return out, nil
+		}
+		last = err
+		if !crashedBySignal(err) {
+			return nil, err
+		}
+		if attempt == ytdlpCrashRetries {
+			break
+		}
+		// Linear backoff. Long enough not to hammer a process that is already
+		// struggling, short enough that a track does not appear to hang.
+		time.Sleep(time.Duration(attempt+1) * 400 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("%w\n  yt-dlp crashed %d times in a row. That is a broken yt-dlp, not a YouTube problem:\n"+
+		"  update it (pipx upgrade yt-dlp / yt-dlp -U), or install a different build.", last, ytdlpCrashRetries+1)
+}
+
+// runOnce is one attempt, with no retry logic.
+func (a ytdlpAuthConfig) runOnce(args ...string) ([]byte, error) {
+	cmd := exec.Command(ytdlpBin, a.withArgs(args...)...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -104,6 +152,21 @@ func (a ytdlpAuthConfig) run(args ...string) ([]byte, error) {
 		return nil, explainYtdlpError(err, stderr.String(), a)
 	}
 	return out, nil
+}
+
+// crashedBySignal reports whether err is a process killed by a signal.
+//
+// Only that. A non-zero *exit* is yt-dlp saying no -- a bad URL, a network
+// failure, the bot check -- and repeating those changes nothing. A signal means
+// the process did not get to decide anything, so it is the one case where the
+// same command may well succeed next time.
+func crashedBySignal(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ProcessState == nil {
+		return false
+	}
+	ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled()
 }
 
 // botCheck is what YouTube says when it wants a logged-in browser.
