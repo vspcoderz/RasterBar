@@ -970,6 +970,23 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	// paintMusic draws one spectrum frame. Split out so the render loop's select
 	// arm stays a single statement and the rebuild path can share it.
 	paintMusic := func() error {
+		// A dead tap is an error, not a quiet picture.
+		//
+		// Measured on a live YouTube track: the tap's ffmpeg exited within
+		// seconds, the process stayed up, and all eighteen styles drew an empty
+		// grid for the rest of the song with nothing anywhere saying why. The tap
+		// has always recorded its exit and Dead has always existed -- nothing
+		// called it. Same shape as the Viz.CapScale bug in AGENTS.md: both halves
+		// of the interface, and the consumer never written.
+		//
+		// Reported once and then fatal, because a tap that is dead stays dead:
+		// there is no spectrum left to draw and continuing would just hold the
+		// last frame on screen forever.
+		if sess.tap != nil {
+			if d := sess.tap.Dead(); d != nil {
+				return fmt.Errorf("audio tap died, so the visualiser has nothing to draw: %w", d)
+			}
+		}
 		// Push before Clear/Paint: the styles fold the new analysis into their
 		// own state (waterfall captures a row, particles integrate), and doing it
 		// in this order means the frame drawn is the frame analysed.

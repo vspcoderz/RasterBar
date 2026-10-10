@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -186,6 +188,42 @@ func levelTapArgs(mediaURL string, startAt float64) []string {
 	return args
 }
 
+// lockedTail is a bounded, concurrency-safe sink for a child's stderr.
+//
+// Bounded because ffmpeg at -loglevel error can still emit a long banner on a
+// pathological input, and this buffer is read on the render loop's error path
+// where an unbounded one would be a memory leak with a user-visible symptom.
+type lockedTail struct {
+	mu  sync.Mutex
+	buf *bytes.Buffer
+}
+
+const errTailMax = 2048
+
+func (t *lockedTail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.buf.Len() < errTailMax {
+		t.buf.Write(p)
+	}
+	return len(p), nil
+}
+
+// String is the captured stderr, trimmed to the last few lines.
+//
+// The *last* lines, not the first: ffmpeg's final complaint is the one that
+// explains the exit, and the first lines are the configuration dump.
+func (t *lockedTail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := strings.TrimSpace(t.buf.String())
+	lines := strings.Split(s, "\n")
+	if len(lines) > 4 {
+		lines = lines[len(lines)-4:]
+	}
+	return strings.TrimSpace(strings.Join(lines, "; "))
+}
+
 // LevelTap decodes a media URL's audio to raw PCM and exposes spectrum bands, the
 // time-domain waveform and an onset envelope.
 type LevelTap struct {
@@ -205,10 +243,13 @@ type LevelTap struct {
 	gen     uint64
 	readGen uint64
 	// dead is the pump's exit error, or nil while it is running. See Dead.
-	dead   error
-	an     *SpectrumAnalyzer
-	onsets *onsetDetector
-	once   sync.Once
+	dead error
+	// errTail holds ffmpeg's captured stderr, so Dead can say why rather than
+	// only that it stopped. See lockedTail.
+	errTail *lockedTail
+	an      *SpectrumAnalyzer
+	onsets  *onsetDetector
+	once    sync.Once
 
 	// sig is how a freeze is delivered to ffmpeg, indirected so a test can observe
 	// the pause without spawning one. Same reason player_test has a fakeMedia.
@@ -248,6 +289,16 @@ func StartLevelTapAt(mediaURL string, startAt float64) (*LevelTap, error) {
 	if err != nil {
 		return nil, err
 	}
+	// ffmpeg's stderr is captured, not inherited.
+	//
+	// With no Stderr set the child inherits this process's stderr, which is the
+	// terminal -- in raw mode, being drawn on. An ffmpeg error therefore
+	// interleaved with the visualiser's own output, and it was the one thing that
+	// could have explained the dead tap being invisible. Capturing it turns "the
+	// screen went blank" into a sentence.
+	var errTail lockedTail
+	errTail.buf = &bytes.Buffer{}
+	cmd.Stderr = &errTail
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("level tap start: %w", err)
 	}
@@ -259,6 +310,7 @@ func StartLevelTapAt(mediaURL string, startAt float64) (*LevelTap, error) {
 		bands:   make([]float64, bands),
 		wave:    make([]float64, 0, waveWindow),
 		waveBuf: make([]float64, fftSize),
+		errTail: &errTail,
 		sig: func(s os.Signal) error {
 			return cmd.Process.Signal(s)
 		},
@@ -309,6 +361,16 @@ func (l *LevelTap) pump() {
 			l.mu.Lock()
 			l.dead = err
 			l.mu.Unlock()
+			// Reap it here. pump is the only goroutine that waits on this child,
+			// and returning without Wait leaves a zombie for the life of the
+			// process -- observed on a live track, where the tap was `[ffmpeg]
+			// <defunct>` under a running rasterbar for the whole song.
+			_ = l.cmd.Wait()
+			if tail := l.errTail.String(); tail != "" {
+				l.mu.Lock()
+				l.dead = fmt.Errorf("level tap stopped (%v): %s", err, tail)
+				l.mu.Unlock()
+			}
 			return
 		}
 	}
@@ -391,9 +453,15 @@ func (l *LevelTap) TryFrameAt(readGen *uint64) (AudioFrame, bool) {
 // StartLevelTapAt only fails when ffmpeg cannot be *started*. A tap that starts
 // and then dies — an expired googlevideo grant, a container it cannot demux —
 // gives pump an EOF on the first ReadFull and the goroutine simply returns.
-// Nothing observed that, so music mode kept drawing the last spectrum it had for
-// the rest of the track, which is indistinguishable from a hung process. The
-// render loop reports this through the status line once per tap.
+//
+// Dead existed and nothing called it. Measured on a real YouTube track: the tap
+// died within seconds of starting, the process stayed alive, and every one of
+// the eighteen styles drew an empty grid for the rest of the track with no
+// message anywhere. That is the same disease as AGENTS.md's rule about a failed
+// probe — "folding ffprobe's failure into 'no audio' reported a corrupt download
+// as 'no audio stream in <title>', which is a confident wrong answer" — except
+// the wrong answer was a blank screen. The pump records the exit so the render
+// loop can report it, and pumpMusic now does.
 func (l *LevelTap) Dead() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -498,4 +566,16 @@ func rmsLevel(pcm []byte) float64 {
 		return 1
 	}
 	return level
+}
+
+// StderrTail is what ffmpeg said on its way out.
+//
+// Separate from Dead so the error path can quote it, and so a test can assert the
+// capture works without having to parse an error string. Empty while the tap is
+// healthy.
+func (l *LevelTap) StderrTail() string {
+	if l.errTail == nil {
+		return ""
+	}
+	return l.errTail.String()
 }
