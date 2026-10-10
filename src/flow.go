@@ -57,7 +57,7 @@ func (s *SyncPlayer) pauseChildren() {
 	if s.audio != nil && s.audio.Process != nil {
 		_ = s.audio.Process.Signal(syscall.SIGSTOP)
 	}
-	s.paused = true
+	s.paused.Store(true)
 }
 
 // resumeChildren continues every child process.
@@ -68,11 +68,11 @@ func (s *SyncPlayer) resumeChildren() {
 	if s.audio != nil && s.audio.Process != nil {
 		_ = s.audio.Process.Signal(syscall.SIGCONT)
 	}
-	s.paused = false
+	s.paused.Store(false)
 }
 
 // Paused reports whether the children are currently suspended.
-func (s *SyncPlayer) Paused() bool { return s.paused }
+func (s *SyncPlayer) Paused() bool { return s.paused.Load() }
 
 // awaitDrain blocks until the terminal accepts output again, or until the key
 // channel closes (the user quit, or stdin reached EOF). Returns false if we gave

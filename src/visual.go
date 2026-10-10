@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -208,6 +209,10 @@ type LevelTap struct {
 	an     *SpectrumAnalyzer
 	onsets *onsetDetector
 	once   sync.Once
+
+	// sig is how a freeze is delivered to ffmpeg, indirected so a test can observe
+	// the pause without spawning one. Same reason player_test has a fakeMedia.
+	sig func(os.Signal) error
 }
 
 // spectrumRate is higher than the old RMS tap on purpose: an FFT needs
@@ -234,6 +239,9 @@ func StartLevelTap(mediaURL string) (*LevelTap, error) {
 // copy of the stream (see resolveAudioPair on why it cannot share mpv's), so it
 // has to be told where playback is or it analyses from the top of the file while
 // the music plays from the middle.
+//
+// The offset is what makes a pause recoverable: a tap stopped by SetPaused and
+// resumed picks up in the same place it was frozen, so it stays aligned with mpv.
 func StartLevelTapAt(mediaURL string, startAt float64) (*LevelTap, error) {
 	cmd := exec.Command("ffmpeg", levelTapArgs(mediaURL, startAt)...)
 	r, err := cmd.StdoutPipe()
@@ -251,6 +259,9 @@ func StartLevelTapAt(mediaURL string, startAt float64) (*LevelTap, error) {
 		bands:   make([]float64, bands),
 		wave:    make([]float64, 0, waveWindow),
 		waveBuf: make([]float64, fftSize),
+		sig: func(s os.Signal) error {
+			return cmd.Process.Signal(s)
+		},
 	}
 	go lt.pump()
 	return lt, nil
@@ -401,6 +412,33 @@ func (l *LevelTap) frameLocked() AudioFrame {
 		Beat:  l.beat,
 		BPM:   l.bpm,
 	}
+}
+
+// SetPaused freezes or resumes the tap's ffmpeg.
+//
+// The tap is not decoration. It runs its own ffmpeg over its own copy of the
+// stream, paced by -re, so it is a clock — and in music mode it is the clock the
+// visualizer is drawn from. Left running through a pause it keeps consuming
+// audio, so the spectrum animates against a stopped sound and, worse, it ends up
+// permanently ahead of mpv by the length of the pause. Nothing can correct that
+// afterwards: checkSync compares mpv against the video *frame counter*, and music
+// mode has no frame counter.
+//
+// SIGSTOP rather than closing the pipe: the pipe's contents are the analysis
+// history, and the styles want to resume on the frame they froze on.
+//
+// Safe on a tap that was never started or is already closed, because a pause is
+// delivered to a session whose children may be any mix of the three, and reaching
+// for a nil process there would turn a keypress into a crash.
+func (l *LevelTap) SetPaused(paused bool) {
+	if l == nil || l.sig == nil {
+		return
+	}
+	if paused {
+		_ = l.sig(syscall.SIGSTOP)
+		return
+	}
+	_ = l.sig(syscall.SIGCONT)
 }
 
 func (l *LevelTap) Close() {

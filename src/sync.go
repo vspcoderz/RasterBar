@@ -52,7 +52,7 @@ type SyncPlayer struct {
 	// removed the *use* of a shared counter from the loop, not the counter
 	// itself, and checkSync still calls Seconds from another goroutine.
 	frames   atomic.Int64
-	paused   bool
+	paused   atomic.Bool
 	ipc      *mpvIPC
 	sockPath string
 	cols     int
@@ -350,9 +350,19 @@ func (s *SyncPlayer) Seconds() float64 {
 // and a socket round trip there is a stall of unknown length on a connection that
 // can block: a busy mpv answers late, and the frame budget is gone. Polling
 // somewhere else turns that into one missed tick instead of a dropped frame.
+//
+// A paused player is not polled at all, for the same reason checkSync and
+// SetVolume both bail on one. SIGSTOP does not stop mpv from *listening*, it stops
+// it from answering, so the read does not fail fast — it blocks for the whole
+// timeout on every single frame, which is a 60ms tax on a 33ms budget for as long
+// as the user holds the pause. The clock holds its last value anyway (posClock's
+// whole design), so refusing to ask costs nothing.
 func (s *SyncPlayer) pollPosition(timeout time.Duration) (float64, bool) {
 	if s.ipc == nil {
 		return 0, false
+	}
+	if s.paused.Load() {
+		return s.clock.now(), false
 	}
 	pos, ok := s.ipc.timePos(timeout)
 	s.clock.update(pos, ok)
@@ -395,7 +405,7 @@ const driftCorrectThreshold = 0.25
 // would look like a passing measurement rather than an absent one.
 func (s *SyncPlayer) checkSync() (SyncReport, bool) {
 	v := s.Seconds()
-	if s.musicOnly || s.paused || s.ipc == nil {
+	if s.musicOnly || s.paused.Load() || s.ipc == nil {
 		return SyncReport{VideoPos: v}, false
 	}
 	a, ok := s.ipc.timePos(400 * time.Millisecond)

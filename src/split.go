@@ -41,6 +41,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -288,6 +289,10 @@ type videoPane struct {
 	live   *videoTap
 	stop   chan struct{}
 	closed bool
+
+	// sig freezes the pane's ffmpeg, indirected for the same reason as
+	// LevelTap.sig: a test should not have to spawn a decoder to check a pause.
+	sig func(os.Signal) error
 }
 
 // newVideoPane allocates the pane's buffer at a geometry.
@@ -297,6 +302,30 @@ func newVideoPane(cols, rows int, mode ColorMode, glyph GlyphMode) *videoPane {
 		n = 1
 	}
 	return &videoPane{cols: cols, rows: rows, frame: make([]byte, n)}
+}
+
+// SetPaused freezes or resumes the pane's ffmpeg.
+//
+// The pane is a third clock: its own ffmpeg, its own grant, its own -re pacing.
+// Left running through a pause it plays video against frozen audio and resumes it
+// the length of the pause out of step with mpv — the same failure, and the same
+// cause, as LevelTap.SetPaused.
+//
+// Freezing leaves the last frame in p.frame, so Latest keeps returning something
+// drawable and the split view holds its picture instead of blanking.
+func (p *videoPane) SetPaused(paused bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// sig is only set by startLive, so it already means "there is a process to
+	// signal" — checking p.live as well would be the same test twice.
+	if p.closed || p.sig == nil {
+		return
+	}
+	if paused {
+		_ = p.sig(syscall.SIGSTOP)
+		return
+	}
+	_ = p.sig(syscall.SIGCONT)
 }
 
 // Resize reallocates for a new geometry. The contents are dropped: the producer
@@ -345,6 +374,12 @@ func (p *videoPane) startLive(videoURL string, fps int, startAt float64, mode Co
 	p.cols, p.rows = vt.cols, vt.rows
 	stop := make(chan struct{})
 	p.stop = stop
+	// Armed here, inside the same critical section as p.live, so a pause can
+	// never observe one without the other.
+	if vt.cmd != nil && vt.cmd.Process != nil {
+		cmd := vt.cmd
+		p.sig = func(s os.Signal) error { return cmd.Process.Signal(s) }
+	}
 	// Frame one is already in hand; show it before the goroutine starts.
 	first := make([]byte, len(vt.first))
 	copy(first, vt.first)

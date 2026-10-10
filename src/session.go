@@ -594,13 +594,31 @@ func currentChapter(chaps []Chapter, pos float64) string {
 	return title
 }
 
-// SetPaused freezes or resumes both children.
+// SetPaused freezes or resumes every clock the track is running on.
 //
-// SIGSTOP on both in the same instant is the whole mechanism, and it is the one
-// flow.go already uses for a covered terminal. Freezing both clocks together is
-// what preserves A/V sync exactly, which is why pausing does not go through
-// mpv's pause property: mpv would stop on the sound card's schedule while the
-// video pipe kept filling, and that backlog would surface as a burst on resume.
+// SIGSTOP on all of them in the same instant is the whole mechanism, and it is
+// the one flow.go already uses for a covered terminal. Freezing them together is
+// what preserves sync exactly, which is why pausing does not go through mpv's
+// pause property: mpv would stop on the sound card's schedule while the video
+// pipe kept filling, and that backlog would surface as a burst on resume.
+//
+// "Every clock" is three, not two, and the third was the bug. Video mode has mpv
+// and ffmpeg, both inside SyncPlayer, so pauseChildren covered it. Music mode has
+// no ffmpeg — and therefore no frame counter and no video pipe — but it has the
+// LevelTap's ffmpeg instead, plus the split pane's, and both are -re paced clocks
+// of the same media. PauseChildren saw a nil ff, correctly, and froze one of the
+// three. The visible half was a spectrum and a split pane animating against a
+// stopped sound; the half that actually mattered was that the tap kept consuming
+// audio, so it ended the pause permanently ahead of mpv by the pause's length,
+// and no later correction could close that — checkSync compares mpv against a
+// frame counter that music mode does not have.
+//
+// The same two taps sit under video mode's `s` strip, which is why this fixes
+// that too rather than only the full-screen visualizer.
+//
+// Order is not load-bearing — the signals land microseconds apart — but mpv goes
+// first because it is the reference clock the other two are drawn against, and
+// the reading should match the rule rather than look arbitrary.
 func (s *trackSession) SetPaused(paused bool) error {
 	if s.cur == nil {
 		return nil
@@ -608,9 +626,17 @@ func (s *trackSession) SetPaused(paused bool) error {
 	s.paused = paused
 	if paused {
 		s.cur.pauseChildren()
+		s.tap.SetPaused(true)
+		if s.pane != nil {
+			s.pane.SetPaused(true)
+		}
 		return nil
 	}
 	s.cur.resumeChildren()
+	s.tap.SetPaused(false)
+	if s.pane != nil {
+		s.pane.SetPaused(false)
+	}
 	// Apply anything the user asked for while we were frozen.
 	if s.hasPendingVol && s.cur.ipc != nil {
 		if err := s.cur.ipc.setVolume(s.pendingVol); err == nil {

@@ -78,6 +78,23 @@ test or an explicit comment.
   act on.
 
 **Concurrency / lifecycle**
+- **A track has three clocks and pause must freeze all of them, not the ones
+  that happen to be inside `SyncPlayer`.** `pauseChildren` SIGSTOPs `ff` and
+  `audio`, which is all of them in video mode. Music mode has a nil `ff` and two
+  `-re`-paced ffmpegs of its own — the `LevelTap` and the split pane's
+  `videoTap` — so freezing mpv alone left the spectrum and the split video
+  animating against a stopped sound. Measured with `/proc/<pid>/stat`: paused on
+  the old code, `mpv=T` and both `ffmpeg=S`; after the fix, all three `T`.
+  The half that could not be undone was the tap: it kept consuming audio, so it
+  ended every pause permanently ahead of mpv by the pause's length, and
+  `checkSync` cannot fix it — music mode has no frame counter to compare against.
+  `TestPauseReachesEveryChildClock` fails if either call is dropped.
+- **A SIGSTOPped process still listens; it just stops answering.** So a paused
+  mpv makes `pollPosition` block for the full `musicPollTimeout` on *every*
+  frame — a 60ms tax on a 33ms budget. `checkSync` and `SetVolume` already
+  bailed on a paused player; the music pump was the third caller that forgot.
+  `SyncPlayer.paused` is an `atomic.Bool` because the pump reads it from another
+  goroutine.
 - **Never close the video pipe before killing ffmpeg, and never `Wait` on mpv.**
   Both hang the render loop (which then ignores `q`). `Close` signals `SIGCONT`
   before `SIGKILL`; ffmpeg wait is bounded by `childReapTimeout`. `mpv` is reaped
