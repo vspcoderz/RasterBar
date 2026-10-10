@@ -607,3 +607,48 @@ func TestPeaksFillsTheWidth(t *testing.T) {
 		t.Errorf("the axis is at the background; peaksAxisInk is %v", peaksAxisInk)
 	}
 }
+
+// TestMatrixLeavesGapsBetweenLEDs pins the fix for matrix rendering as a solid
+// slab.
+//
+// With one LED per column and the unlit LEDs drawn too, the lit columns ran
+// straight into each other and into their own dark LEDs: measured in colour at
+// 120x40 on a full-spectrum track, the picture was one solid rainbow block with a
+// stepped top edge -- a filled area chart, not hardware. Adjacent cells with no
+// space between them are not dots.
+func TestMatrixLeavesGapsBetweenLEDs(t *testing.T) {
+	const cols, rows = 120, 40
+	m := &matrixViz{}
+	m.Resize(cols, rows)
+	m.Push(&AudioFrame{Bands: ones(bands)})
+	g := NewVizGrid(cols, rows, false, 1)
+	g.Clear()
+	m.Paint(g)
+
+	// Somewhere in the middle of the matrix, a run of columns must contain at
+	// least one cell left at the background -- the gap.
+	base := rows - m.cells
+	worst := 0
+	run := 0
+	for x := 0; x < cols; x++ {
+		lit := false
+		for y := base; y < rows; y++ {
+			if g.At(x, y) != g.bgRamp {
+				lit = true
+				break
+			}
+		}
+		if lit {
+			run++
+			if run > worst {
+				worst = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	if worst > matrixGap {
+		t.Errorf("a run of %d consecutive lit columns; the pitch is %d, so no more than %d may touch",
+			worst, matrixGap, matrixGap)
+	}
+}

@@ -156,12 +156,23 @@ func (r *raysViz) Paint(g *VizGrid) {
 		}
 		for d := 0; d < head; d++ {
 			y := r.rows - 1 - d
-			// Fade with distance from the head, on a curve rather than linearly:
-			// a linear fade spends half its cells below the level the ramp can
-			// even show, because the bottom of the ramp is a space.
-			t := 1 - float64(d)/length
+			// Brightness *rises* toward the top of the shaft, and the tail above
+			// fades out from there. That ordering is the whole difference between a
+			// light shaft and a bar with a gap, and it was backwards the first time.
+			//
+			// Measured in colour at 120x40, against barsViz as the reference: with
+			// the head at the bottom the picture was indistinguishable from bars --
+			// flat top, bright foot, hard edge exactly at the level. Bright at the
+			// top plus a fading tail gives a soft upper edge, which is the only
+			// thing that reads as light rather than as a quantity.
+			//
+			// smoothstep rather than linear: a linear ramp spends half its cells
+			// below what the palette can show, because the bottom of the value
+			// range is very nearly the background.
+			t := float64(d) / length
 			ink := rayBodyInk + (rayHeadInk-rayBodyInk)*smoothstep(t)
-			if d == 0 {
+			if d == head-1 {
+				// The head itself, which is where the onset flash lands.
 				ink = maxFloat(ink, r.headInk)
 			}
 			g.Set(x, y, rampFor(ink), g.Color(band, t, r.headInk))

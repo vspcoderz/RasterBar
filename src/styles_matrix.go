@@ -22,6 +22,19 @@ type matrixViz struct {
 }
 
 const (
+	// matrixGap is the column pitch: a lit LED, then that many empty columns.
+	//
+	// Without it the dots are adjacent cells, and adjacent cells with no space
+	// between them are not dots. Measured at 120x40 on a full-spectrum track, in
+	// colour: the lit columns merged with the unlit LEDs below them into one solid
+	// rainbow slab with a stepped top edge, which reads as a filled area chart and
+	// not as hardware at all. The gap is the entire difference between an LED
+	// matrix and an area chart.
+	//
+	// One gap column, not more. At 250 columns a pitch of 2 gives 125 LEDs, which
+	// is still dense enough to read as a meter; a wider pitch leaves more empty
+	// column than LED.
+	matrixGap = 2
 	// matrixCells is the *minimum* height of the LED matrix, in dots.
 	//
 	// A floor, not a constant. The first version fixed it at 8 whatever the
@@ -101,7 +114,9 @@ func (m *matrixViz) Paint(g *VizGrid) {
 	levels := m.viz.Level()
 	peaks := m.viz.Peak()
 	base := m.rows - m.cells
-	for x := 0; x < m.cols && x < m.n; x++ {
+	// One LED every matrixGap columns. The gap is what makes these read as dots;
+	// see matrixGap.
+	for x := 0; x < m.cols && x < m.n; x += matrixGap {
 		// Quantise with a round, not a floor. Floor puts a level of 0.99 in the
 		// first dot and 1.01 in the second, so the meter jumps a whole step at
 		// exactly full scale and never reads the level it is at below it. Round
