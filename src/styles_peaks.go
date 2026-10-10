@@ -41,18 +41,45 @@ var bandRatio = math.Pow(nyquistHz()/loBandHz, 1.0/float64(bands))
 const (
 	// peaksFloor is the level below which a band is not considered a note.
 	//
-	// Not small: this is the noise floor as the *smoother* reports it, and on a
-	// quiet passage the floor is the content. 0.12 was chosen so a synthesised
-	// tone reads clearly while broadband noise does not produce forty needles,
-	// and it is the one constant in this file that wants checking against real
-	// music rather than a fixture.
-	peaksFloor = 0.12
-	// peaksMax is the ceiling on needles drawn.
+	// Measured against real material, not chosen and hoped for. 0.12 was set from a
+	// synthesised tone and turned out to be far too high: on the 12s drum-and-bass
+	// fixture, only three or four bands passed it, so a 120-column screen drew three
+	// needles and 114 columns of empty panel -- the same failure as the old flat cap,
+	// just reached a different way. Raising `need` cannot fix that, because the limit
+	// is how many bands *qualify*, not how many slots there are.
 	//
-	// A count, not a fraction of the grid, because the point is that the picture
-	// stays sparse: forty needles is the spectrum again. Six is about the widest
-	// chord a listener can name.
-	peaksMax = 6
+	// 0.04 admits the quieter partials, and the picture stays a comb because height
+	// carries the level: a needle at 0.05 is a dot on the axis and a needle at 0.9
+	// is a full-height spike. That is the honest reading -- the comb gets denser as
+	// the music does -- and it is what a tuner display actually does.
+	peaksFloor = 0.04
+	// peaksMin and peaksMax bound the needle count. The first version capped at a
+	// flat 6, which is right on an 80-column terminal and absurd on a 250-column
+	// one: measured at 120x40 it drew six needles and left 114 columns empty, so
+	// the picture was almost entirely background and read as a renderer that had
+	// stopped. The count follows the width now, like every other spectrum style.
+	peaksMin = 6
+	peaksMax = 28
+	// peaksPerCol is how many columns one needle gets. 5 at the low end because a
+	// dense comb is not readable as separate notes; the point of the style is that
+	// the gaps mean something.
+	peaksPerCol = 5
+	// peaksAxisInk is the axis the needles stand on.
+	//
+	// Brighter than barsViz's baselineInk on purpose. That value is 0.10, chosen to
+	// be "visible as a line without being readable as a value" -- but in colour
+	// mode the cell's *colour* is what shows, and Color(band, 0.10, 0) on a
+	// by-band palette is very nearly black. Measured: peaks' axis was invisible
+	// on screen, so the needles had nothing to stand on and the picture read as
+	// dots floating in nothing.
+	peaksAxisInk = 0.34
+	// peaksFaintInk is the ceiling brightness of the spectrum curve behind the
+	// needles, and peaksFaintFloor the level below which it is not drawn.
+	//
+	// Dim on purpose, and bounded well below 1: this is context, not content. If
+	// it were bright it would be barsViz and the needles would be lost in it.
+	peaksFaintInk   = 0.34
+	peaksFaintFloor = 0.03
 )
 
 func (p *peaksViz) Name() string { return "peaks" }
@@ -71,7 +98,17 @@ func (p *peaksViz) Resize(cols, rows int) {
 	if len(p.scratch) != bands {
 		p.scratch = make([]float64, bands)
 	}
-	p.need = minInt(peaksMax, maxInt(cols/8, 3))
+	// Needles follow the width, floored so a narrow grid still shows a chord and
+	// capped so a wide one does not become the spectrum again -- forty needles is
+	// barsViz with extra steps, and the whole point is that the gaps mean
+	// something.
+	p.need = cols / peaksPerCol
+	if p.need < peaksMin {
+		p.need = peaksMin
+	}
+	if p.need > peaksMax {
+		p.need = peaksMax
+	}
 	if len(p.bestVal) != p.need {
 		p.bestVal = make([]float64, p.need)
 		p.bestIdx = make([]int, p.need)
@@ -141,12 +178,39 @@ func (p *peaksViz) Paint(g *VizGrid) {
 		bestIdx[j] = i
 	}
 
+	// The spectrum itself, faint, behind the needles.
+	//
+	// Added because the style's premise -- only the peaks, so a triad reads as
+	// three needles -- means a real track has three or four peaks in it, and the
+	// rest of the grid was empty background. Measured at 120x40: three needles
+	// and 114 empty columns, which reads as a renderer that failed rather than as
+	// a sparse reading. The faint curve is the same data, drawn dim, so the space
+	// between the needles carries the spectrum they were picked out of. It cannot
+	// be mistaken for a needle because a needle is full-brightness and reaches
+	// from the axis.
+	axisY := p.rows - 1
+	for x := 0; x < p.cols; x++ {
+		bi := x * len(levels) / maxInt(p.cols, 1)
+		if bi >= len(levels) {
+			bi = len(levels) - 1
+		}
+		v := clamp01(levels[bi])
+		if v <= peaksFaintFloor {
+			continue
+		}
+		y := axisY - int(v*float64(axisY))
+		if y < 0 {
+			y = 0
+		}
+		b := bandPos(x, p.cols)
+		g.Set(x, y, rampFor(peaksFaintInk*v), g.Color(b, v*peaksFaintInk, 0))
+	}
+
 	// The axis the needles stand on. Without it a needle is a floating segment
 	// and the height of the pitch is unreadable -- a bass note and a hat at the
 	// same level would be the same picture.
-	axisY := p.rows - 1
 	for x := 0; x < p.cols; x++ {
-		g.Set(x, axisY, rampFor(baselineInk), g.Color(bandPos(x, p.cols), baselineInk, 0))
+		g.Set(x, axisY, rampFor(peaksAxisInk), g.Color(bandPos(x, p.cols), peaksAxisInk, 0))
 	}
 
 	for k := 0; k < p.need; k++ {

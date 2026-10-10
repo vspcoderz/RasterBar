@@ -22,14 +22,29 @@ type matrixViz struct {
 }
 
 const (
-	// matrixCells is the height of the LED matrix in dots.
+	// matrixCells is the *minimum* height of the LED matrix, in dots.
 	//
-	// Fixed rather than the row count, and the reason is that a fixed count is
-	// what makes a level *readable*. With one dot per row, every level is
-	// distinct and nothing is legible, because the eye cannot compare two
-	// continuous numbers that are one cell apart. Eight is enough rows of dots
-	// that "five of eight" is a thing you can see.
+	// A floor, not a constant. The first version fixed it at 8 whatever the
+	// terminal was, which is defensible on a 22-row grid and broken on a 45-row
+	// one: measured at 120x40, eight rows of meter sat at the bottom and the
+	// other thirty-two were an empty dark panel, which reads as a renderer that
+	// gave up rather than as a meter.
+	//
+	// Still fixed *per dot*, which is the part that makes it a meter: with one dot
+	// per row, every level is distinct and nothing is legible, because the eye
+	// cannot compare two numbers that are one cell apart. Quantisation has to be
+	// visible or there is no meter, just a bar chart with gaps.
 	matrixCells = 8
+	// matrixMaxCells is the ceiling. Past this the dots are too small to read as
+	// separate and the column stops looking like hardware.
+	matrixMaxCells = 24
+	// matrixHeightPct is how much of the grid the matrix takes on a tall
+	// terminal, as a percentage, before matrixMaxCells clamps it.
+	//
+	// A percentage rather than a fraction because this multiplies an int row count
+	// and 0.7 there truncates to zero, which the compiler catches but which is a
+	// needlessly confusing way to write rows*7/10.
+	matrixHeightPct = 70
 	// matrixGapInk is the brightness of the unlit dots of a column.
 	//
 	// Not zero: the point of a hardware meter is that the LEDs are *there*, dark,
@@ -51,7 +66,18 @@ func (m *matrixViz) Resize(cols, rows int) {
 	if len(m.scratch) != m.n {
 		m.scratch = make([]float64, m.n)
 	}
-	m.cells = minInt(rows, matrixCells)
+	// Dots scale with the grid, floored at matrixCells so a small terminal still
+	// gets a meter and capped at matrixMaxCells so a tall one stays readable.
+	m.cells = rows * matrixHeightPct / 100
+	if m.cells < matrixCells {
+		m.cells = matrixCells
+	}
+	if m.cells > matrixMaxCells {
+		m.cells = matrixMaxCells
+	}
+	if m.cells > rows {
+		m.cells = rows
+	}
 	if m.cells < 1 {
 		m.cells = 1
 	}

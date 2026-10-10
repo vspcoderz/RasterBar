@@ -486,3 +486,124 @@ func TestPhosphorBlitLeavesDarkCellsAlone(t *testing.T) {
 		t.Error("a cell above the floor was left at the background")
 	}
 }
+
+// TestMatrixGrowsWithTheGrid pins the fix for matrix on a tall terminal.
+//
+// The style had a hard 8 dots whatever the grid was, so at 40 rows it drew
+// eight rows of meter and left thirty-two rows of empty panel -- measured at
+// 120x40, and it reads as a renderer that gave up rather than as a meter.
+func TestMatrixGrowsWithTheGrid(t *testing.T) {
+	cellsAt := func(rows int) int {
+		m := &matrixViz{}
+		m.Resize(120, rows)
+		return m.cells
+	}
+	// 10 rows: 10*70/100 = 7, under the floor, so the floor applies.
+	// 22 rows: 22*70/100 = 15, the fraction on its own.
+	// 200 rows: 140, over the ceiling, so the ceiling applies.
+	small, mid, huge := cellsAt(10), cellsAt(22), cellsAt(200)
+	if small != matrixCells {
+		t.Errorf("at 10 rows: %d dots, want the floor %d", small, matrixCells)
+	}
+	if mid != 22*matrixHeightPct/100 {
+		t.Errorf("at 22 rows: %d dots, want the scaled %d", mid, 22*matrixHeightPct/100)
+	}
+	if huge != matrixMaxCells {
+		t.Errorf("at 200 rows: %d dots, want the ceiling %d", huge, matrixMaxCells)
+	}
+	// And the dots must never exceed the rows available, or the peak cap lands
+	// off the grid.
+	m := &matrixViz{}
+	m.Resize(20, 4)
+	if m.cells > 4 {
+		t.Errorf("cells = %d on a 4-row grid", m.cells)
+	}
+}
+
+// TestRaysLeaveHeadroomAndGaps is the fix for rays looking like a solid mass.
+//
+// Shaft length was level*rows, so every loud band ran to the top of the grid and
+// the tail added another 0.55 of its own length above that: measured at 120x40 it
+// filled 38 of 40 rows with no gap anywhere. Both properties are asserted here --
+// headroom at the top, and an unlit column between shafts.
+func TestRaysLeaveHeadroomAndGaps(t *testing.T) {
+	const cols, rows = 120, 40
+	v := &raysViz{}
+	v.Resize(cols, rows)
+	// Full scale everywhere: the loudest possible picture.
+	v.Push(&AudioFrame{Bands: ones(bands), Beat: 1})
+	g := NewVizGrid(cols, rows, false, 1)
+	g.Clear()
+	v.Paint(g)
+
+	lit := 0
+	for x := 0; x < cols; x++ {
+		if g.At(x, 0) != g.bgRamp {
+			lit++
+		}
+	}
+	if lit > 0 {
+		t.Errorf("%d columns are lit on the top row; a full-scale shaft reaches %.0f%% of the height, so the top should be clear",
+			lit, rayHeightFrac*100)
+	}
+	// A gap: a column just left of the second shaft must be unlit at the bottom
+	// row, where every shaft is at least rayEpsilon long.
+	gapCol := v.gap - 1
+	if gapCol > 0 && g.At(gapCol, rows-1) != g.bgRamp {
+		t.Errorf("column %d, between shafts at pitch %d, is lit at the bottom row; the shafts are touching",
+			gapCol, v.gap)
+	}
+	// And the pitch stays inside its bounds at any width, with the shaft *count*
+	// bounded -- that is what keeps a 250-column terminal from growing a picket
+	// fence. The pitch cannot keep widening past n=maxDrawnBands, which is why
+	// the bound is on the count and not on the gap.
+	for _, c := range []int{40, 80, 120, 200, 250, 300} {
+		w := &raysViz{}
+		w.Resize(c, 40)
+		if w.gap < rayGapMin || w.gap > rayGapMax {
+			t.Errorf("at %d columns the gap is %d, outside [%d,%d]", c, w.gap, rayGapMin, rayGapMax)
+		}
+		// The bound is on the count, which is what the width is actually buying.
+		// A tolerance of one gap, because cols/rayShafts is a truncating divide.
+		if shafts := (c + w.gap - 1) / w.gap; shafts > rayShafts+w.gap {
+			t.Errorf("at %d columns there are %d shafts, want around %d", c, shafts, rayShafts)
+		}
+	}
+}
+
+// TestPeaksFillsTheWidth is the fix for peaks drawing six needles on a
+// 120-column screen and leaving the rest of the picture empty.
+func TestPeaksFillsTheWidth(t *testing.T) {
+	needAt := func(cols int) int {
+		p := &peaksViz{}
+		p.Resize(cols, 40)
+		return p.need
+	}
+	// 40 cols: 8 by the fraction, above the floor of 6.
+	// 120 cols: 24, which is the whole point -- the old flat cap drew 6.
+	// 20 cols: 4, under the floor, so the floor applies.
+	if got, want := needAt(120), 120/peaksPerCol; got != want {
+		t.Errorf("at 120 columns: %d needles, want %d", got, want)
+	}
+	if got := needAt(40); got != 40/peaksPerCol {
+		t.Errorf("at 40 columns: %d needles, want %d", got, 40/peaksPerCol)
+	}
+	if got := needAt(20); got != peaksMin {
+		t.Errorf("at 20 columns: %d needles, want the floor %d", got, peaksMin)
+	}
+	if got := needAt(400); got > peaksMax {
+		t.Errorf("at 400 columns: %d needles, above the ceiling %d", got, peaksMax)
+	}
+	// The axis has to be visible, which in colour mode means the palette has to
+	// be asked for something above the background. It was 0.10, which is very
+	// nearly black on a by-band palette.
+	p := &peaksViz{}
+	p.Resize(120, 40)
+	p.Push(&AudioFrame{Bands: ones(bands)})
+	g := NewVizGrid(120, 40, false, 1)
+	g.Clear()
+	p.Paint(g)
+	if g.At(60, 39) == g.bgRamp {
+		t.Errorf("the axis is at the background; peaksAxisInk is %v", peaksAxisInk)
+	}
+}

@@ -18,6 +18,8 @@ type raysViz struct {
 	n          int
 	viz        Visualizer
 	scratch    []float64
+	// gap is the column pitch of the shafts, chosen in Resize from the width.
+	gap int
 	// headInk is the onset envelope, which brightens the shaft's *head* and
 	// nothing else: a whole picture that flashes is a strobe, and the point is
 	// that only the leading edge pops.
@@ -27,19 +29,37 @@ type raysViz struct {
 }
 
 const (
-	// rayGap is how many columns one shaft occupies, including the gap.
+	// rayGapMin is the narrowest gap allowed between shafts, in columns.
 	//
-	// 2, so half the grid is shaft. 3 reads as sparser and more like light, 1
-	// reads as bars -- and at one column per shaft a 200-column grid is 100
-	// shafts, which stops being light and starts being a bar chart.
-	rayGap = 2
-	// rayTailRows is how far above its level a shaft fades to nothing.
+	// The gap is what makes them shafts rather than bars. It is derived from the
+	// *column count*, not the band count: the first version used the band count,
+	// which is capped at maxDrawnBands, so at 200 columns the gap came out at 3
+	// and the grid grew 67 shafts instead of the ~40 the constant asks for --
+	// caught by TestRaysLeaveHeadroomAndGaps, which asserts the shaft count and
+	// not just the pitch.
+	rayGapMin = 2
+	// rayGapMax is the widest gap. At 8 columns a one-column shaft still reads as
+	// a shaft rather than as an accident, and the ceiling is what stops a 300
+	// column terminal from drawing a dozen of them.
+	rayGapMax = 8
+	// rayShafts is how many shafts the gap is chosen to fit, at any width.
+	rayShafts = 40
+	// rayHeightFrac is how much of the grid a full-scale shaft reaches.
 	//
-	// Relative to the level, not a fixed row count: a shaft for a quiet band ends
-	// in the same place relative to its own head as a loud one does, which is
-	// what makes the two comparable. A fixed tail would make quiet bands look
-	// like they reach further than loud ones.
-	rayTailRows = 0.55
+	// Below 1, and that is the fix for the first version: shaft length was
+	// level*rows, so every loud band ran to the very top of the grid and the
+	// picture was a solid mass with a stair-stepped edge and no headroom at all.
+	// Measured at 120x40 that filled 38 of 40 rows. With headroom the loudest
+	// shaft stops short of the top and the shape is a shape.
+	rayHeightFrac = 0.78
+	// rayTailFrac is how far above its head a shaft fades to nothing, as a
+	// fraction of its own length.
+	//
+	// Was 0.55, and that was the other half of the solid mass: a shaft's tail
+	// reached more than half its own height again, so the gaps between adjacent
+	// shafts were filled by their neighbours' tails. 0.22 keeps the glow visible
+	// and the shafts separate.
+	rayTailFrac = 0.22
 	// rayHeadInk is the brightness of the shaft's leading cell.
 	rayHeadInk = 0.95
 	// rayBodyInk is the brightness one row further from the head, so the shaft's
@@ -63,6 +83,17 @@ func (r *raysViz) Resize(cols, rows int) {
 	if len(r.scratch) != r.n {
 		r.scratch = make([]float64, r.n)
 	}
+	// The gap follows the *width*, so the shaft count stays near rayShafts at any
+	// terminal size. Derived from cols rather than r.n: the shafts are laid out
+	// across the columns, and r.n is capped at maxDrawnBands, so scaling the gap
+	// by it under-spaced every grid wider than that cap.
+	r.gap = cols / rayShafts
+	if r.gap < rayGapMin {
+		r.gap = rayGapMin
+	}
+	if r.gap > rayGapMax {
+		r.gap = rayGapMax
+	}
 }
 
 func (r *raysViz) Reset() {
@@ -84,6 +115,13 @@ func (r *raysViz) Paint(g *VizGrid) {
 		return
 	}
 	levels := r.viz.Level()
+	// The reachable height, with headroom above it. See rayHeightFrac: a shaft
+	// that reaches the top of the grid has no headroom, and a picture with no
+	// headroom is a solid mass.
+	usable := float64(r.rows) * rayHeightFrac
+	if usable < 1 {
+		usable = 1
+	}
 	// The head's brightness follows the *rise* of the envelope, not its level:
 	// a level-following head glows continuously through a loud passage, which is
 	// a glow, not a pop.
@@ -100,19 +138,19 @@ func (r *raysViz) Paint(g *VizGrid) {
 		// renderer never reached, and a quiet passage reads as a broken renderer
 		// rather than as quiet music. See barsViz's axis tick for the same
 		// argument.
-		len := lv*float64(r.rows) + rayEpsilon
-		if len < 1 {
-			len = 1
+		length := lv*usable + rayEpsilon
+		if length < 1 {
+			length = 1
 		}
-		if len > float64(r.rows) {
-			len = float64(r.rows)
+		if length > usable {
+			length = usable
 		}
 		band := bandPos(i, r.n)
-		x := i * rayGap
+		x := i * r.gap
 		if x >= r.cols {
 			break
 		}
-		head := int(len)
+		head := int(length)
 		if head > r.rows {
 			head = r.rows
 		}
@@ -121,16 +159,16 @@ func (r *raysViz) Paint(g *VizGrid) {
 			// Fade with distance from the head, on a curve rather than linearly:
 			// a linear fade spends half its cells below the level the ramp can
 			// even show, because the bottom of the ramp is a space.
-			t := 1 - float64(d)/len
+			t := 1 - float64(d)/length
 			ink := rayBodyInk + (rayHeadInk-rayBodyInk)*smoothstep(t)
 			if d == 0 {
 				ink = maxFloat(ink, r.headInk)
 			}
 			g.Set(x, y, rampFor(ink), g.Color(band, t, r.headInk))
 		}
-		// The tail above the head, fading to the background over rayTailRows of
+		// The tail above the head, fading to the background over rayTailFrac of
 		// the shaft's own length.
-		tail := int(len * rayTailRows)
+		tail := int(length * rayTailFrac)
 		for d := head; d < head+tail && d < r.rows; d++ {
 			t := 1 - float64(d-head)/maxFloat(float64(tail), 1)
 			ink := rayBodyInk * 0.5 * t
