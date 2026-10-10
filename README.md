@@ -10,8 +10,8 @@
 # RasterBar
 
 **A YouTube player that lives in your terminal.**
-ASCII video, or a music visualiser with ten gradient palettes — in one static
-binary with **zero third-party Go modules**.
+ASCII video, or a music visualiser with eighteen styles and ten gradient palettes
+— in one static binary with **zero third-party Go modules**.
 
 </div>
 
@@ -51,21 +51,53 @@ Two modes, one player:
 
 | | |
 |---|---|
-| **`-M` music mode** *(default)* | no video. Six audio-reacting visualisers, ten palettes, beat detection. |
+| **`-M` music mode** *(default)* | no video. Eighteen audio-reacting visualisers, ten palettes, beat detection. |
 | **`-a` video mode** | ASCII or truecolour video, with the spectrum strip under the picture. |
 
 ## Visualisers
 
 `v` and `V` walk them; `--viz NAME` picks one at startup.
 
+Eighteen, in the order `v` walks them — the readable ones first, the strange ones
+last.
+
+**From the waveform** (amplitude against time)
+
+| name | what it does |
+|---|---|
+| `scope` | a triggered oscilloscope. ~2.5 cycles of the dominant pitch, standing still. |
+| `lissajous` | the waveform against itself, quarter-period delayed. A tone is an ellipse. |
+| `ribbon` | the waveform's per-column min and max, filled. Loudness as thickness. |
+| `swell` | a waterfall of the waveform rather than the spectrum. Tremolos and fades are shapes here. |
+
+**From the spectrum** (frequency against level)
+
 | name | what it does |
 |---|---|
 | `bars` | the classic. Bars grow from the baseline, peak caps hold the top. |
-| `scope` | a waveform trace, aspect-corrected so it's a line and not a smear. |
 | `mirror` | mirrored around the centreline — the wings in the screenshots. |
+| `matrix` | a hardware LED meter. Eight quantised dots per band, dark ones drawn. |
+| `peaks` | only the local maxima, as needles at interpolated frequency. A triad is three needles. |
+| `rays` | light shafts rising from the bottom. Heads pop on transients. |
+| `wheel` | a polar spectrum: every band its own radius band, loudness is *thickness*. |
+| `helix` | the spectrum wound onto a rotating coil, bass at the outside. |
+| `terrain` | the spectrum's history in perspective, receding to a horizon. |
 | `waterfall` | a scrolling spectrogram. Newest row on top, fading with age. |
 | `radial` | one spoke per frequency band, fanning out from the centre. |
+
+**From the beat and the tempo**
+
+| name | what it does |
+|---|---|
+| `bloom` | an expanding ring per onset, sized by the spectrum's brightness. |
+| `metro` | wavefronts travelling outward at the estimated BPM. The only style that uses the tempo. |
 | `particles` | dots launched on transients and integrated with momentum. |
+
+**A field, not a reading**
+
+| name | what it does |
+|---|---|
+| `aurora` | a drifting noise field lit by the bass. Capped, not disabled, on a big grid. |
 
 ## Palettes
 
@@ -193,7 +225,7 @@ Music mode only — there is no visualiser in video mode:
 
 | key | |
 |---|---|
-| `v` `V` | next / previous visualiser |
+| `v` `V` | next / previous visualiser (18 of them; `--viz NAME` picks one outright) |
 | `c` | next palette |
 | `1`–`9` `0` | pick a palette directly |
 | `W` | split view: video beside the visualiser (off by default) |

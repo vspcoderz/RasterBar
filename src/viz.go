@@ -330,13 +330,69 @@ const musicPollTimeout = 60 * time.Millisecond
 // Order is cheap-first. Pressing `v` repeatedly should walk through the visual
 // styles and end somewhere surprising, not run into the particle field on the
 // second press.
+//
+// The waveform styles sit next to each other, and the spectrum ones after them,
+// because the pairs read alike and grouping them means `v` walks through
+// families rather than through eighteen unrelated pictures.
 var vizRegistry = []func() Viz{
 	func() Viz { return &barsViz{} },
 	func() Viz { return &scopeViz{} },
+	func() Viz { return &lissajousViz{} },
+	func() Viz { return &ribbonViz{} },
+	func() Viz { return &swellViz{} },
 	func() Viz { return &mirrorViz{} },
+	func() Viz { return &matrixViz{} },
+	func() Viz { return &peaksViz{} },
+	func() Viz { return &raysViz{} },
+	func() Viz { return &wheelViz{} },
+	func() Viz { return &helixViz{} },
+	func() Viz { return &terrainViz{} },
 	func() Viz { return &waterfallViz{} },
 	func() Viz { return &radialViz{} },
+	func() Viz { return &bloomViz{} },
+	func() Viz { return &metroViz{} },
 	func() Viz { return &particlesViz{} },
+	func() Viz { return &auroraViz{} },
+}
+
+// waveOnlyStyles are the styles whose picture comes from the time-domain
+// waveform, and which therefore draw nothing from bands alone.
+//
+// A set rather than a string compare on "scope", because there are now four
+// such styles and the next one would otherwise be added as an exception rather
+// than as a fact. TestStylesOnlyDrawFromTheirOwnInput asserts the set equals the
+// styles that actually behave this way, so a style that starts using bands
+// without being removed from here fails rather than being excused.
+//
+// lissajous and scope both read Bands -- for the zoom, in scope's case -- but
+// neither *draws* without a waveform, which is what the test measures.
+var waveOnlyStyles = map[string]bool{
+	"scope":     true,
+	"lissajous": true,
+	"ribbon":    true,
+	"swell":     true,
+}
+
+// tempoStyles are the styles driven by the tempo estimate rather than by a
+// level. Exempt from the bands-alone check because a tempo-driven style that
+// drew from bands alone would not be a tempo-driven style.
+//
+// metro is the only one, and it exists because AudioFrame.BPM was computed by
+// the onset detector and read by nothing but the HUD.
+var tempoStyles = map[string]bool{
+	"metro": true,
+}
+
+// heavyStyles is the registry's heavy set, asserted against what the styles
+// actually report by TestHeavyStylesAreMarkedAndCapped.
+//
+// Named rather than counted, because a count pins the *number* and says nothing
+// about *which* styles are expensive: adding an eleventh style would satisfy a
+// `heavy == 2` assertion while the new expensive one claimed to be cheap.
+var heavyStyles = map[string]bool{
+	"radial":    true,
+	"particles": true,
+	"aurora":    true,
 }
 
 // VizNames lists the registry in cycling order, for --help and the style line.

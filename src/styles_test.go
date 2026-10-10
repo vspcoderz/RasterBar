@@ -58,14 +58,35 @@ func TestStylesOnlyDrawFromTheirOwnInput(t *testing.T) {
 		g := NewVizGrid(60, 16, false, 1)
 		g.Clear()
 		v.Paint(g)
-		if v.Name() == "scope" {
+		name := v.Name()
+		switch {
+		case waveOnlyStyles[name]:
 			if cellsAboveBg(g) != 0 {
-				t.Error("scope drew something from bands alone; it must use the waveform")
+				t.Errorf("%s drew something from bands alone; it must use the waveform", name)
 			}
-			continue
+		case tempoStyles[name]:
+			// Exempt, and deliberately so. metro's only input is a tempo that is
+			// 0 until the detector commits, so drawing nothing here is its correct
+			// behaviour rather than a missing input. An exempt style still has to
+			// pass every other registry-wide suite, including the real-audio one
+			// that requires it to have drawn something by the end of a fixture.
+		default:
+			if cellsAboveBg(g) == 0 {
+				t.Errorf("%s drew nothing from bands alone", name)
+			}
 		}
-		if cellsAboveBg(g) == 0 {
-			t.Errorf("%s drew nothing from bands alone", v.Name())
+	}
+	// The sets are not a loophole: every name in them must be a registered style,
+	// or a typo would silently exempt nothing -- or exempt a style that does not
+	// exist and let a real one through unexamined.
+	for _, set := range []struct {
+		name string
+		m    map[string]bool
+	}{{"waveOnlyStyles", waveOnlyStyles}, {"tempoStyles", tempoStyles}} {
+		for name := range set.m {
+			if _, ok := VizByName(name); !ok {
+				t.Errorf("%s names %q, which is not a registered style", set.name, name)
+			}
 		}
 	}
 }
@@ -429,7 +450,6 @@ func TestParticlesNeverExceedTheirBudget(t *testing.T) {
 // expensive styles have to say so, and their cost has to stop growing past some
 // point rather than tracking the cell count forever.
 func TestHeavyStylesAreMarkedAndCapped(t *testing.T) {
-	heavy := 0
 	for _, mk := range vizRegistry {
 		v := mk()
 		// The scale is a ratio against the style's own ceiling, so 1 means
@@ -442,12 +462,24 @@ func TestHeavyStylesAreMarkedAndCapped(t *testing.T) {
 					v.Name(), sz.cols, sz.rows, scale)
 			}
 		}
-		if v.Heavy() {
-			heavy++
+		// The set, not a count. `heavy == 2` pins the *number* and says nothing
+		// about *which* styles are expensive, so an eleventh style would satisfy
+		// the assertion while the new expensive one quietly claimed to be cheap.
+		// Both directions are checked: a style that is heavy must be declared, and
+		// a declared style must actually be heavy, because the declaration is what
+		// makes the render loop apply the cap.
+		name := v.Name()
+		if v.Heavy() && !heavyStyles[name] {
+			t.Errorf("%s reports Heavy but is not in heavyStyles", name)
+		}
+		if !v.Heavy() && heavyStyles[name] {
+			t.Errorf("%s is in heavyStyles but does not report Heavy, so the cap never applies", name)
 		}
 	}
-	if heavy != 2 {
-		t.Errorf("%d heavy styles, want 2 (radial and particles)", heavy)
+	for name := range heavyStyles {
+		if _, ok := VizByName(name); !ok {
+			t.Errorf("heavyStyles names %q, which is not a registered style", name)
+		}
 	}
 }
 
@@ -500,9 +532,82 @@ func TestRegistryNamesAreUniqueAndResolvable(t *testing.T) {
 // TestEveryRegistryStyleIsInThePlan checks the list did not quietly drift.
 
 // TestEveryRegistryStyleIsInThePlan checks the list did not quietly drift.
+//
+// A count, so a style added without a line here is visible in review. The rules
+// that actually need pinning are the sets in viz.go, which this does not replace:
+// 18 is a number, and a number says nothing about whether the new style was
+// measured, capped or given a doc comment.
 func TestEveryRegistryStyleIsInThePlan(t *testing.T) {
-	if got := len(vizRegistry); got != 6 {
-		t.Errorf("%d styles registered, want 6", got)
+	if got := len(vizRegistry); got != 18 {
+		t.Errorf("%d styles registered, want 18", got)
+	}
+}
+
+// TestResetDropsEveryStyleState is the seek case, across the whole registry.
+//
+// A style that keeps a history and does not clear it on Reset draws the part of
+// the song you just left, at the position you jumped to. That is invisible to
+// every other test here -- they push, paint and assert -- because the state is
+// always consistent with the audio it was fed.
+//
+// Eleven of the eighteen keep state, so this is the one test that would catch
+// the eleventh forgetting.
+//
+// The bar is a *control* instance of the same style fed nothing but silence, not
+// zero lit cells. That distinction is the whole test: matrixViz deliberately
+// draws its unlit LEDs and metroViz deliberately draws its tempo front, so both
+// light cells with no audio at all, and a "must be dark" assertion would fail
+// them for drawing what they are supposed to draw. Comparing against a control
+// isolates the thing that is actually the bug -- state that survived a reset
+// that nothing but silence could have produced.
+func TestResetDropsEveryStyleState(t *testing.T) {
+	const cols, rows = 48, 14
+	silence := func() *AudioFrame {
+		return &AudioFrame{Bands: make([]float64, bands), Wave: make([]float64, fftSize)}
+	}
+	litAfter := func(v Viz) int {
+		for i := 0; i < 3; i++ {
+			v.Push(silence())
+		}
+		g := NewVizGrid(cols, rows, true, 2)
+		g.Clear()
+		v.Paint(g)
+		return cellsAboveBg(g)
+	}
+	for _, mk := range vizRegistry {
+		t.Run(mk().Name(), func(t *testing.T) {
+			v := mk()
+			v.Resize(cols, rows)
+			// Loud and hot, several analyses deep, so any history is full.
+			for i := 0; i < 6; i++ {
+				v.Push(&AudioFrame{
+					Bands: rampBands(bands, 0.9),
+					Wave:  rampWave(fftSize),
+					Beat:  1,
+					BPM:   128,
+				})
+			}
+			g := NewVizGrid(cols, rows, true, 2)
+			g.Clear()
+			v.Paint(g)
+			if cellsAboveBg(g) == 0 {
+				t.Fatalf("%s drew nothing before Reset, so this proves nothing", v.Name())
+			}
+			v.Reset()
+			got := litAfter(v)
+			// The control: a fresh instance of the same style, never fed anything
+			// but silence.
+			control := mk()
+			control.Resize(cols, rows)
+			want := litAfter(control)
+			// Slack for a phosphor trail still decaying and for a style whose own
+			// silence drawing depends on when the push happened. Not a full screen.
+			slack := cols * rows / 16
+			if got > want+slack {
+				t.Errorf("%s left %d cells lit after Reset on silence; a fresh instance draws %d, want <= %d (+%d slack)",
+					v.Name(), got, want, want, slack)
+			}
+		})
 	}
 }
 

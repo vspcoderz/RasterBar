@@ -1,5 +1,7 @@
 package main
 
+import "math"
+
 // The visualizer styles.
 //
 // Six of them, all painting into the same neutral grid (see viz.go). They differ
@@ -124,4 +126,90 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// sumRange adds a half-open range, for the decimating averages.
+//
+// Half-open, and clamped to the slice's length, because the callers divide by
+// the width they asked for rather than the width they got: a short read at the
+// end of the window must not divide by a count that includes samples that were
+// never there.
+func sumRange(v []float64, lo, hi int) float64 {
+	var sum float64
+	for i := lo; i < hi && i < len(v); i++ {
+		sum += v[i]
+	}
+	return sum
+}
+
+// clampSigned saturates to -1..1, for a waveform sample.
+//
+// A NaN becomes 0 rather than propagating: it would reach an int conversion and
+// index a cell with a garbage row, which in a full-screen style is a panic in
+// the render loop rather than one wrong pixel.
+func clampSigned(v float64) float64 {
+	switch {
+	case v != v:
+		return 0
+	case v < -1:
+		return -1
+	case v > 1:
+		return 1
+	}
+	return v
+}
+
+// lerp, smoothstep, hash2 and vnoise are the arithmetic the styles share.
+//
+// They live here rather than in each style because several of them want the
+// same two lines, and three copies of an easing curve is three places to change
+// it when the picture looks wrong.
+
+// lerp is linear interpolation. t is not clamped: the styles clamp at the ends
+// where it matters and an extra branch per call sits in a per-cell path.
+func lerp(a, b, t float64) float64 { return a + (b-a)*t }
+
+// smoothstep is the classic 3t²-2t³ ease, clamped at both ends.
+//
+// The clamp is not defensive tidiness. A style that runs its field coordinate
+// past 1 and out the other side gets 3-2t² > 1 here, which is a field that
+// inverts instead of repeating, and it looks like a rendering fault rather than
+// an arithmetic one.
+func smoothstep(t float64) float64 {
+	if t <= 0 {
+		return 0
+	}
+	if t >= 1 {
+		return 1
+	}
+	return t * t * (3 - 2*t)
+}
+
+// hash2 is a 32-bit integer hash to 0..1.
+//
+// Deterministic on purpose, for the reason particlesViz uses the golden angle
+// instead of a random source: the same music must give the same picture, or a
+// bug report is a description of a frame nobody else can reproduce.
+func hash2(x, y int) float64 {
+	h := uint32(x)*0x9E3779B1 ^ uint32(y)*0x85EBCA77
+	h ^= h >> 15
+	h *= 0x2545F491
+	h ^= h >> 13
+	return float64(h) / 4294967296.0
+}
+
+// vnoise is 2D value noise in 0..1: a lattice of hashes, smoothly interpolated.
+//
+// Not fBm and not a gradient noise with derivatives -- the styles using it want
+// a soft, cheap, non-repeating drift, and four octaves of that is four times the
+// hash arithmetic in a loop that already runs per cell per frame. That per-cell
+// cost is why auroraViz is the registry's heavy style, and it is heavy for
+// exactly this reason rather than for the sake of having one.
+func vnoise(x, y float64) float64 {
+	fx, fy := math.Floor(x), math.Floor(y)
+	xi, yi := int(fx), int(fy)
+	tx, ty := smoothstep(x-fx), smoothstep(y-fy)
+	a := lerp(hash2(xi, yi), hash2(xi+1, yi), tx)
+	b := lerp(hash2(xi, yi+1), hash2(xi+1, yi+1), tx)
+	return lerp(a, b, ty)
 }

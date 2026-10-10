@@ -11,7 +11,7 @@ import (
 	"github.com/vspcoderz/rasterbar/internal/term"
 )
 
-const usage = `rasterbar - terminal YouTube player: ASCII video or a music visualizer
+const usageTemplate = `rasterbar - terminal YouTube player: ASCII video or a music visualizer
 
 usage:
   rasterbar <query>                    search YouTube
@@ -22,7 +22,7 @@ verbs:
   play <query|file...>   search YouTube, or play files — the default
   search <query>         force a search, even if an argument looks like a path
   list [DIR]             browse a directory (was -l DIR); defaults to "."
-  viz NAME               bars scope mirror waterfall radial particles
+  viz NAME               %s
   palette NAME           spectrum height ocean ember graphite ink ice magma
                          viridis mono
   help                   this text
@@ -150,12 +150,26 @@ ffmpeg decode cost scales with resolution, and an 80x22 character grid cannot
 show the difference between 360p and 1080p. Video is letterboxed rather than
 stretched, so the picture keeps its own shape whatever shape your window is. The
 spectrum is computed in-process with a hand-rolled FFT, so there are no
-third-party Go modules. The expensive styles (radial, particles) are capped
-rather than disabled: particles never exceed 400, and on a large grid radial
-draws at a fraction of the frame rate rather than at none.
+third-party Go modules. The expensive styles (radial, particles, aurora) are
+capped rather than disabled: particles never exceed 400, and on a large grid
+radial and aurora draw at a fraction of the frame rate rather than at none.
 
 requires: yt-dlp, ffmpeg, mpv  (ytfzf optional, used as the primary scraper)
 `
+
+// usage is the help text with the style list filled in from the registry.
+//
+// Generated rather than written out, for the reason paletteCount generates the
+// digit table: a hardcoded list of style names is right exactly until the next
+// style lands, and nothing fails when it goes stale -- `--viz` still resolves, the
+// error message still lists the real names, and the help quietly lies about what
+// exists. Found by driving the binary after adding twelve styles: the help still
+// said six.
+//
+// strings.Replace rather than fmt.Sprintf: the template already contains a `%` in
+// its percentage-related prose, and Sprintf would reject it as an unknown verb.
+// One substitution site does not need a format string.
+var usage = strings.Replace(usageTemplate, "%s", strings.Join(VizNames(), " "), 1)
 
 type options struct {
 	// args holds the positional arguments in the order given, after any leading

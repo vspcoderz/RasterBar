@@ -16,6 +16,21 @@ const (
 	bands      = 48
 )
 
+// analysisHz is how often the tap produces an analysed frame.
+//
+// Derived, not a separate constant: the tap reads in fftSize-sized blocks
+// (`io.ReadFull` in LevelTap.pump) so the hop is exactly one window, which is
+// why AGENTS.md's "~11Hz" is this number and not a round figure. A style that
+// advances a clock per Push -- metro, whose whole premise is tempo -- has to use
+// this and not assume 11, or its wavefront drifts by 2.3%.
+//
+// The float64 conversion is load-bearing. spectrumHz and fftSize are untyped
+// integer constants, so `spectrumHz / fftSize` is integer division evaluated at
+// compile time: 11025/1024 is 10, not 10.766, and a tempo-driven style advancing
+// by one beat per analysis would be 7.7% slow -- a tempo that is visibly wrong
+// for a reason that reads as a rounding mistake somewhere else.
+const analysisHz = float64(spectrumHz) / float64(fftSize)
+
 // agcSpanDb is how many dB of dynamic range each band is shown across.
 //
 // 42dB is a little less than the usual 60dB of a spectrum analyser, because the top
@@ -289,6 +304,81 @@ func NewSpectrumAnalyzer(rate, nBands int) *SpectrumAnalyzer {
 }
 
 func pow(base, exp float64) float64 { return math.Pow(base, exp) }
+
+// The band layout as a function, for the styles.
+//
+// NewSpectrumAnalyzer builds the same mapping into edges[] and keeps it private,
+// which left the visualizers with no way to turn a band index into a frequency.
+// scopeViz needs it to decide how much of the waveform to show (see
+// scopeCycles): showing the tap's full 1024-sample window puts 41 cycles of a
+// 440Hz note across an 80-column screen, two columns per cycle, which aliases
+// into a band and makes every note look identical.
+//
+// Derived from the same closed form as the constructor above rather than read
+// back out of it, so a style asking a question about a band does not need an
+// analyser instance -- but the two must agree, and TestBandHzAgreesWithTheEdges
+// is what holds them to it.
+//
+// n is the number of *drawn* bands, not the analyser's. Styles resample on the
+// way in (resampleBands), so index i of n drawn bands is analyser band
+// i*bands/n, and past n > bands the mapping saturates: the analyser really
+// cannot resolve more frequencies than it has bins.
+func bandHz(i, n int) float64 {
+	if n < 1 {
+		return loBandHz
+	}
+	// Clamped, not short-circuited: a caller with an off-by-one index gets band 0
+	// or the top band, which is a usable answer, rather than a bare 30Hz that
+	// means "no band" and quietly reads as the bottom of the spectrum.
+	if i < 0 {
+		i = 0
+	}
+	if i > n-1 {
+		i = n - 1
+	}
+	j := i * bands / n
+	if j < 0 {
+		j = 0
+	}
+	if j > bands-1 {
+		j = bands - 1
+	}
+	// Geometric centre of the band, not the arithmetic one: the edges are
+	// logarithmic, so the midpoint in Hz of a band from 30Hz to 33Hz is 31.5 and
+	// the geometric centre is the same thing here -- but for a band from 3000 to
+	// 3300 the arithmetic midpoint is 3150 and the geometric one is 3147, and it
+	// is the geometric one that matches what resampleBands averaged.
+	return loBandHz * math.Pow(nyquistHz()/loBandHz, (float64(j)+0.5)/float64(bands))
+}
+
+// loBandHz is the analyser's lowest band edge. Duplicated as a constant rather
+// than read from the constructor's local so bandHz can be called from a test
+// with no analyser at all.
+const loBandHz = 30.0
+
+func nyquistHz() float64 { return spectrumHz / 2 }
+
+// dominantBand is the loudest band in an analysed frame and its frequency.
+//
+// The index is over the analyser's own bands, because that is what AudioFrame
+// carries -- resampling happens inside the styles, downstream of this.
+//
+// Ties resolve to the lower band. A tie means the spectrum is flat, and on a
+// flat spectrum the honest answer is "the bass end", not whichever index the
+// comparison happened to reach first, because a scope that zooms to a tie would
+// jump between 30Hz and 5kHz on a passage that has no pitch at all.
+func dominantBand(mags []float64) (int, float64) {
+	best, bestI := 0.0, 0
+	for i, v := range mags {
+		if v > best {
+			best, bestI = v, i
+		}
+	}
+	if bestI >= bands {
+		bestI = bands - 1
+	}
+	return bestI, bandHz(bestI, bands)
+}
 
 // Analyze consumes mono float samples in [-1,1] and returns band magnitudes
 // smoothed over time. Fewer than fftSize samples zero-pads.

@@ -1,0 +1,114 @@
+package main
+
+// --- matrix ------------------------------------------------------------------
+
+// matrixViz is a hardware-style LED meter: quantised dots, one column per band.
+//
+// Reads as an instrument rather than a chart, which is the point. Where barsViz
+// draws a continuous height and therefore says "about 0.63", this draws the dot
+// that is lit and says "six of eight" -- the quantisation is the information,
+// not a loss of it. It is also the cheapest style in the registry: a dot is one
+// Set, and the whole picture is a loop over columns with a compare per row.
+type matrixViz struct {
+	cols, rows int
+	n          int
+	viz        Visualizer
+	scratch    []float64
+	// cells is how many dots tall a band can be. Capped below the row count
+	// because a meter with as many steps as it has rows is not a meter; 8 is the
+	// LED-matrix part of the reference, and the cap is what makes the
+	// quantisation visible at all.
+	cells int
+}
+
+const (
+	// matrixCells is the height of the LED matrix in dots.
+	//
+	// Fixed rather than the row count, and the reason is that a fixed count is
+	// what makes a level *readable*. With one dot per row, every level is
+	// distinct and nothing is legible, because the eye cannot compare two
+	// continuous numbers that are one cell apart. Eight is enough rows of dots
+	// that "five of eight" is a thing you can see.
+	matrixCells = 8
+	// matrixGapInk is the brightness of the unlit dots of a column.
+	//
+	// Not zero: the point of a hardware meter is that the LEDs are *there*, dark,
+	// and seeing the dark ones is what tells you which are lit. A matrix with only
+	// the lit dots drawn is a bar chart with gaps.
+	matrixGapInk = 0.14
+)
+
+func (m *matrixViz) Name() string { return "matrix" }
+func (m *matrixViz) Heavy() bool  { return false }
+func (m *matrixViz) CapScale(int, int) float64 {
+	return 1
+}
+
+func (m *matrixViz) Resize(cols, rows int) {
+	m.cols, m.rows = cols, rows
+	m.n = bandCountFor(cols)
+	m.viz.Resize(m.n)
+	if len(m.scratch) != m.n {
+		m.scratch = make([]float64, m.n)
+	}
+	m.cells = minInt(rows, matrixCells)
+	if m.cells < 1 {
+		m.cells = 1
+	}
+}
+
+func (m *matrixViz) Reset() {
+	m.viz = Visualizer{level: make([]float64, m.n), peak: make([]float64, m.n)}
+}
+
+// Push resamples the analyser's bands up to one per column, then feeds the
+// smoother. See barsViz.Push for why the resample belongs on the way in.
+func (m *matrixViz) Push(f *AudioFrame) {
+	resampleBands(f.Bands, m.n, m.scratch)
+	m.viz.Push(m.scratch)
+}
+
+func (m *matrixViz) Paint(g *VizGrid) {
+	if m.n == 0 || m.cols == 0 || m.cells == 0 {
+		return
+	}
+	levels := m.viz.Level()
+	peaks := m.viz.Peak()
+	base := m.rows - m.cells
+	for x := 0; x < m.cols && x < m.n; x++ {
+		// Quantise with a round, not a floor. Floor puts a level of 0.99 in the
+		// first dot and 1.01 in the second, so the meter jumps a whole step at
+		// exactly full scale and never reads the level it is at below it. Round
+		// maps 0..1 onto the nearest dot, which is the mapping that makes "six of
+		// eight" mean the band is 0.69-0.81 of full.
+		n := int(clamp01(levels[x])*float64(m.cells) + 0.5)
+		if n > m.cells {
+			n = m.cells
+		}
+		band := bandPos(x, m.n)
+		for y := 0; y < m.cells; y++ {
+			y0 := base + y
+			if y < n {
+				// Lit dots: brightness by height up the matrix, so the top of a
+				// column is the brightest and a level is legible as a position as
+				// well as a count.
+				v := 0.45 + 0.55*float64(y+1)/float64(m.cells)
+				g.Set(x, y0, rampFor(v), g.Color(band, v, 0))
+			} else {
+				// The dark LEDs, drawn rather than skipped. The point of a
+				// hardware meter is that the LEDs are there, unlit, and seeing
+				// which ones are dark is what tells you which are lit.
+				g.Set(x, y0, rampFor(matrixGapInk), g.Color(band, 0, 0))
+			}
+		}
+		// The cap, at the row just above the lit dots, in the brightest ramp
+		// index there is. It is the hardware meter's peak indicator and it earns
+		// its row: without it the meter shows where it is now and not how loud
+		// the passage was.
+		if p := int(clamp01(peaks[x])*float64(m.cells) + 0.5); p > n {
+			if y0 := base - 1 + n; y0 >= 0 && y0 < m.rows {
+				g.Set(x, y0, rampBright, g.Color(band, 1, 0))
+			}
+		}
+	}
+}

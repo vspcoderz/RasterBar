@@ -137,6 +137,62 @@ test or an explicit comment.
   0.42-0.80 where tones read 0.04-0.11. Calibrate against real material.
 - **The dB window adapts per spectrum, not per band.** Per band makes an empty
   band read full scale.
+- **`analysisHz` needs its `float64` conversion.** `spectrumHz/fftSize` with both
+  untyped int constants is *integer division evaluated at compile time*: 11025/1024
+  is 10, not 10.766. A tempo-driven style advancing one beat per analysis is then
+  7.7% slow — a wrong tempo that reads as a rounding mistake somewhere else. `go
+  vet` catches the `%f`-with-int case; it caught this one only because a test
+  printed the value.
+- **`bandHz` is a second copy of the analyser's band layout**, in closed form,
+  because `NewSpectrumAnalyzer` keeps its `edges` private. Nothing but
+  `TestBandHzAgreesWithTheAnalyzersEdges` connects them — change the log spacing
+  in the constructor and every scope silently stops zooming.
+
+**Visualisers**
+- **The scope's window was the bug, not its line style.** The tap hands over
+  `waveWindow` = 1024 samples at 11025Hz — 92.9ms — and the old scope drew all of
+  it across the width: 40.8 cycles of a 440Hz note on an 80-column screen, two
+  columns per cycle, aliased into a band where every note looked identical. It now
+  shows ~2.5 cycles of the dominant band (62 samples at 440Hz) and triggers on a
+  rising zero crossing. Measured, not aesthetic.
+- **Animate in `Push`, not `Paint`.** `Push` is the analysis rate (~10.77Hz);
+  `Paint` is up to 30Hz *and* `CapScale` of that. A phase advanced in `Paint` runs
+  in slow motion the moment a style is capped — metro's wavefront, wheel's spin,
+  helix's coil, bloom's rings, aurora's drift.
+- **A phosphor trail decays in `Push` for the same reason**: per `Paint` it is
+  three times longer on a capped style, so the same track looks different on two
+  terminals.
+- **A style's picture must be a function of the music, not of a generator.** Value
+  noise is 0..1 *by construction*, so aurora drawn straight from it lit 654 of 672
+  cells in silence — a bright screen reacting to nothing. It is gated by the
+  smoothed level.
+- **Gate a field, do not gate nothing.** The same argument is why barsViz draws an
+  axis under every band and matrixViz draws its unlit LEDs: a silent band drawn as
+  literally nothing is indistinguishable from a column the renderer never reached.
+- **Spatial constants need the grid, not a per-beat unit.** metro's first version
+  moved one cell per beat, which at 128bpm is a 1-cell spacing — every cell inside
+  the front, the whole screen lit every frame, 1.2ms/op and a uniform glow instead
+  of rings. Spacing is a fraction of the radius; the *speed* carries the tempo.
+- **Per-row phase skew has to stay under a fraction of the spacing.** 0.35
+  cells/row over 60 rows is 21 cells against a 25-cell spacing: the rings interfere
+  with each other instead of waving, and 61% of the grid lights. 0.04 is a tenth
+  of a spacing and still visible.
+- **`math.Hypot`, `math.Mod` and `math.Exp` in a per-cell path are 3.8x.** metro
+  went 2.67ms → 697µs by using `math.Sqrt`, floor-and-subtract, and `smoothstep`.
+  Same picture to the eye. `Hypot`'s overflow protection is for inputs that cannot
+  overflow, like grid coordinates.
+- **The heavy set is a set, not a count.** `TestHeavyStylesAreMarkedAndCapped`
+  used to assert `heavy == 2`, which a new expensive style could satisfy by
+  claiming to be cheap. It now checks `heavyStyles` against what the styles report,
+  in both directions.
+- **A style's exemptions are sets too, and they are checked for typos.**
+  `waveOnlyStyles` and `tempoStyles` replace a string compare on `"scope"`; a name
+  in either must resolve through `VizByName` or it would silently exempt nothing.
+- **`TestResetDropsEveryStyleState` compares against a control**, not against zero
+  lit cells. matrix draws unlit LEDs and metro draws a tempo front on purpose, so a
+  "must be dark" assertion fails them for drawing what they should. A fresh
+  instance fed only silence is the right baseline; what it isolates is history that
+  survived a reset.
 
 **Rendering / layout**
 - **Letterbox, never stretch.** `videoTapGeometry` emitted a bare `scale=W:H`,
@@ -285,6 +341,29 @@ go test -run XXX -bench . -benchtime 500ms -count 5 ./src
 | MonoDraw | 52us | 24us | 57 -> 0 |
 | MiniBars | 41us | 10us | 4 -> 4 (unchanged) |
 
+`BenchmarkEveryStylePaint` walks `vizRegistry`, so the nineteenth style is
+measured the day it lands rather than never. 200x60, min of 3:
+
+```
+go test -run XXX -bench EveryStylePaint -benchtime 200ms -count 3 ./src
+```
+
+| style | ns/op | style | ns/op |
+|---|---|---|---|
+| bloom | 23us | terrain | 224us |
+| particles | 21us | helix | 263us |
+| peaks | 53us | rays | 322us |
+| radial | 75us | mirror | 357us |
+| matrix | 84us | ribbon | 427us |
+| scope | 83us | lissajous | 595us |
+| swell | 113us | metro | 697us |
+| wheel | 193us | waterfall | 942us |
+| **aurora** | **1.51ms** | | |
+
+All 18 at **0 allocs/op** — that is the hard signal, not `ns/op`. `aurora` is the
+worst case and is the one style that is `Heavy()`, capped to 10-20fps by
+`CapScale`. `waterfall` is the slowest *cheap* style and predates this batch.
+
 Rules of thumb, each of which was a bug first:
 - **No `fmt` in a per-cell path.** `fmt.Sprintf`/`Fprintf` per changed cell was
   11400 allocations per full repaint. Both renderers keep an `esc []byte` scratch
@@ -311,7 +390,7 @@ ipc.go       mpv JSON IPC                         hud.go    title / progress / p
 render.go    mono diff renderer + overlay          color.go  colour renderer, glyph probe
 flow.go      covered-terminal stall handling      fft.go    FFT, log-spaced bands
 visual.go    LevelTap + display smoother          viz.go    VizGrid, style registry, prefs
-styles_*.go  the six visualisers                  palette.go HSV -> RGB, ten schemes
+styles_*.go  the eighteen visualisers              palette.go HSV -> RGB, ten schemes
 split.go     the split view: two panes, one composed frame, splitState
 beat.go      spectral flux, onsets, tempo         doc.go    package docs
 internal/term  termios, TIOCGWINSZ, pty — the one extracted package

@@ -174,3 +174,43 @@ func BenchmarkMiniBars(b *testing.B) {
 		_ = miniBars(lev, 200, pk)
 	}
 }
+
+// BenchmarkEveryStylePaint is the registry-wide paint cost, and it is the one
+// that matters for a new style.
+//
+// Per-style benchmarks have to be written by hand when a style is added, which is
+// to say they are written once and never again, and the rule that painting
+// allocates nothing goes unchecked for every style added after them. This one
+// cannot be forgotten: it walks vizRegistry, so the nineteenth style is measured
+// the day it lands.
+//
+// Allocations are the hard signal, not ns/op: on this box the timing is noisy
+// (a 2.5GHz i5 under load) but an allocation in a per-cell path is a fact rather
+// than a measurement. Every sub-benchmark here must report 0 allocs/op.
+func BenchmarkEveryStylePaint(b *testing.B) {
+	const cols, rows = 200, 60
+	wave := make([]float64, fftSize)
+	for i := range wave {
+		wave[i] = math.Sin(float64(i) * 0.21)
+	}
+	for _, mk := range vizRegistry {
+		v := mk()
+		b.Run(v.Name(), func(b *testing.B) {
+			v.Resize(cols, rows)
+			// Fed a full history before timing, so the styles that own one (the
+			// phosphor trails, the scroll buffers) are measured on a full frame
+			// rather than on an empty one that skips every cell.
+			for i := 0; i < 30; i++ {
+				v.Push(&AudioFrame{Bands: benchBands(bands), Wave: wave, Beat: 1, BPM: 128})
+			}
+			g := NewVizGrid(cols, rows, true, 2)
+			g.SetPalette(palettes[0])
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				g.Clear()
+				v.Paint(g)
+			}
+		})
+	}
+}
