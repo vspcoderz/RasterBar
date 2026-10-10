@@ -1,6 +1,6 @@
 # PLAN — more visualisers, and a scope worth looking at
 
-Status: done
+Status: done (plus the follow-up below)
 
 Result: 6 → 18 styles, all at **0 allocs/op**, all painting under DEC 2026 in a
 pty. `scope` rewritten: 40.8 cycles of a 440Hz note across an 80-column screen
@@ -89,3 +89,73 @@ track, which a bare pty cannot catch.
   in the batch tuned on a fixture. 40 needles is the spectrum again.
 - **Screenshots.** The pty drive measures frames and bytes, not appearance. Worth
   running `termscreen.py` over the new styles by hand before trusting the tuning.
+
+---
+
+# Follow-up — the empty visualiser was never a visualiser bug
+
+Symptom: "all visualizers are stuck", sometimes, on some tracks. Every style
+affected at once, which is the tell: a visualiser fault cannot hit all eighteen
+independently, but a fault in what feeds them hits all of them identically.
+
+## What it actually was
+
+`ps` on a live instance, mid-song:
+
+```
+137608  rasterbar play LET ME IN cg5
+138082  TLl+ mpv  ...googlevideo.co     <- playing
+138102  Z+   [ffmpeg] <defunct>          <- the level tap, dead and unreaped
+```
+
+The **level tap's ffmpeg had exited**. No audio reaching the analyser means no
+`TryFrame`, so no `Push`, so every style held its last frame — on a fresh track,
+zero. The process stayed up, the HUD kept advancing, and nothing said why.
+
+`LevelTap.Dead()` existed, recorded the exit, and was **called by nothing**. Its
+own doc comment claimed "the render loop reports this through the status line
+once per tap", which it did not. Identical in shape to the `Viz.CapScale` entry
+in AGENTS.md: both halves of an interface, and the consumer never written.
+
+Two more faults on the same path:
+
+- **`pump` never `Wait`ed**, so the dead child stayed a zombie for the life of
+  the process. Now reaped on the goroutine that owns the pipe.
+- **ffmpeg's stderr was unset**, so the child inherited the terminal — in raw
+  mode, being drawn on. Its own explanation of the failure was interleaved with
+  the visualiser and unreadable. Captured now, bounded, and folded into the error.
+
+Fixed in `12f2272`. `paintMusic` treats a dead tap as fatal and says why; a dead
+tap stays dead, so continuing would only hold the last frame forever.
+
+## The separate failure, and a false lead of mine
+
+A second, unrelated mode showed up while reproducing this locally:
+
+```
+cannot play Rick Astley ...: yt-dlp -J: signal: segmentation fault (core dumped)
+```
+
+That one was already reported correctly. `yt-dlp` 2026.08.19 segfaults on `-J`
+for this URL — an environment problem, not a code one, and it will hit the user.
+
+Two of my own hypotheses were wrong before the right one, both worth recording:
+
+1. **"It's the AGC pegging everything."** Image 2 showed full-height columns, so
+   I blamed the dB window. Measured the analyser: `mean 0.20, max 0.73` — nowhere
+   near pegged. Wrong.
+2. **"It's the visualiser grid going empty."** True, but it is a *symptom* of the
+   tap. Chasing it in the styles would have produced nothing, because no style
+   can draw audio that never arrived.
+
+The instrument that finally answered it was `ps` on a live process. Every
+in-band measurement said the renderer was fine, because the renderer *was*
+fine.
+
+## matrix's width bug, found in the same session
+
+`matrix` looped `x < cols && x < n` at the new gap pitch, and `n` is capped at
+`maxDrawnBands = 128` — so on a 250-column terminal every LED landed in the left
+128 columns and the right third was bare. The waterfall band-count rule in
+AGENTS.md, walked into for the second time in one batch. The loop now runs over
+columns and derives the band from the column, so pitch and width are independent.
