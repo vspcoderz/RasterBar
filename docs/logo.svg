@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="RasterBar">
+  <title>RasterBar</title>
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1A081F"/><stop offset="1" stop-color="#0C0511"/></linearGradient></defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <g fill="none" stroke-linecap="round">
+    <path d="M106.94 90.94V421.06" stroke="#C71818" stroke-width="5.89"/>
+    <path d="M116.44 90.94V421.06" stroke="#C8181F" stroke-width="5.89"/>
+    <path d="M125.94 90.94V421.06" stroke="#C91825" stroke-width="5.89"/>
+    <path d="M135.44 90.94V421.06" stroke="#CA172C" stroke-width="5.89"/>
+    <path d="M144.94 90.94V421.06" stroke="#CB1733" stroke-width="5.89"/>
+    <path d="M154.44 90.94V421.06" stroke="#CC173A" stroke-width="5.89"/>
+    <path d="M163.94 90.94V421.06" stroke="#CD1741" stroke-width="5.89"/>
+    <path d="M173.44 90.94V421.06" stroke="#CE1748" stroke-width="5.89"/>
+    <path d="M182.94 90.94V147.06" stroke="#CF1650" stroke-width="5.89"/>
+    <path d="M182.94 240.94V308.16" stroke="#CF1650" stroke-width="5.89"/>
+    <path d="M192.44 90.94V147.06" stroke="#D01657" stroke-width="5.89"/>
+    <path d="M192.44 240.94V313.07" stroke="#D01657" stroke-width="5.89"/>
+    <path d="M201.94 90.94V147.06" stroke="#D1165F" stroke-width="5.89"/>
+    <path d="M201.94 240.94V317.98" stroke="#D1165F" stroke-width="5.89"/>
+    <path d="M211.44 90.94V147.06" stroke="#D21666" stroke-width="5.89"/>
+    <path d="M211.44 240.94V322.89" stroke="#D21666" stroke-width="5.89"/>
+    <path d="M220.94 90.94V147.06" stroke="#D3166E" stroke-width="5.89"/>
+    <path d="M220.94 240.94V327.80" stroke="#D3166E" stroke-width="5.89"/>
+    <path d="M230.44 90.94V147.06" stroke="#D41576" stroke-width="5.89"/>
+    <path d="M230.44 240.94V332.70" stroke="#D41576" stroke-width="5.89"/>
+    <path d="M239.94 90.94V147.06" stroke="#D6157D" stroke-width="5.89"/>
+    <path d="M239.94 240.94V337.61" stroke="#D6157D" stroke-width="5.89"/>
+    <path d="M249.44 90.94V342.52" stroke="#D71585" stroke-width="5.89"/>
+    <path d="M258.94 90.94V347.43" stroke="#D8158D" stroke-width="5.89"/>
+    <path d="M268.44 90.94V297.06" stroke="#D91496" stroke-width="5.89"/>
+    <path d="M268.44 303.69V352.34" stroke="#D91496" stroke-width="5.89"/>
+    <path d="M277.94 90.94V297.06" stroke="#DA149E" stroke-width="5.89"/>
+    <path d="M277.94 308.44V357.25" stroke="#DA149E" stroke-width="5.89"/>
+    <path d="M287.44 90.94V297.06" stroke="#DB14A6" stroke-width="5.89"/>
+    <path d="M287.44 313.19V362.16" stroke="#DB14A6" stroke-width="5.89"/>
+    <path d="M296.94 90.94V297.06" stroke="#DC14AF" stroke-width="5.89"/>
+    <path d="M296.94 317.94V367.06" stroke="#DC14AF" stroke-width="5.89"/>
+    <path d="M306.44 90.94V297.06" stroke="#DD13B7" stroke-width="5.89"/>
+    <path d="M306.44 322.69V371.97" stroke="#DD13B7" stroke-width="5.89"/>
+    <path d="M315.94 327.44V376.88" stroke="#DE13C0" stroke-width="5.89"/>
+    <path d="M325.44 332.19V381.79" stroke="#DF13C8" stroke-width="5.89"/>
+    <path d="M334.94 336.94V386.70" stroke="#E013D1" stroke-width="5.89"/>
+    <path d="M344.44 341.69V391.61" stroke="#E112DA" stroke-width="5.89"/>
+    <path d="M353.94 346.44V396.51" stroke="#E112E2" stroke-width="5.89"/>
+    <path d="M363.44 351.19V401.42" stroke="#DA12E3" stroke-width="5.89"/>
+    <path d="M372.94 355.94V406.33" stroke="#D212E4" stroke-width="5.89"/>
+    <path d="M382.44 360.69V411.24" stroke="#CB11E5" stroke-width="5.89"/>
+    <path d="M391.94 365.44V416.15" stroke="#C411E6" stroke-width="5.89"/>
+    <path d="M401.44 370.19V421.06" stroke="#BC11E7" stroke-width="5.89"/>
+  </g>
+</svg>
