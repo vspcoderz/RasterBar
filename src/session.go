@@ -732,6 +732,15 @@ type playOpts struct {
 	// copy per track -- would mean re-pressing `v` on every song, which is the
 	// opposite of remembered. See vizPrefs.
 	prefs *vizPrefs
+
+	// presence publishes what is playing to Discord, or nil when Discord is
+	// not running. Nil rather than a disabled flag so the render loop can call
+	// it unconditionally; every method is safe on a nil *presence.
+	//
+	// Owned by playQueue, not by the track, for the same reason prefs is: the
+	// socket and its handshake outlive a track, so a queue advance reuses the
+	// connection rather than opening a new one per song.
+	presence *presence
 }
 
 // playTrack plays one track and reports why it stopped.
@@ -851,6 +860,14 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	defer sess.Close()
 
 	pl := NewPlayerAt(queue, index, sess)
+
+	// Publish the new track immediately, before the first frame.
+	//
+	// Not deferred to the first tick: a slow mpv start means the profile would
+	// show the *previous* track for as long as the decoder takes to come up,
+	// which is long enough for someone to see it and short enough that it looks
+	// like a stale presence bug rather than a startup delay.
+	o.presence.Set(presenceFor(pl.State()))
 
 	// readKeys closes the channel on EOF, and the select below treats a closed
 	// channel as "nobody left to drive the transport". There is deliberately no
@@ -1448,9 +1465,21 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			reportLine("transport: " + st.LastErr.Error())
 			pl.ClearErr()
 		}
+		// Every transport key, not only pause and seek. Set drops what has not
+		// visibly changed and holds the rest for five seconds, so this is one
+		// comparison per keypress rather than one update — and it means a key
+		// added to the transport later cannot be silently missing from presence
+		// because whoever added it did not know this line existed.
+		o.presence.Set(presenceFor(pl.State()))
 		return OutcomePlaying
 	}
 
+	// A prompt-driven seek does not come through applyCmd, so republish once
+	// here. This is the one jump the transport keys cannot cover.
+	//
+	// Reached by the `:` path and by nothing else, which is why it is here
+	// rather than in applyCmd: applyCmd has no idea a prompt was involved, and
+	// putting it there would publish on every keypress of the prompt text.
 	// feedKeys applies one chunk of terminal bytes. The routing itself lives in
 	// keyRouter so it can be tested without a terminal; this is the adapter that
 	// turns its answer into transport calls and repaints.
@@ -1470,6 +1499,11 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 			if res.valid {
 				pl.JumpTo(res.target)
 				markAt = time.Now()
+				// A jump prompt goes straight to JumpTo rather than through a Cmd,
+				// so it bypasses applyCmd entirely. Without this line a typed
+				// timestamp moves the picture and leaves presence pointing at
+				// where the player used to be.
+				o.presence.Set(presenceFor(pl.State()))
 			}
 		case res.cancel:
 			closeOverlay()

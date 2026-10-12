@@ -194,6 +194,16 @@ test or an explicit comment.
   instance fed only silence is the right baseline; what it isolates is history that
   survived a reset.
 
+**Discord presence**
+- **Presence is four updates per track, not thirty per second.** The progress bar is derived by Discord from `timestamps.start`/`end`, so there is nothing to send per frame. `presence.Set` is called on every transport key and drops what has not visibly changed; a per-frame publish would spend Discord's five-updates-per-twenty budget on facts it already has.
+- **The five-second floor is arithmetic, not taste.** Discord allows 5 updates / 20s = 1 per 4s. A 5s floor means at most 4 per 20. Exceeding it does not error — Discord silently drops, and presence lags the player with nothing to show for it. Held `<`/`>` autorepeat past the limit on their own, which is the whole reason the floor exists.
+- **`Pos` is deliberately outside the change test (`sameAs`).** The start timestamp is `now - pos`, so `pos` moves every frame; including it means no two updates are ever equal and the dedup is dead code that looks alive.
+- **Cap the payload length BEFORE allocating.** The length is 4 bytes off a socket we did not write. Reading into a buffer sized from it turns a music player into an OOM. `rpcMaxPayload` is checked in both directions.
+- **Never block the render loop on the presence socket.** `Set` hands off to a buffered channel with a non-blocking send; a blocking send would queue stale positions and publish them after the track moved on. Writes carry a 250ms deadline.
+- **The PONG reader goroutine is load-bearing, not tidiness.** Discord pings every ~30s and closes a client that stops answering. A client that only writes fills its receive buffer and wedges its own writes. A pre-READY ping must be answered inline — the goroutine does not exist yet.
+- **A nil `*presence` is the disabled state**, so call sites never check. The alternative is four `if enabled` guards, i.e. four places to forget one.
+- **Absence is not an error worth printing.** Presence is on by default, so "Discord is not running" would put a line of stderr on every launch. `--discord` means "I asked", and only then is the reason reported.
+
 **Rendering / layout**
 - **Letterbox, never stretch.** `videoTapGeometry` emitted a bare `scale=W:H`,
   which stretches the source to the grid's shape. Measured: a square in a 16:9

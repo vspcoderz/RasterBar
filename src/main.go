@@ -67,6 +67,10 @@ options:
       --rows N       force ASCII grid height (default: from terminal height)
       --no-probe     skip the ffprobe pass on a directory scan
       --play         with list, start the first track without the browse list
+      --no-discord   do not publish what is playing to Discord (on by default)
+      --discord      presence is on anyway; report if it cannot connect
+      --discord-app-id ID
+                      a different Discord application id (a snowflake: digits)
   -h, --help         this text
 
   Every flag still works and every verb is a flag spelled out. The flags are
@@ -155,6 +159,14 @@ capped rather than disabled: particles never exceed 400, and on a large grid
 radial and aurora draw at a fraction of the frame rate rather than at none.
 
 requires: yt-dlp, ffmpeg, mpv  (ytfzf optional, used as the primary scraper)
+
+  Discord: what is playing is published to your profile by default — the track
+  title, the channel, and a progress bar — and it clears when you quit. The
+  bar comes from start and end timestamps, so nothing is sent per frame; a
+  track costs a few updates rather than thirty a second. --no-discord turns it
+  off, and VSPZ_YT_CLI_NO_DISCORD=1 does the same for a whole shell.
+
+      rasterbar --discord "lofi hip hop"  same, but say why if it cannot connect
 `
 
 // usage is the help text with the style list filled in from the registry.
@@ -208,6 +220,15 @@ type options struct {
 	// decided is a scraper, which is most machines eventually — see ytdlpAuth.
 	cookies     string
 	cookiesFrom string
+
+	// Discord presence. On by default because the app ID is ours and the whole
+	// point of the feature is that it needs no flag; noDiscord turns it off, and
+	// discord says "I asked for this, so tell me why it is not working" — the
+	// difference between a program that is quiet because nothing happened and
+	// one that is quiet because it failed.
+	noDiscord    bool
+	discord      bool
+	discordAppID string
 
 	// vizPrefs caches the resolved style/palette across the queue. Built by
 	// prefs() on demand and shared, so the `v` and `c` keys mutate one value.
@@ -370,6 +391,19 @@ func parseArgs(args []string) (options, error) {
 			}
 			i++
 			o.cookiesFrom = args[i]
+		case "--no-discord":
+			o.noDiscord = true
+		case "--discord":
+			o.discord = true
+		case "--discord-app-id":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--discord-app-id needs a numeric application id")
+			}
+			i++
+			if err := validDiscordAppID(args[i]); err != nil {
+				return o, err
+			}
+			o.discordAppID = args[i]
 		default:
 			if strings.HasPrefix(a, "-") {
 				return o, fmt.Errorf("unknown flag: %s", a)
@@ -605,6 +639,58 @@ func expandFileArgs(args []string) (paths []string, isFileIntent bool, err error
 	return out, true, nil
 }
 
+// validDiscordAppID checks an application id before it is used.
+//
+// Discord application ids are snowflakes: decimal digits, nothing else. A
+// name, a UUID or a stray space all fail the handshake server-side with
+// "Invalid Client ID", which reads like a networking problem and is not one.
+// Catching it here turns a confusing failure at playback time into an argument
+// error, which is the same treatment --viz and --palette already get.
+func validDiscordAppID(id string) error {
+	if id == "" {
+		return fmt.Errorf("--discord-app-id needs a value")
+	}
+	for _, r := range id {
+		if r < '0' || r > '9' {
+			return fmt.Errorf("--discord-app-id must be the numeric application id (got %q)", id)
+		}
+	}
+	return nil
+}
+
+// discordConfig resolves presence settings from the flag and the environment.
+//
+// The flag wins over the environment, for the same reason --cookies does: the
+// one stated most precisely. Presence is on unless something says otherwise,
+// so the only two ways to change it are --no-discord and the environment
+// equivalent.
+//
+// Returned rather than applied so parseArgs stays a parser and main stays the
+// thing that decides.
+func discordConfig(o options, env []string) (enabled bool, appID string, err error) {
+	for _, kv := range env {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "VSPZ_YT_CLI_DISCORD_APP_ID":
+			if o.discordAppID == "" {
+				o.discordAppID = val
+			}
+		case "VSPZ_YT_CLI_NO_DISCORD":
+			if val != "" && val != "0" && val != "false" {
+				o.noDiscord = true
+			}
+		}
+	}
+	appID = o.discordAppID
+	if appID == "" {
+		appID = discordAppID
+	}
+	return !o.noDiscord, appID, validDiscordAppID(appID)
+}
+
 func main() {
 	opts, err := parseArgs(os.Args[1:])
 	if err != nil {
@@ -789,6 +875,37 @@ func playQueue(opts options, mode ColorMode, tracks []Track, index int, music bo
 	if po.aspect <= 0 {
 		po.aspect = defaultAspect
 	}
+
+	// Presence. Opened once for the whole queue, not per track: the handshake is
+	// a round trip to Discord and a socket we would otherwise open and close
+	// once per song.
+	//
+	// A failure here is reported only when the user asked for presence by name.
+	// Presence is on by default, and the overwhelmingly common reason it fails
+	// is that Discord is not running — which is not an error worth a line of
+	// stderr on every launch. --discord means "I asked for this", so then the
+	// reason is worth saying.
+	var pres *presence
+	if presenceOn, appID, err := discordConfig(opts, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "discord presence: %v\n", err)
+	} else if presenceOn {
+		p, perr := newPresence(appID)
+		if perr != nil {
+			if opts.discord {
+				fmt.Fprintf(os.Stderr, "discord presence: %v\n", perr)
+			}
+		} else {
+			pres = p
+		}
+	}
+	if pres != nil {
+		// Deferred so every exit from the queue clears the activity: quitting,
+		// the end of the list, and a track that failed all land here. Without
+		// it a crash leaves the profile claiming to listen to a track that
+		// stopped minutes ago.
+		defer pres.Close()
+	}
+	po.presence = pres
 
 	// One key reader for the whole queue. Starting one per track left the
 	// previous goroutine blocked in Read after a queue advance, and the two then
