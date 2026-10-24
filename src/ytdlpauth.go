@@ -122,23 +122,42 @@ const ytdlpCrashRetries = 2
 // picture. And the error text is the only way to recognise the bot check, which
 // needs to be turned into an instruction instead of being passed through.
 //
-// runStream is run() with stderr mirrored to the terminal, for the download
-// path whose output is worth watching and which runs before the renderer owns
-// the screen. The retry loop is shared: a crash-retry policy that differs per
-// call site is two answers to "did yt-dlp die" and the flakier one wins.
+// runDownload is the streaming form for the download path. It DIFFERS from run
+// in *where* the progress lives, and the naive answer is stale:
+//
+// Modern yt-dlp writes everything — logs, "[download]  42.3% of ...", the merge
+// note — to STDOUT, not stderr. Measured: a 30s download with stdout piped and
+// stderr captured printed every progress line into the captured stdout buffer
+// and produced 0 stderr lines. The first version of streaming here mirrored
+// *stderr* to the terminal and swallowed the whole progress stream into the
+// stdout capture, so the download verb was a long silence followed by one
+// summary line, and the in-player background save had nothing to read.
+//
+// So the sink goes on stdout, which is also the pipe the return value reads —
+// io.MultiWriter(sink, capture) keeps both, with no scanner goroutine: yt-dlp
+// is the only writer on that pipe and it writes whole lines (the --newline flag
+// buys the line endings). stderr keeps the run() treatment, because a bot-check
+// text is worth mirroring to the terminal even while progress streams.
+//
+// The retry loop is shared: a crash-retry policy that differs per call site is
+// two answers to "did yt-dlp die" and the flakier one wins. On a retry the sink
+// sees the log lines of attempt N again — acceptable noise for a crash that is
+// supposed to be rare, and the parsers tolerate repeats (last line wins).
 func (a ytdlpAuthConfig) run(args ...string) ([]byte, error) {
-	return a.runRetried(args, false)
+	return a.attempt(args, false, nil)
 }
 
-func (a ytdlpAuthConfig) runStream(args ...string) ([]byte, error) {
-	return a.runRetried(args, true)
+// runDownload runs yt-dlp with its stdout streamed to sink as it arrives.
+// sink may be nil, which degenerates to run().
+func (a ytdlpAuthConfig) runDownload(args []string, sink io.Writer) ([]byte, error) {
+	return a.attempt(args, true, sink)
 }
 
-func (a ytdlpAuthConfig) runRetried(args []string, mirrorStderr bool) ([]byte, error) {
+func (a ytdlpAuthConfig) attempt(args []string, mirrorStderr bool, stdoutSink io.Writer) ([]byte, error) {
 	var last error
 	for attempt := 0; attempt <= ytdlpCrashRetries; attempt++ {
 		cmd := exec.Command(ytdlpBin, a.withArgs(args...)...)
-		var stderr strings.Builder
+		var stdout, stderr strings.Builder
 		// Mirror, do not delegate: `cmd.Stderr = os.Stderr` would leave the
 		// bot-check text uncaptured for explainYtdlpError.
 		if mirrorStderr {
@@ -146,7 +165,13 @@ func (a ytdlpAuthConfig) runRetried(args []string, mirrorStderr bool) ([]byte, e
 		} else {
 			cmd.Stderr = &stderr
 		}
-		out, err := cmd.Output()
+		if stdoutSink != nil {
+			cmd.Stdout = io.MultiWriter(stdoutSink, &stdout)
+		} else {
+			cmd.Stdout = &stdout
+		}
+		err := cmd.Run()
+		out := []byte(stdout.String())
 		if err == nil {
 			return out, nil
 		}

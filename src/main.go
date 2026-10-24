@@ -124,6 +124,15 @@ download/save environment variables:
    VSPZ_YT_CLI_UPDATE=auto  check GitHub in the background at launch and
                             mention a newer release before playback starts
 
+downloads and the cache:
+  Playing a YouTube link or a search result saves that video into the cache
+  while it plays — the HUD status row shows "saving — 42.3% of ..." until
+  it finishes, and the next play of the same video starts from the local
+  file with no network at all (and free seek, pause and chapters). The
+  download verb streams yt-dlp's own progress lines. --cache-dir picks the
+  folder, the settings screen stores it, VSPZ_YT_CLI_CACHE_DIR keeps it
+  for a shell.
+
 keys (playback, both modes):
   space            pause / resume
   left / right     seek -10s / +10s
@@ -1037,7 +1046,15 @@ func main() {
 	// with one key, no HUD, no duration, no seek and no queue advance. Sharing
 	// playQueue is what makes it a player rather than a demo, and it is why the
 	// prompt, the resize path and the stall handler work there for free.
-	playQueue(opts, colorMode, tracks, idx, !wantVideo)
+	//
+	// The cache dir is resolved here (empty on failure: no cache, no background
+	// saves, playback unaffected) rather than past Opts through, because the
+	// session wants a concrete path and the option is a maybe-tilde string.
+	playDir, pderr := resolveCacheDir(opts.cacheDir, cfg.CacheDir)
+	if pderr != nil {
+		playDir = ""
+	}
+	playQueue(opts, colorMode, tracks, idx, !wantVideo, playDir)
 }
 
 // runDownload is the whole download verb: URL arguments are saved directly,
@@ -1080,8 +1097,14 @@ func runDownload(opts options, cfg settings, mode ColorMode) int {
 			if action == ActionASCII || action == ActionPlay {
 				// Playing from the picker uses the same queue machinery as the
 				// play verb, so seek, pause, chapters and the HUD all work in
-				// a session that opened as a download.
-				playQueue(opts, mode, tracks, sel, action != ActionASCII)
+				// a session that opened as a download. The cache rides along:
+				// a download-mode play saves too, so "watch it and have it
+				// next time" costs one keypress.
+				playDir, pderr := resolveCacheDir(opts.cacheDir, cfg.CacheDir)
+				if pderr != nil {
+					playDir = ""
+				}
+				playQueue(opts, mode, tracks, sel, action != ActionASCII, playDir)
 				continue
 			}
 			dir, derr := resolveCacheDir(opts.cacheDir, cfg.CacheDir)
@@ -1090,8 +1113,10 @@ func runDownload(opts options, cfg settings, mode ColorMode) int {
 				return 1
 			}
 			// A picker entry already carries Title and ID from the search, so
-			// downloadTrack goes straight to the cache check.
-			path, already, derr := downloadTrack(tracks[sel], dir)
+			// downloadTrack goes straight to the cache check. os.Stdout is the
+			// sink: raw mode is off, the terminal is plain, and yt-dlp's own
+			// progress lines ARE the loading display ("[download] 42.3% ...").
+			path, already, derr := downloadTrack(tracks[sel], dir, os.Stdout)
 			if derr != nil {
 				fmt.Fprintf(os.Stderr, "download: %v\n", derr)
 				continue
@@ -1118,7 +1143,7 @@ func runDownload(opts options, cfg settings, mode ColorMode) int {
 			fmt.Fprintf(os.Stderr, "[%d/%d] %s: %v\n", i+1, len(links), link, merr)
 			return 1
 		}
-		path, already, derr := downloadTrack(tr, dir)
+		path, already, derr := downloadTrack(tr, dir, os.Stdout)
 		if derr != nil {
 			fmt.Fprintf(os.Stderr, "[%d/%d] %s: %v\n", i+1, len(links), link, derr)
 			return 1
@@ -1143,7 +1168,12 @@ func runDownload(opts options, cfg settings, mode ColorMode) int {
 //
 // Navigation keys (n/p) return an outcome rather than changing the queue here, so
 // the loop stays the single owner of the index.
-func playQueue(opts options, mode ColorMode, tracks []Track, index int, music bool) {
+//
+// cacheDir is the resolved download cache, ""-able. It is a parameter rather
+// than a field on options because the resolved value (tilde expanded, runtime
+// config applied) is what the session needs, and two resolution sites in this
+// file already exist.
+func playQueue(opts options, mode ColorMode, tracks []Track, index int, music bool, cacheDir string) {
 	po := playOpts{
 		in:        os.Stdin,
 		out:       os.Stdout,
@@ -1155,6 +1185,7 @@ func playQueue(opts options, mode ColorMode, tracks []Track, index int, music bo
 		mode:      mode,
 		glyphPref: opts.glyph,
 		music:     music,
+		cacheDir:  cacheDir,
 		// One prefs value for the whole queue, shared by every track: pressing `v`
 		// once should not have to be repeated per song.
 		prefs: opts.prefs(),

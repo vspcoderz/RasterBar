@@ -733,6 +733,11 @@ type playOpts struct {
 	// opposite of remembered. See vizPrefs.
 	prefs *vizPrefs
 
+	// cacheDir is the resolved download cache, empty when there is none. When
+	// set, every remote track that plays downloads itself into it in the
+	// background — see startSave.
+	cacheDir string
+
 	// presence publishes what is playing to Discord, or nil when Discord is
 	// not running. Nil rather than a disabled flag so the render loop can call
 	// it unconditionally; every method is safe on a nil *presence.
@@ -903,6 +908,17 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 	// The strip's own TryFrame cursor. Separate from the visualiser's because they
 	// are two consumers of one tap and a shared cursor makes one of them starve.
 	var stripReadGen uint64
+
+	// saver downloads the track into the cache while it plays, nil when there
+	// is nothing to save (local track, no cache dir). Started here rather than
+	// in playQueue: only this function knows a track survived the cache swap
+	// and is still remote — the whole point of the swap is that cached tracks
+	// never reach this line.
+	var saver *saveJob
+	lastSaveLine := ""
+	if o.cacheDir != "" {
+		saver = startSave(track, o.cacheDir)
+	}
 
 	// Split-view state. sp owns what the user asked for; this closure owns the
 	// geometry, because only the loop knows what the grid currently is.
@@ -1721,14 +1737,25 @@ func playTrack(o playOpts, queue []Track, index int) Outcome {
 					lastKey = time.Time{} // let the hints stay faded rather than
 					// popping back because of an expiring message
 				}
-				// The pre-seek tick has been up long enough to be read. Leaving it
-				// would make a bar that is never entirely clean, which reads as a
-				// rendering fault rather than as information.
-				if !markAt.IsZero() && time.Since(markAt) > markLinger {
-					pl.ClearMark()
-					markAt = time.Time{}
+			// The pre-seek tick has been up long enough to be read. Leaving it
+			// would make a bar that is never entirely clean, which reads as a
+			// rendering fault rather than as information.
+			if !markAt.IsZero() && time.Since(markAt) > markLinger {
+				pl.ClearMark()
+				markAt = time.Time{}
+			}
+			// The background save reports through the same status row as the
+			// transport messages, on change only: a percent that repaints the
+			// HUD ten times a second buys nothing over one that repaints it
+			// when yt-dlp prints a new number. Downloader silence — "no change,
+			// skip" — is the shared cache doing its job.
+			if saver != nil {
+				if m := saver.line(); m != "" && m != lastSaveLine {
+					lastSaveLine = m
+					reportLine(m)
 				}
-				paintHUD(false)
+			}
+			paintHUD(false)
 			}
 
 			// After the HUD, because the HUD is chrome outside the grid and the

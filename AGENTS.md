@@ -45,6 +45,12 @@ hand-rolled. Before adding an import, check the stdlib, then check whether the
 These bugs do not crash — they misbehave somewhere else, so each is pinned by a
 test or an explicit comment.
 
+**Downloading / cache**
+- **yt-dlp's progress goes to STDOUT now, not stderr.** Every run() captures stdout (the `-J` JSON is read from it), which is exactly where all the log lines and `[download] 42.3%` lines are written — measured: a 30s download emitted 0 stderr lines and its whole progress stream into the captured stdout. The stderr mirror in the first streaming variant was therefore silently wrong: it printed nothing and swallowed every progress line. Streaming sinks go on stdout via `io.MultiWriter(sink, capture)` in `attempt` — no scanner goroutine, `--newline` buys the line endings. Pinned by `TestRunDownloadStreamsStdout`.
+- **A sink sees a chunk that ends mid-line.** exec's stdout copier is free to split at any byte; `saveJob.Write` keeps an unfixed fragment and folds it at the next newline. Parsing the fragment as a line shows a stale percent forever. Pinned by `TestSaveJobWriteReassemblesLines`.
+- **Playing downloads: one save per video ID, registry process-wide, not per track.** `startSave` is keyed by ID in `saves`; killing the saver at track end would throw away a half-finished `.part` on every queue skip, so the yt-dlp child deliberately outlives playTrack (dies with its pipe when the program exits; `--continue` resumes next play). A failed job is replaced on the next play rather than returned — one play was that attempt's chance.
+- **Cache-hit playback is still the fast path and now masks the saver.** `serveFromCache` runs before the session, so a cached track is local and `startSave` returns nil for it. Only tracks that survived the swap reach the background download — that invariant is why the check lives in playTrack and not playQueue.
+
 **Media / streams**
 - **Ask what streams a local file has, and act on both answers.** `hasAudio` and
   `hasVideo`. An audio-only file handed to the video tap gets `-map 0:v:0`, which
