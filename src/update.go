@@ -30,9 +30,14 @@ import (
 // updateRepo is the GitHub repository with the releases.
 const updateRepo = "vspcoderz/rasterbar"
 
-// updateTimeout bounds every HTTP operation: an update must fail fast and
-// loudly near the program it serves rather than hang the shell.
+// updateTimeout bounds the releases API call: an update check must fail fast
+// and loudly near the program it serves rather than hang the shell. The asset
+// download gets its own budget (updateDownloadTimeout), because a multi-MB
+// binary over a slow connection was killed by a 10s whole-body deadline —
+// verified failing with "context deadline exceeded" on real hardware.
 const updateTimeout = 10 * time.Second
+
+const updateDownloadTimeout = 5 * time.Minute
 
 // ghRelease is the small slice of GitHub's release JSON that matters.
 type ghRelease struct {
@@ -183,12 +188,14 @@ func installAsset(a *ghAsset) (string, error) {
 	tmp := filepath.Join(filepath.Dir(self), fmt.Sprintf(".rasterbar.new-%d", os.Getpid()))
 	defer os.Remove(tmp) // no-op on success; a leftover must never linger
 
-	// A crash-retry leftover from a previous run is removed first, or the
+	// A previous run's leftover (a crashed download) is removed first, or the
 	// download opens it to append.
 	if err := os.RemoveAll(tmp); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	resp, err := updateClient().Get(a.URL)
+
+	dl := &http.Client{Timeout: updateDownloadTimeout}
+	resp, err := dl.Get(a.URL)
 	if err != nil {
 		return "", fmt.Errorf("download %s: %w", a.Name, err)
 	}
