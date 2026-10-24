@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -113,23 +114,45 @@ var ytdlpBin = "yt-dlp"
 // into a five-second one with the same text at the end.
 const ytdlpCrashRetries = 2
 
-// run executes yt-dlp and returns its stdout.
+// run executes yt-dlp and returns its stdout with stderr captured.
 //
 // stderr is captured rather than inherited, for two reasons. The subprocess runs
 // under raw mode with the cursor hidden and the screen owned by the renderer, so
 // a progress line printed straight to the terminal lands in the middle of the
 // picture. And the error text is the only way to recognise the bot check, which
 // needs to be turned into an instruction instead of being passed through.
+//
+// runStream is run() with stderr mirrored to the terminal, for the download
+// path whose output is worth watching and which runs before the renderer owns
+// the screen. The retry loop is shared: a crash-retry policy that differs per
+// call site is two answers to "did yt-dlp die" and the flakier one wins.
 func (a ytdlpAuthConfig) run(args ...string) ([]byte, error) {
+	return a.runRetried(args, false)
+}
+
+func (a ytdlpAuthConfig) runStream(args ...string) ([]byte, error) {
+	return a.runRetried(args, true)
+}
+
+func (a ytdlpAuthConfig) runRetried(args []string, mirrorStderr bool) ([]byte, error) {
 	var last error
 	for attempt := 0; attempt <= ytdlpCrashRetries; attempt++ {
-		out, err := a.runOnce(args...)
+		cmd := exec.Command(ytdlpBin, a.withArgs(args...)...)
+		var stderr strings.Builder
+		// Mirror, do not delegate: `cmd.Stderr = os.Stderr` would leave the
+		// bot-check text uncaptured for explainYtdlpError.
+		if mirrorStderr {
+			cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
+		} else {
+			cmd.Stderr = &stderr
+		}
+		out, err := cmd.Output()
 		if err == nil {
 			return out, nil
 		}
-		last = err
+		last = explainYtdlpError(err, stderr.String(), a)
 		if !crashedBySignal(err) {
-			return nil, err
+			return nil, last
 		}
 		if attempt == ytdlpCrashRetries {
 			break
@@ -140,18 +163,6 @@ func (a ytdlpAuthConfig) run(args ...string) ([]byte, error) {
 	}
 	return nil, fmt.Errorf("%w\n  yt-dlp crashed %d times in a row. That is a broken yt-dlp, not a YouTube problem:\n"+
 		"  update it (pipx upgrade yt-dlp / yt-dlp -U), or install a different build.", last, ytdlpCrashRetries+1)
-}
-
-// runOnce is one attempt, with no retry logic.
-func (a ytdlpAuthConfig) runOnce(args ...string) ([]byte, error) {
-	cmd := exec.Command(ytdlpBin, a.withArgs(args...)...)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, explainYtdlpError(err, stderr.String(), a)
-	}
-	return out, nil
 }
 
 // crashedBySignal reports whether err is a process killed by a signal.

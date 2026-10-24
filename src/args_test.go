@@ -138,9 +138,9 @@ func TestParseArgsFileArgsAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths, isFile, ferr := expandFileArgs(o.args)
+	paths, _, isFile, ferr := expandArgs(o.args)
 	if ferr != nil {
-		t.Fatalf("expandFileArgs: %v", ferr)
+		t.Fatalf("expandArgs: %v", ferr)
 	}
 	if !isFile {
 		t.Error("a real file was not a file intent")
@@ -154,9 +154,9 @@ func TestParseArgsFileArgsAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2, isFile2, err2 := expandFileArgs(o2.args)
+	p2, _, isFile2, err2 := expandArgs(o2.args)
 	if err2 != nil {
-		t.Fatalf("expandFileArgs: %v", err2)
+		t.Fatalf("expandArgs: %v", err2)
 	}
 	if isFile2 {
 		t.Error("a search query claimed to be a file intent")
@@ -187,12 +187,12 @@ func TestSearchStillSearches(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parseArgs(%v): %v", q, err)
 		}
-		paths, isFile, ferr := expandFileArgs(o.args)
+		paths, links, isFile, ferr := expandArgs(o.args)
 		if ferr != nil {
-			t.Fatalf("expandFileArgs(%v): %v", q, ferr)
+			t.Fatalf("expandArgs(%v): %v", q, ferr)
 		}
 		if isFile {
-			t.Errorf("%v was treated as files (%v), want a search", q, paths)
+			t.Errorf("%v was treated as files/links (%v %v), want a search", q, paths, links)
 		}
 		if len(o.args) == 0 {
 			t.Errorf("%v left nothing to search for", q)
@@ -209,7 +209,8 @@ func TestExpandFileArgsRejectsMixedInput(t *testing.T) {
 	if err := os.WriteFile(song, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := expandFileArgs([]string{song, "lofi"}); err == nil {
+	_, _, _, err := expandArgs([]string{song, "lofi"})
+	if err == nil {
 		t.Fatal("want an error for a mixed file/search argument list")
 	}
 }

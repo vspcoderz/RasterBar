@@ -20,6 +20,11 @@ usage:
 
 verbs:
   play <query|file...>   search YouTube, or play files — the default
+  download <url|query>   save the video to your download folder as mp4; with a
+                         query, opens the picker and enter/d downloads
+  update [--check]       replace this binary with the newest release on GitHub
+  settings               click-only screen: default mode, quality cap,
+                         visualizer, palette, download folder, cookies
   search <query>         force a search, even if an argument looks like a path
   list [DIR]             browse a directory (was -l DIR); defaults to "."
   viz NAME               %s
@@ -35,10 +40,14 @@ verbs:
   rasterbar play roadtrip.m3u             an m3u/m3u8 playlist
   rasterbar list ~/Shows --play           browse a directory
   rasterbar play -a "tesseract"           video mode
+  rasterbar https://youtu.be/ID           play a link, from cache when it is
+                                          already downloaded
+  rasterbar download https://youtu.be/ID  same link, into the download folder
 
   An argument becomes a file when it exists, contains a wildcard, or names a
-  playlist. Anything else is a YouTube search. A file with no video stream plays
-  as a visualiser whichever mode you asked for, because there is no picture.
+  playlist. A link becomes a player of that link, not a search for its text.
+  Anything else is a YouTube search. A file with no video stream plays as a
+  visualiser whichever mode you asked for, because there is no picture.
 
 modes:
   -M, --music       music mode: the visualizer replaces the video (default)
@@ -52,6 +61,9 @@ options:
                           opera. YouTube bot-checks by IP, and a signed-in
                           browser is the only cure; see "yt-dlp and YouTube"
                           below.
+      --cache-dir DIR     the folder "download" saves videos into
+                          (default ~/RasterStuff, then
+                          VSPZ_YT_CLI_CACHE_DIR, then the settings file)
       --viz NAME     visualizer style (same as the viz verb)
       --palette NAME colour scheme (same as the palette verb)
   -c, --color        force colour (default: auto-detected from the terminal)
@@ -104,7 +116,13 @@ keys (browse):
   1-9              jump to row
   enter            play music mode (visualizer)
   a                play video mode
+  d                download (in the download picker; enter there too)
   q                quit
+
+download/save environment variables:
+   VSPZ_YT_CLI_CACHE_DIR    the download folder, once per shell
+   VSPZ_YT_CLI_UPDATE=auto  check GitHub in the background at launch and
+                            mention a newer release before playback starts
 
 keys (playback, both modes):
   space            pause / resume
@@ -210,6 +228,19 @@ type options struct {
 	library  string    // directory to browse instead of searching
 	noProbe  bool      // skip ffprobe during a library scan
 	playOnly bool      // play immediately, skip the browse list
+
+	// downloadMode comes from the `download` verb: the arguments are a URL to
+	// save to the cache, or a search whose results pick what to download.
+	downloadMode bool
+	// cacheDir is the `--cache-dir` value, stored unparsed (tilde intact).
+	cacheDir string
+	// updateMode from the `update` verb; updateCheck is its --check form,
+	// compare-only.
+	updateMode  bool
+	updateCheck bool
+	// settingsMode from the `settings` verb: open the click-only screen and
+	// exit. Takes no position on anything else.
+	settingsMode bool
 
 	// viz and palette name a starting style, resolved here rather than at first
 	// use so a typo is an argument error instead of a silently ignored flag.
@@ -379,6 +410,16 @@ func parseArgs(args []string) (options, error) {
 			o.noProbe = true
 		case "--play", "--now":
 			o.playOnly = true
+		case "--cache-dir":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--cache-dir needs a directory")
+			}
+			i++
+			o.cacheDir = args[i]
+		case "--check":
+			// update's compare-only form. Refused later when no update verb
+			// outranks it, so a stray --check has an owner or an error.
+			o.updateCheck = true
 		case "--cookies":
 			if i+1 >= len(args) {
 				return o, fmt.Errorf("--cookies needs a file (a Netscape cookies.txt)")
@@ -466,10 +507,52 @@ func verbSearch(o *options, args []string) ([]string, error) {
 
 func verbPlay(o *options, args []string) ([]string, error) { return args, nil }
 
+// verbDownload marks the download picker. Bare is an error rather than a
+// search for the word "download": the verb's whole point is an argument that
+// says what to save, and guessing would be uploading someone's weather query
+// to a shop they never asked about. neverBareVerbs routes the bare case here.
+func verbDownload(o *options, args []string) ([]string, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("download needs a URL or a search term")
+	}
+	o.downloadMode = true
+	return args, nil
+}
+
+// verbUpdate is `update` or `update check`. Extra words are refused rather
+// than ignored: an update that pretends it understood "update nightly arm"
+// would install the wrong asset if one matched. The --check form is parsed as
+// a flag (below), the spoken form as a word, both spelling one option.
+func verbUpdate(o *options, args []string) ([]string, error) {
+	if len(args) > 0 {
+		if args[0] != "check" {
+			return nil, fmt.Errorf("update takes --check or check, or nothing (got %q)", args[0])
+		}
+		o.updateCheck = true
+	}
+	o.updateMode = true
+	return nil, nil
+}
+
+// verbSettings opens the click-only screen and exits; it does not play, and
+// splitting the session there would be two fronts for one verb.
+func verbSettings(o *options, args []string) ([]string, error) {
+	if len(args) > 0 {
+		return nil, fmt.Errorf("settings takes no arguments (got %s)", strings.Join(args, " "))
+	}
+	o.settingsMode = true
+	return nil, nil
+}
+
 func verbList(o *options, args []string) ([]string, error) { return listDirArg(o, args) }
 
 var verbs = map[string]func(o *options, args []string) ([]string, error){
 	"play":       verbPlay,
+	"download":   verbDownload,
+	"dl":         verbDownload,
+	"save":       verbDownload,
+	"update":     verbUpdate,
+	"settings":   verbSettings,
 	"search":     verbSearch,
 	"find":       verbSearch,
 	"list":       verbList,
@@ -567,6 +650,12 @@ var neverBareVerbs = map[string]bool{
 	"palette": true, "color": true,
 	"help": true, "version": true,
 	"list": true, "library": true, // these take an optional DIR, defaulting to "."
+	// A bare `download` must error ("needs a URL or a search term"), a bare
+	// `update` must actually update, and a bare `settings` must open the
+	// screen: for all three the word is not something anyone searches for,
+	// and the search fallback would swallow the whole verb.
+	"download": true, "dl": true, "save": true,
+	"update": true, "settings": true,
 }
 
 func takeVerb(o *options) (string, bool) {
@@ -592,51 +681,60 @@ func takeVerb(o *options) (string, bool) {
 	return verb, true
 }
 
-// expandFileArgs turns positional arguments that name files into a queue of
-// paths, in order.
+// expandArgs turns positional arguments into a queue of paths plus links.
 //
-// The decision is "does at least one argument look like a file", not "does every
-// argument" — `rasterbar b.opus lofi hip hop` is a mixed intent, and taking the
-// file and searching for the rest would be two players. When any argument looks
-// like a file, all of them are treated as paths and the ones that are not get an
-// error naming them, which is honest. When none does, it is a search.
+// The decision is "does at least one argument look like a file or a link", not
+// "does every argument" — `rasterbar b.opus lofi hip hop` is a mixed intent,
+// and taking the file and searching for the rest would be two players. When any
+// argument looks like a file or a link, the whole set is treated as such and
+// anything unresolvable gets an error naming it, which is honest. When none
+// does, it is a search.
 //
-// The second return value is whether this was a file intent at all, and it is
-// load-bearing. There are three answers, not two:
+// The second return value is whether this was a file/link intent at all, and it
+// is load-bearing. There are three answers, not two:
 //
-//	(nil, false, nil)  no argument names a file -> a YouTube search
-//	(p,  true,  nil)  files resolved          -> play them
-//	(_,  true,  err)  files asked for, none usable -> report why
+//	(nil, nil, false, nil)  no argument names a file or link -> a YouTube search
+//	(p, l,   true,  nil)  resolved -> play/download them
+//	(_, _,   true,  err)  asked for, none usable -> report why
 //
-// The first version returned only (paths, error) and the caller treated "no
-// paths" as "nothing playable", which made every search die with "no playable
-// files in lofi hip hop radio". The primary feature of the program, gone, and
-// nothing in the suite noticed because no test asked for a path that is NOT a
-// file end to end.
-func expandFileArgs(args []string) (paths []string, isFileIntent bool, err error) {
+// Links live in their own slice, appended after the local files, because the
+// order inside each kind is what the user typed and the two kinds differ in
+// what they cost to resolve (a link needs yt-dlp, a file does not). A track
+// from a link keeps its URL for the player; a file keeps its path.
+//
+// The first version of this (as expandFileArgs) returned only (paths, error)
+// and the caller treated "no paths" as "nothing playable", which made every
+// search die with "no playable files in lofi hip hop radio". The primary
+// feature of the program, gone, and nothing in the suite noticed because no
+// test asked for a path that is NOT a file end to end.
+func expandArgs(args []string) (paths []string, links []string, isIntent bool, err error) {
 	any := false
 	for _, a := range args {
-		if looksLikeFile(a) {
+		if looksLikeFile(a) || looksLikeURL(a) {
 			any = true
 			break
 		}
 	}
 	if !any {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 
 	var out []string
 	for _, a := range args {
+		if looksLikeURL(a) {
+			links = append(links, a)
+			continue
+		}
 		paths, isFile, err := loadPathArg(a, 0)
 		if err != nil {
-			return nil, true, err
+			return nil, nil, true, err
 		}
 		if !isFile {
-			return nil, true, fmt.Errorf("%q is not a file, a glob or a playlist", a)
+			return nil, nil, true, fmt.Errorf("%q is not a file, a glob, a playlist or a link", a)
 		}
 		out = append(out, paths...)
 	}
-	return out, true, nil
+	return out, links, true, nil
 }
 
 // validDiscordAppID checks an application id before it is used.
@@ -703,19 +801,22 @@ func main() {
 	}
 
 	// Decide what the positional arguments are before anything else needs to know:
-	// a list of files, or text to search YouTube for.
+	// a list of files, a list of links, or text to search YouTube for.
 	//
 	// -l wins outright when both are given, because a directory scan has its own
 	// walk and its own episode parser and a file list would only duplicate them.
-	var filePaths []string
-	if opts.library == "" && len(opts.args) > 0 && !opts.forceSearch {
-		var isFileIntent bool
-		filePaths, isFileIntent, err = expandFileArgs(opts.args)
+	// The download verb is skipped here: its arguments carry the same meaning
+	// (what to save), not what to play, and resolving them twice would run
+	// yt-dlp on a URL twice.
+	var filePaths, linkArgs []string
+	if opts.library == "" && len(opts.args) > 0 && !opts.forceSearch && !opts.downloadMode {
+		var isIntent bool
+		filePaths, linkArgs, isIntent, err = expandArgs(opts.args)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
-		if isFileIntent && len(filePaths) == 0 {
+		if isIntent && len(filePaths) == 0 && len(linkArgs) == 0 {
 			// Every argument looked like a path and none of them resolved to a
 			// playable file. Saying so beats falling back to a YouTube search for
 			// the user's own filename, which is what used to happen.
@@ -723,7 +824,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if len(filePaths) == 0 && opts.library == "" {
+	if len(filePaths) == 0 && len(linkArgs) == 0 && opts.library == "" {
 		opts.query = strings.Join(opts.args, " ")
 	}
 
@@ -744,7 +845,51 @@ func main() {
 		return
 	}
 
-	if len(filePaths) == 0 && opts.library == "" && opts.query == "" {
+	// The settings file is read before anything that consumes it. A load error
+	// is a warning, not an exit: the settings are defaults, and a corrupt file
+	// must never stop a song from playing.
+	cfg, serr := loadSettings()
+	if serr != nil {
+		fmt.Fprintf(os.Stderr, "settings: %v (using defaults)\n", serr)
+	}
+	cfg.applyTo(&opts)
+
+	// update and settings both end the session: no playback, no cache, no
+	// presence. They run before anything that needs cookies, the terminal or
+	// the audio stack.
+	if opts.updateCheck && !opts.updateMode {
+		fmt.Fprintln(os.Stderr, "--check belongs to `update`")
+		os.Exit(2)
+	}
+	if opts.updateMode {
+		msg, uerr := runUpdate(opts.updateCheck)
+		if uerr != nil {
+			fmt.Fprintln(os.Stderr, uerr)
+			os.Exit(1)
+		}
+		fmt.Println(msg)
+		return
+	}
+	if opts.settingsMode {
+		out, saved, rerr := runSettings(cfg, os.Stdin, os.Stdout)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "settings: %v\n", rerr)
+			os.Exit(1)
+		}
+		cfg = out
+		if saved {
+			path, _ := settingsPath()
+			fmt.Fprintf(os.Stderr, "settings saved: %s\n", path)
+		}
+		return
+	}
+
+	// Background update check, VSPZ_YT_CLI_UPDATE=auto only. Started before the
+	// network-heavy work so it has time to finish; the notice is consumed just
+	// before the UI takes the terminal, non-blockingly.
+	updCh := updateNotice()
+
+	if len(filePaths) == 0 && len(linkArgs) == 0 && opts.library == "" && opts.query == "" {
 		fmt.Print(usage)
 		return
 	}
@@ -767,10 +912,21 @@ func main() {
 		colorMode = detectColor(envSlice())
 	}
 
-	// Three sources, one Track shape: a network search, a directory scan, or a
-	// list of files the user named. The library branch deliberately skips Search
-	// entirely rather than both filling a slice, because there is no query to hand
-	// a scraper; the same goes for explicit files.
+	// The download verb. Runs after settings (folder) and cookies (yt-dlp needs
+	// them on exactly the same terms as playback: cookies here, missed there,
+	// is a bug report that depends on which path the user was on).
+	if opts.downloadMode {
+		drainUpdateNotice(updCh)
+		if code := runDownload(opts, cfg, colorMode); code != 0 {
+			os.Exit(code)
+		}
+		return
+	}
+
+	// Three sources, one Track shape: a network search, a directory scan, or
+	// arguments the user named (files, or links). The library branch deliberately
+	// skips Search entirely rather than both filling a slice, because there is no
+	// query to hand a scraper; the same goes for explicit files.
 	var tracks []Track
 	label := opts.query
 	switch {
@@ -788,10 +944,15 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "%d tracks\n", len(tracks))
 
-	case len(filePaths) > 0:
+	case len(filePaths) > 0 || len(linkArgs) > 0:
+		// Files resolve before links; a link costs yt-dlp round trips and a
+		// file does not, and each kind keeps the order it was typed in.
 		tracks = tracksFromPaths(filePaths)
-		label = fmt.Sprintf("%d files", len(tracks))
-		fmt.Fprintf(os.Stderr, "%d files: %s\n", len(tracks), strings.Join(opts.args, " "))
+		for _, link := range linkArgs {
+			tracks = append(tracks, trackForURL(link))
+		}
+		label = fmt.Sprintf("%d tracks", len(tracks))
+		fmt.Fprintf(os.Stderr, "%s: %s\n", label, strings.Join(opts.args, " "))
 
 	default:
 		fmt.Fprintf(os.Stderr, "searching: %s\n", opts.query)
@@ -802,12 +963,46 @@ func main() {
 		}
 	}
 
+	// Any remote track already in the download cache plays from the file
+	// instead of a minted grant — free seeks, chapters and pause, and none of
+	// the single-use URL machinery. The swap happens BEFORE the metadata fetch:
+	// a cached link must not pay one yt-dlp round trip per play, which is
+	// exactly the wait the cache exists to remove. The cache directory is
+	// resolved but not created: playing a track is not a reason to make folders
+	// on disk, and a failed ReadDir in cacheLookup just means "not cached".
+	if len(tracks) > 0 {
+		if dir, derr := resolveCacheDir(opts.cacheDir, cfg.CacheDir); derr == nil {
+			serveFromCache(dir, tracks)
+		}
+	}
+
+	// A bare URL is not a search result, so its Title/ID/duration are whatever
+	// yt-dlp says rather than nothing. One -J per track that lacks them, and
+	// only when the field is missing: a search result already carries all of
+	// this, a library track never reaches here, and a cache hit above resolved
+	// to a local file with no network at all. A failure is a warning, not an
+	// exit — the track plays the same either way.
+	for i := range tracks {
+		if tracks[i].IsLocal() || tracks[i].Title != "" || tracks[i].URL == "" {
+			continue
+		}
+		if merr := fetchTrackMeta(&tracks[i]); merr != nil {
+			fmt.Fprintf(os.Stderr, "track %d: %v (playing anyway)\n", i+1, merr)
+		}
+		if tracks[i].Title == "" {
+			// The display has to show something, and a bare link is the truth
+			// about what the user asked for even when the metadata lied.
+			tracks[i].Title = strings.TrimSpace(tracks[i].URL)
+		}
+	}
+
 	// A library scan is already an ordered queue, so --play skips the browse
 	// list: picking one episode by hand is the only thing between the command
 	// and playback, and for a known show you want the first episode.
 	idx := 0
 	action := ActionPlay
 	if !opts.playOnly {
+		drainUpdateNotice(updCh)
 		tui := NewTUI(os.Stdin, os.Stdout, label, tracks)
 		var sel int
 		action, sel = tui.Run()
@@ -843,6 +1038,98 @@ func main() {
 	// playQueue is what makes it a player rather than a demo, and it is why the
 	// prompt, the resize path and the stall handler work there for free.
 	playQueue(opts, colorMode, tracks, idx, !wantVideo)
+}
+
+// runDownload is the whole download verb: URL arguments are saved directly,
+// anything else is joined into one search whose picker downloads on enter.
+//
+// Playing stays available from the picker ('a', video mode), and the picker is
+// given back after every download or playback ends — a download session is
+// "what do I want from this query", not one item and out.
+func runDownload(opts options, cfg settings, mode ColorMode) int {
+	paths, links, _, err := expandArgs(opts.args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if len(links) == 0 {
+		// No links means nothing here is a URL. With file intent that is "you
+		// already have this file, on disk"; otherwise it is the picker flow.
+		if len(paths) > 0 {
+			fmt.Fprintf(os.Stderr, "download takes a URL or a search term; %q is already on disk\n",
+				strings.Join(paths, " "))
+			return 1
+		}
+		if strings.TrimSpace(opts.query) == "" {
+			// Unreachable through the verb (bare `download` errors in
+			// verbDownload), but runDownload is callable directly in tests.
+			fmt.Fprintln(os.Stderr, "download needs a URL or a search term")
+			return 1
+		}
+		tracks, serr := Search(opts.query)
+		if serr != nil {
+			fmt.Fprintf(os.Stderr, "search failed: %v\n", serr)
+			return 1
+		}
+		for {
+			tui := NewDownloadTUI(os.Stdin, os.Stdout, opts.query, tracks)
+			action, sel := tui.Run()
+			if action == ActionQuit || sel < 0 {
+				return 0
+			}
+			if action == ActionASCII || action == ActionPlay {
+				// Playing from the picker uses the same queue machinery as the
+				// play verb, so seek, pause, chapters and the HUD all work in
+				// a session that opened as a download.
+				playQueue(opts, mode, tracks, sel, action != ActionASCII)
+				continue
+			}
+			dir, derr := resolveCacheDir(opts.cacheDir, cfg.CacheDir)
+			if derr != nil {
+				fmt.Fprintln(os.Stderr, derr)
+				return 1
+			}
+			// A picker entry already carries Title and ID from the search, so
+			// downloadTrack goes straight to the cache check.
+			path, already, derr := downloadTrack(tracks[sel], dir)
+			if derr != nil {
+				fmt.Fprintf(os.Stderr, "download: %v\n", derr)
+				continue
+			}
+			state := "saved"
+			if already {
+				state = "already cached"
+			}
+			fmt.Printf("%s: %s\n", state, path)
+		}
+	}
+
+	// URL arguments: save each one. A failure names its link and stops the
+	// batch — `download url1 url2` with url1 offline must not half-report
+	// success by continuing.
+	dir, derr := resolveCacheDir(opts.cacheDir, cfg.CacheDir)
+	if derr != nil {
+		fmt.Fprintln(os.Stderr, derr)
+		return 1
+	}
+	for i, link := range links {
+		tr := trackForURL(link)
+		if merr := fetchTrackMeta(&tr); merr != nil {
+			fmt.Fprintf(os.Stderr, "[%d/%d] %s: %v\n", i+1, len(links), link, merr)
+			return 1
+		}
+		path, already, derr := downloadTrack(tr, dir)
+		if derr != nil {
+			fmt.Fprintf(os.Stderr, "[%d/%d] %s: %v\n", i+1, len(links), link, derr)
+			return 1
+		}
+		state := "saved"
+		if already {
+			state = "already cached"
+		}
+		fmt.Printf("[%d/%d] %s: %s\n", i+1, len(links), state, path)
+	}
+	return 0
 }
 
 // playQueue plays the selected result and then keeps going through the rest of

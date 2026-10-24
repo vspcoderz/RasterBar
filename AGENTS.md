@@ -18,6 +18,12 @@ go vet ./... && go test ./... && go build -ldflags="-s -w" -o rasterbar ./src
 Single test: `go test -run TestComputeLayout ./...`. Tests run offline, in ~0.6s,
 with no ffmpeg/mpv/network.
 
+Releases the `update` verb can find are tagged on GitHub, and the asset must be
+named `rasterbar-<ver>-linux-<arch>` — `pickUpdateAsset` matches by substring
+against GOOS/GOARCH, so a differently-shaped name is a release nobody can
+update to. New feature runs must re-check `rasterbar update --check` against a
+stamped build (`-X main.version=vX.Y.Z`) before the release ships.
+
 ## Zero third-party Go modules
 
 Defining constraint, not a preference. FFT, PTY, raw mode and termios are all

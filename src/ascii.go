@@ -418,6 +418,11 @@ func pickAudio(formats []ytFormat) (string, error) {
 
 // ytInfo is the subset of `yt-dlp -J` we need.
 type ytInfo struct {
+	// Identity, needed by the cache: `%(id)s` is the cache key and `title` is
+	// what a queue entry built from a bare URL displays before playback. Both
+	// ride along in every -J response; they were simply never read before.
+	VideoID string     `json:"id"`
+	Title   string     `json:"title"`
 	Formats []ytFormat `json:"formats"`
 	// Duration in seconds, for the progress bar. Absent or zero on a live
 	// stream, which is why the HUD falls back to elapsed-only.

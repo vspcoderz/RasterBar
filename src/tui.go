@@ -20,6 +20,11 @@ type TUI struct {
 	top    int
 	query  string
 	rows   int
+	// downloadMode changes what enter does. Building it as a flag rather than a
+	// second Run() keeps the key handling in one place; 'd' only downloads when
+	// the session was opened by one, so `rasterbar search lofi` cannot download
+	// by accident and the browse list stays a spoiler-free picker.
+	downloadMode bool
 }
 
 func NewTUI(in, out *os.File, query string, tracks []Track) *TUI {
@@ -44,7 +49,18 @@ const (
 	ActionQuit Action = iota
 	ActionPlay
 	ActionASCII
+	// ActionDownload saves the selected track into the cache. Returned by
+	// enter and 'd' only when the list was opened by the download verb; main
+	// then downloads, prints where it went, and gives the list back.
+	ActionDownload
 )
+
+// NewDownloadTUI opens the picker in the mode where selection downloads.
+func NewDownloadTUI(in, out *os.File, query string, tracks []Track) *TUI {
+	t := NewTUI(in, out, query, tracks)
+	t.downloadMode = true
+	return t
+}
 
 func (t *TUI) clear() {
 	fmt.Fprint(t.out, "\x1b[2J\x1b[H")
@@ -89,7 +105,14 @@ func (t *TUI) render() {
 	}
 	sb.WriteString(strings.Repeat("─", w) + "\n")
 	fmt.Fprint(t.out, sb.String())
-	fmt.Fprint(t.out, "j/k move  enter music  a video  q quit\n")
+	// The hint line differs by mode: the verb decides what the safest key
+	// enters, because the list is borrowed by `download` and an "enter plays"
+	// hint under a picker that downloads would be a lie.
+	if t.downloadMode {
+		fmt.Fprint(t.out, "j/k move  enter/d download  a video  q quit\n")
+	} else {
+		fmt.Fprint(t.out, "j/k move  enter music  a video  q quit\n")
+	}
 }
 
 // Run reads single keypresses until the user acts. Reads raw bytes, not lines:
@@ -180,7 +203,16 @@ func (t *TUI) Run() (Action, int) {
 			if len(t.tracks) == 0 {
 				return ActionQuit, -1
 			}
+			if t.downloadMode {
+				return ActionDownload, t.cursor
+			}
 			return ActionPlay, t.cursor
+		case 'd', 'D':
+			// 'd' downloads only in download mode; outside it the key is free
+			// for a future playback feature rather than surprising.
+			if t.downloadMode && len(t.tracks) > 0 {
+				return ActionDownload, t.cursor
+			}
 		case 'a', 'A':
 			if len(t.tracks) == 0 {
 				return ActionQuit, -1

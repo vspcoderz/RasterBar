@@ -1,161 +1,114 @@
-# PLAN — more visualisers, and a scope worth looking at
+# PLAN — download verb + URL playback + media cache + update + settings
 
-Status: done (plus the follow-up below)
+Status: **done.** `download` (URL + keyterm picker) downloads merged mp4s into
+the cache and serves `play` of an already-downloaded ID from the file; `update`
+self-swaps via GitHub releases; `settings` is the click-only store. Verified:
+new unit tests green, real download of "Me at the zoo" into a sandbox cache,
+"already cached" re-invocation, and a pty drive of `rasterbar <url>` that
+presented live frames with "local" in the chrome. `update --check` reports the
+honest 404 until the first release is tagged.
 
-Result: 6 → 18 styles, all at **0 allocs/op**, all painting under DEC 2026 in a
-pty. `scope` rewritten: 40.8 cycles of a 440Hz note across an 80-column screen
-becomes 2.5, triggered and standing still. `BPM` finally has a consumer.
+## Goal
 
-## The scope was not "meh" because of its line style
+1. `rasterbar download <keyterm | URL>` — download a track into a cache dir.
+2. `rasterbar <URL>` / `rasterbar play <URL>` — play a URL directly instead of
+   turning it into a YouTube search for the URL text.
+3. Playback serves a remote track from cache when it is already downloaded.
 
-Measured, from the constants: `waveWindow = fftSize = 1024` samples at
-`spectrumHz = 11025`, so the scope was handed **92.9ms of audio** and asked to
-draw it across the terminal's width.
+## Approach
 
-| note | cycles in 92.9ms | columns per cycle at 80 cols |
-|---|---|---|
-| 55Hz bass | 5.1 | 16 |
-| 220Hz mid | 20.4 | 3.9 |
-| 440Hz treble | 40.8 | **2.0** |
+- **New file `src/download.go`**
+  - `cacheDir()` — flag/env/default: `--cache-dir DIR`, `VSPZ_YT_CLI_CACHE_DIR`,
+    default under the home dir. Two subdirs: `audio/` and `video/`.
+  - `downloadTrack(t Track, cfg) error` — one `yt-dlp` call, routed through
+    `ytdlpAuth.run` (cookies everywhere rule; a flagged machine needs cookies on
+    the download path too or the bug only shows for flagged users).
+  - Filename template `%(title)s [%(id)s].%(ext)s` — the ID in every name is what
+    makes cache lookup a glob instead of an index.
+  - `--download-archive downloaded.txt` + `--no-overwrites`: the archive is the
+    "already have it" index keyed by video ID.
+  - Format selection (AGENTS dead-end: no progressive `18` exists anymore, so
+    every download is split streams):
+    - audio: (dropped) no separate audio files — downloads carry the merged mp4
+    video: `bestvideo[height<=1080]+bestaudio/best[height<=1080]/b`, mp4 out
+  - Progress: print `downloading: <title>` before, result line after. stderr stays
+    captured (raw-mode/renderer rule) and is shown on failure.
+- **URL playback (`src/playlist.go` + `main.go`)**
+  - `looksLikeURL` already exists. `expandFileArgs`' classification grows a third
+    kind: a URL arg becomes a `Track{URL:…}`, mixed with file args in one queue.
+    Search still happens only when no arg is a file or a URL
+    (`TestSearchStillSearches` semantics).
+  - Standalone URL helper: `trackForURL(url)` sets `Scraper:"url"`; the title is
+    filled from the `-J` response already being fetched at playback (add `Title`
+    to `ytInfo` — it is on the wire, we just never read it).
+- **Cache hit (src/ascii.go `resolveMedia`)**
+  - Before resolving a remote track, glob the cache for `[<ID>]*`. Found → probe
+    the local file and play it — `Track.IsLocal()` machinery already handles
+    everything downstream (no yt-dlp, no grants, seeking free).
+  - Applies to search results and `download`-ed URLs alike, since ID is the key.
+- **Verb wiring (`main.go`)**
+  - `download` verb (+ `dl` alias): consumes args into a new `options` mode.
+    Bare `rasterbar download` must not fall through to a search for the word
+    "download" — needs the `neverBareVerbs` treatment (it takes a value: URL or
+    keyterm).
+  - Usage text updated.
+- **Tests** (all offline, existing seams):
+  - URL classification: URL → track, not search; mixed files+URLs; the
+    "question-mark URL was a glob" family of regressions.
+  - verb parsing: `download` consumes args, bare `download` errors nicely,
+    `rasterbar play download.mp3` still a file.
+  - `downloadTrack`'s yt-dlp arg list is pure code: assert format flags, merge
+    format, archive path, and that cookies land in the list.
+  - cache lookup: glob match by ID, miss → resolve as before.
+  - End-to-end real download: needs network — manual verification step, same
+    tier as the SIGSTOP/SIGINT cases.
 
-Past a few hundred Hz there are more cycles than columns, so the trace aliased
-into a solid band and every note looked the same. Three smaller faults sat on top
-of it: no trigger (the trace slid with the note's phase), a column **mean** (a
-lowpass, which cancels an asymmetric waveform toward zero), and no persistence.
+## Files touched
 
-Fixed by zoom (~2.5 cycles of the dominant band, 62 samples at 440Hz), a rising
-zero-crossing trigger, a min/max beam, and a phosphor trail. Zoom needed a
-band→Hz mapping no style had, so `bandHz` went into fft.go next to the
-constructor that builds the same layout privately, with
-`TestBandHzAgreesWithTheAnalyzersEdges` holding the two copies together.
-
-## What shipped
-
-| axis | styles |
-|---|---|
-| waveform | `lissajous` `ribbon` `swell` (+ the rewritten `scope`) |
-| spectrum | `matrix` `peaks` `rays` `wheel` `helix` `terrain` |
-| beat / tempo | `bloom` `metro` |
-| field | `aurora` (the only `Heavy()`) |
-
-Shared: `phosphor` (the trail buffer), `lerp`/`smoothstep`/`vnoise`,
-`analysisHz`, `bandHz`, `dominantBand`, `maxFloat`.
-
-## Bugs this batch found, which is the point of the plan
-
-| found by | bug |
-|---|---|
-| `TestResetDropsEveryStyleState` (new) | aurora lit **654 of 672 cells in silence** — value noise is 0..1 by construction, so the picture had stopped reacting to anything. Now gated by level. |
-| `TestResetDropsEveryStyleState` (new) | ribbon drew a lit hairline from bands alone. Needed a `haveWave` flag: a zero envelope is not the same as no signal. |
-| `TestStylesOnlyDrawFromTheirOwnInput` | ribbon again, same cause. |
-| `TestMetroFrontsAreLegible` (new) | one cell of travel per beat = a 1-cell spacing at 128bpm, so **every cell lit every frame**: 1.2ms/op and a uniform glow instead of rings. |
-| `go vet` | `analysisHz = spectrumHz/fftSize` is **integer division** — 10, not 10.766. A tempo 7.7% slow. |
-| `BenchmarkEveryStylePaint` (new) | metro at 2.67ms/op was the worst style in the registry while declaring itself cheap. `math.Hypot`/`Mod`/`Exp` per cell → `sqrt`/floor-subtract/`smoothstep`: **697µs**. |
-| driving the binary | `help` still listed six styles. The list is now generated from `VizNames()`. |
-| my own test | matrix and metro draw *on purpose* on silence, so the Reset test compares against a **control instance** rather than against zero lit cells. |
-
-The Reset test caught two real bugs on its first run. It is now the most valuable
-test in the file for a future nineteenth style.
+- `src/download.go` (new), `src/download_test.go` (new)
+- `src/main.go` — verb + intent dispatch + flag
+- `src/playlist.go` — URL args as a third kind
+- `src/ascii.go` — cache-hit lookup + `ytInfo.Title`
+- `src/search.go` — untouched (search keeps working)
+- `src/ytdlpauth.go` — untouched (used as-is)
+- README/usage strings in `main.go`
 
 ## Verification
 
-```
-go vet ./... && go test ./... && go build -ldflags="-s -w" -o rasterbar ./src
-```
-All pass, `gofmt` clean. Full suite ~9s.
+- `go vet ./... && go test ./... && go build -ldflags="-s -w" -o rasterbar ./src`
+- pty drive: `tools/ptysync.py` — play a known URL twice; second run must show
+  the cache hit (no yt-dlp network call: check with `--no-probe` timing or debug)
+- Real download of one small video + one music track over network, manually.
 
-Paint cost, 200x60, `BenchmarkEveryStylePaint` (registry-driven, so the next
-style is measured on arrival): **all 18 at 0 allocs/op**, 23µs (bloom) to 1.51ms
-(aurora, capped). Slowest cheap style is `waterfall` at 942µs, pre-existing.
+## Open questions
 
-Driven, one at a time, through `tools/ptysync.py` — DEC 2026 honoured the way
-Ghostty does, 12s fixture, `--viz NAME` per style:
+None. Answers: picker (1a), flat `~/RasterStuff/` (2b), merged mp4 always (3).
 
-```
-bars 5086  scope 8799  lissajous 36102  ribbon 7711  swell 17839  mirror 4666
-matrix 2754  peaks 1040  rays 32113  wheel 9931  helix 6401  terrain 9880
-waterfall 35315  radial 2810  bloom 563  metro 37380  particles 463  aurora 62901
-```
+## Scope additions (same build)
 
-(bytes/frame.) All 18 presented 55–67 frames with **nothing withheld at exit** —
-a program that left 2026 open would show 1 frame and a black screen for the whole
-track, which a bare pty cannot catch.
+**`rasterbar update`** — self-update, stdlib only:
+- GitHub REST `releases/latest` on `github.com/vspcoderz/rasterbar`, parse
+  `tag_name`, pick the asset named for linux/$GOARCH; error lists what was found.
+- Never overwrite blindly: download to `rasterbar.new-<pid>` in the binary's own
+  *directory* (rename must be same-filesystem), verify `\x7fELF` magic, chmod
+  0755, rename over `os.Executable()`. Running binary keeps executing the old
+  inode, which is safe on Linux.
+- Version compare strips a leading `v`; dev build (no stamp) warns and proceeds.
+- `update --check` = compare only. `VSPZ_YT_CLI_UPDATE=auto` adds a background
+  startup check (3s timeout, silent failure) that prints a notice line before
+  playback starts — notice only, it never swaps the binary unasked.
 
-## Not done, deliberately
+**`rasterbar settings`** — click-only settings, zero third-party:
+- `~/.config/rasterbar/config.json`, atomic write (temp + rename).
+- Rows cycled with j/k + left/right or enter; no text inputs: values are cycles
+  (viz names, palette names, quality/auto, music/video default, cookies-from
+  browser or none, cache-dir presets including `~/RasterStuff`).
+- Not a TTY: print current values.
+- Precedence: explicit flag > settings > built-in default. Settings never
+  override something the user typed.
 
-- **No direct-select keys for styles.** 18 makes `v` a longer walk, but `--viz
-  NAME` and `V` cover it and adding keys is a change nobody asked for.
-- **`peaksFloor` (0.12) wants a check against real music.** It is the one constant
-  in the batch tuned on a fixture. 40 needles is the spectrum again.
-- **Screenshots.** The pty drive measures frames and bytes, not appearance. Worth
-  running `termscreen.py` over the new styles by hand before trusting the tuning.
+## Files touched (final)
 
----
-
-# Follow-up — the empty visualiser was never a visualiser bug
-
-Symptom: "all visualizers are stuck", sometimes, on some tracks. Every style
-affected at once, which is the tell: a visualiser fault cannot hit all eighteen
-independently, but a fault in what feeds them hits all of them identically.
-
-## What it actually was
-
-`ps` on a live instance, mid-song:
-
-```
-137608  rasterbar play LET ME IN cg5
-138082  TLl+ mpv  ...googlevideo.co     <- playing
-138102  Z+   [ffmpeg] <defunct>          <- the level tap, dead and unreaped
-```
-
-The **level tap's ffmpeg had exited**. No audio reaching the analyser means no
-`TryFrame`, so no `Push`, so every style held its last frame — on a fresh track,
-zero. The process stayed up, the HUD kept advancing, and nothing said why.
-
-`LevelTap.Dead()` existed, recorded the exit, and was **called by nothing**. Its
-own doc comment claimed "the render loop reports this through the status line
-once per tap", which it did not. Identical in shape to the `Viz.CapScale` entry
-in AGENTS.md: both halves of an interface, and the consumer never written.
-
-Two more faults on the same path:
-
-- **`pump` never `Wait`ed**, so the dead child stayed a zombie for the life of
-  the process. Now reaped on the goroutine that owns the pipe.
-- **ffmpeg's stderr was unset**, so the child inherited the terminal — in raw
-  mode, being drawn on. Its own explanation of the failure was interleaved with
-  the visualiser and unreadable. Captured now, bounded, and folded into the error.
-
-Fixed in `12f2272`. `paintMusic` treats a dead tap as fatal and says why; a dead
-tap stays dead, so continuing would only hold the last frame forever.
-
-## The separate failure, and a false lead of mine
-
-A second, unrelated mode showed up while reproducing this locally:
-
-```
-cannot play Rick Astley ...: yt-dlp -J: signal: segmentation fault (core dumped)
-```
-
-That one was already reported correctly. `yt-dlp` 2026.08.19 segfaults on `-J`
-for this URL — an environment problem, not a code one, and it will hit the user.
-
-Two of my own hypotheses were wrong before the right one, both worth recording:
-
-1. **"It's the AGC pegging everything."** Image 2 showed full-height columns, so
-   I blamed the dB window. Measured the analyser: `mean 0.20, max 0.73` — nowhere
-   near pegged. Wrong.
-2. **"It's the visualiser grid going empty."** True, but it is a *symptom* of the
-   tap. Chasing it in the styles would have produced nothing, because no style
-   can draw audio that never arrived.
-
-The instrument that finally answered it was `ps` on a live process. Every
-in-band measurement said the renderer was fine, because the renderer *was*
-fine.
-
-## matrix's width bug, found in the same session
-
-`matrix` looped `x < cols && x < n` at the new gap pitch, and `n` is capped at
-`maxDrawnBands = 128` — so on a 250-column terminal every LED landed in the left
-128 columns and the right third was bare. The waterfall band-count rule in
-AGENTS.md, walked into for the second time in one batch. The loop now runs over
-columns and derives the band from the column, so pitch and width are independent.
+- `src/download.go` (new), `src/update.go` (new), `src/settings.go` (new)
+- `src/main.go`, `src/playlist.go`, `src/ascii.go`, `src/ytdlpauth.go`, `src/tui.go`
+- tests: `download_test.go`, `update_test.go`, `settings_test.go`, `args_test.go`
