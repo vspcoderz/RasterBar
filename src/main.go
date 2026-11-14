@@ -25,6 +25,8 @@ verbs:
   update [--check]       replace this binary with the newest release on GitHub
   settings               click-only screen: default mode, quality cap,
                          visualizer, palette, download folder, cookies
+  web                    serve the browser UI on 127.0.0.1 (prints a token URL)
+  app                    the same UI in a chromeless Chromium window (PWA)
   search <query>         force a search, even if an argument looks like a path
   list [DIR]             browse a directory (was -l DIR); defaults to "."
   viz NAME               %s
@@ -43,6 +45,8 @@ verbs:
   rasterbar https://youtu.be/ID           play a link, from cache when it is
                                           already downloaded
   rasterbar download https://youtu.be/ID  same link, into the download folder
+  rasterbar web                          browser UI, this machine only
+  rasterbar app                          the same, as a window (PWA)
 
   An argument becomes a file when it exists, contains a wildcard, or names a
   playlist. A link becomes a player of that link, not a search for its text.
@@ -78,6 +82,10 @@ options:
       --cols N       force ASCII grid width (default: terminal width)
       --rows N       force ASCII grid height (default: from terminal height)
       --no-probe     skip the ffprobe pass on a directory scan
+      --port N       web/app port (default 8420; 0 picks a free one)
+      --host ADDR    loopback address to bind: 127.0.0.1, localhost or ::1
+      --no-open      serve only; print the token URL instead of opening it
+      --browser B    browser command for web/app (chromium, google-chrome...)
       --play         with list, start the first track without the browse list
       --no-discord   do not publish what is playing to Discord (on by default)
       --discord      presence is on anyway; report if it cannot connect
@@ -270,6 +278,17 @@ type options struct {
 	discord      bool
 	discordAppID string
 
+	// web/app serve the same embedded UI over loopback. webVerb records which
+	// spelling got here, because the startup line should repeat what was typed.
+	webMode    bool
+	appMode    bool
+	webVerb    string
+	webHost    string
+	webPort    int
+	webPortSet bool
+	webNoOpen  bool
+	webBrowser string
+
 	// vizPrefs caches the resolved style/palette across the queue. Built by
 	// prefs() on demand and shared, so the `v` and `c` keys mutate one value.
 	vizPrefs *vizPrefs
@@ -309,7 +328,7 @@ const colorAuto ColorMode = -1
 // function has no business touching. main joins them into a query only when none
 // of them names a file.
 func parseArgs(args []string) (options, error) {
-	o := options{color: colorAuto}
+	o := options{color: colorAuto, webHost: "127.0.0.1"}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
@@ -419,6 +438,36 @@ func parseArgs(args []string) (options, error) {
 			o.noProbe = true
 		case "--play", "--now":
 			o.playOnly = true
+		case "--port":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--port needs a number (0 picks a free one)")
+			}
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil || v < 0 || v > 65535 {
+				return o, fmt.Errorf("bad --port value: %s", args[i])
+			}
+			o.webPort = v
+			o.webPortSet = true
+		case "--host":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--host needs an address (127.0.0.1, localhost or ::1)")
+			}
+			i++
+			switch args[i] {
+			case "127.0.0.1", "localhost", "::1":
+				o.webHost = args[i]
+			default:
+				return o, fmt.Errorf("--host must be loopback (127.0.0.1, localhost or ::1); got %s", args[i])
+			}
+		case "--no-open":
+			o.webNoOpen = true
+		case "--browser":
+			if i+1 >= len(args) {
+				return o, fmt.Errorf("--browser needs a command name (chromium, google-chrome, brave)")
+			}
+			i++
+			o.webBrowser = args[i]
 		case "--cache-dir":
 			if i+1 >= len(args) {
 				return o, fmt.Errorf("--cache-dir needs a directory")
@@ -516,6 +565,25 @@ func verbSearch(o *options, args []string) ([]string, error) {
 
 func verbPlay(o *options, args []string) ([]string, error) { return args, nil }
 
+func verbWeb(o *options, args []string) ([]string, error) {
+	if len(args) > 0 {
+		return nil, fmt.Errorf("web takes no arguments (got %q)", strings.Join(args, " "))
+	}
+	o.webMode = true
+	o.webVerb = "web"
+	return nil, nil
+}
+
+func verbApp(o *options, args []string) ([]string, error) {
+	if len(args) > 0 {
+		return nil, fmt.Errorf("app takes no arguments (got %q)", strings.Join(args, " "))
+	}
+	o.webMode = true
+	o.appMode = true
+	o.webVerb = "app"
+	return nil, nil
+}
+
 // verbDownload marks the download picker. Bare is an error rather than a
 // search for the word "download": the verb's whole point is an argument that
 // says what to save, and guessing would be uploading someone's weather query
@@ -572,6 +640,8 @@ var verbs = map[string]func(o *options, args []string) ([]string, error){
 	"visualizer": verbViz,
 	"palette":    verbPalette,
 	"color":      verbPalette,
+	"web":        verbWeb,
+	"app":        verbApp,
 	"help":       verbPrintHelp,
 	"version":    verbPrintVersion,
 }
@@ -665,6 +735,7 @@ var neverBareVerbs = map[string]bool{
 	// and the search fallback would swallow the whole verb.
 	"download": true, "dl": true, "save": true,
 	"update": true, "settings": true,
+	"web": true, "app": true,
 }
 
 func takeVerb(o *options) (string, bool) {
@@ -898,7 +969,7 @@ func main() {
 	// before the UI takes the terminal, non-blockingly.
 	updCh := updateNotice()
 
-	if len(filePaths) == 0 && len(linkArgs) == 0 && opts.library == "" && opts.query == "" {
+	if len(filePaths) == 0 && len(linkArgs) == 0 && opts.library == "" && opts.query == "" && !opts.webMode {
 		fmt.Print(usage)
 		return
 	}
@@ -919,6 +990,17 @@ func main() {
 	colorMode := opts.color
 	if colorMode == colorAuto {
 		colorMode = detectColor(envSlice())
+	}
+
+	// web and app end the terminal session the same way settings and update do.
+	// They run after settings and cookies so the UI starts with the stored
+	// defaults and the same bot-check workaround every other path uses.
+	if opts.webMode {
+		drainUpdateNotice(updCh)
+		if code := runWeb(opts, cfg, colorMode); code != 0 {
+			os.Exit(code)
+		}
+		return
 	}
 
 	// The download verb. Runs after settings (folder) and cookies (yt-dlp needs

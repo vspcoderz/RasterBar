@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#08080a">
+<meta name="description" content="RasterBar: YouTube in your terminal, and in this window.">
+<title>RasterBar</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/assets/icons/app-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <a class="brand" href="#search" data-page="search" aria-label="RasterBar home">
+      <img class="brand__mark" src="/assets/icons/app-192.png" alt="" width="34" height="34">
+      <span class="brand__text">
+        <span class="brand__name">RasterBar</span>
+        <span class="brand__tag">terminal video, in the browser</span>
+      </span>
+    </a>
+
+    <nav class="nav" aria-label="Main">
+      <button class="nav-item" type="button" data-page="search"><span class="icon i-search"></span><span>Search</span></button>
+      <button class="nav-item" type="button" data-page="library"><span class="icon i-library"></span><span>Library</span></button>
+      <button class="nav-item" type="button" data-page="now"><span class="icon i-monitor-play"></span><span>Now playing</span><span class="nav-live" id="navLive" hidden></span></button>
+      <button class="nav-item" type="button" data-page="queue"><span class="icon i-list-music"></span><span>Queue</span><span class="nav-count" id="navCount">0</span></button>
+      <button class="nav-item" type="button" data-page="settings"><span class="icon i-settings"></span><span>Settings</span></button>
+      <button class="nav-item" type="button" data-page="about"><span class="icon i-info"></span><span>About</span></button>
+    </nav>
+
+    <div class="sidebar__foot">
+      <button class="now-mini" type="button" id="nowMini" data-page="now" hidden>
+        <span class="now-mini__art" id="nowMiniArt"><span class="icon i-audio-lines"></span></span>
+        <span class="now-mini__body">
+          <span class="now-mini__title" id="nowMiniTitle">Nothing playing</span>
+          <span class="now-mini__channel" id="nowMiniChannel">Pick a track</span>
+          <span class="now-mini__bar"><span id="nowMiniFill"></span></span>
+        </span>
+      </button>
+      <div class="conn" id="conn"><span class="conn__dot"></span><span id="connLabel">Connecting</span></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar__brand">
+        <img src="/assets/icons/app-192.png" alt="" width="26" height="26">
+        <span>RasterBar</span>
+      </div>
+      <p class="topbar__page" id="topbarPage">Search</p>
+      <div class="topbar__actions">
+        <button class="btn btn-ghost btn-sm" type="button" id="btnNow" data-page="now"><span class="icon i-monitor-play"></span><span>Now playing</span></button>
+        <button class="btn btn-ghost btn-sm" type="button" id="btnInstall" hidden><span class="icon i-download"></span><span>Install</span></button>
+      </div>
+    </header>
+
+    <div class="pages">
+      <section class="page" id="page-search" data-page="search">
+        <div class="page-head">
+          <p class="eyebrow">YouTube search</p>
+          <h1>Find something to play</h1>
+          <p class="page-sub">Search a track, paste a link, or open a folder from this machine.</p>
+        </div>
+        <form class="searchbar" id="searchForm" role="search">
+          <span class="icon i-search searchbar__icon"></span>
+          <input id="searchInput" class="searchbar__input" type="search" name="q" placeholder="Search YouTube, or paste a video link" autocomplete="off" spellcheck="false" maxlength="300" aria-label="Search YouTube">
+          <button class="btn btn-primary" type="submit" id="searchBtn">Search</button>
+        </form>
+        <div class="chips" id="searchChips">
+          <button class="chip" type="button" data-query="lofi hip hop radio">lofi hip hop radio</button>
+          <button class="chip" type="button" data-query="synthwave mix">synthwave mix</button>
+          <button class="chip" type="button" data-query="jazz standards">jazz standards</button>
+          <button class="chip" type="button" data-query="ambient focus">ambient focus</button>
+        </div>
+        <div class="results-head" id="searchResultsHead" hidden>
+          <p class="eyebrow" id="searchResultsLabel">Results</p>
+          <button class="btn btn-ghost btn-sm" type="button" id="searchQueueAll"><span class="icon i-list-music"></span><span>Queue all</span></button>
+        </div>
+        <div class="track-list" id="searchResults"></div>
+        <div class="empty" id="searchEmpty">
+          <span class="icon i-radio empty__icon"></span>
+          <p class="empty__title">Nothing here yet</p>
+          <p class="empty__text">A search costs one yt-dlp lookup and works without opening a terminal.</p>
+        </div>
+        <div class="results-head" id="libraryStrip" hidden>
+          <p class="eyebrow">Local files</p>
+          <button class="btn btn-ghost btn-sm" type="button" data-page="library"><span class="icon i-folder"></span><span>Open library</span></button>
+        </div>
+        <div class="track-list" id="libraryStripList"></div>
+      </section>
+
+      <section class="page" id="page-library" data-page="library" hidden>
+        <div class="page-head">
+          <p class="eyebrow">On this machine</p>
+          <h1>Your library</h1>
+          <p class="page-sub">RasterBar plays local video and audio files with free seek and no network.</p>
+        </div>
+        <div class="panel">
+          <div class="panel__head">
+            <p class="eyebrow">Folders</p>
+            <label class="switch"><input type="checkbox" id="probeToggle"><span>Probe media</span></label>
+          </div>
+          <div class="roots" id="roots"></div>
+          <div class="library-actions">
+            <button class="btn btn-primary" type="button" id="pickFolder"><span class="icon i-folder"></span><span>Choose a folder</span></button>
+            <span class="muted" id="libraryDir">No folder chosen</span>
+          </div>
+        </div>
+        <div class="results-head" id="libraryHead" hidden>
+          <p class="eyebrow" id="libraryLabel">Tracks</p>
+          <button class="btn btn-ghost btn-sm" type="button" id="libraryQueueAll"><span class="icon i-list-music"></span><span>Queue all</span></button>
+        </div>
+        <div class="track-list" id="libraryResults"></div>
+        <div class="empty" id="libraryEmpty">
+          <span class="icon i-library empty__icon"></span>
+          <p class="empty__title">No folder open</p>
+          <p class="empty__text">Pick one of the folders above, or use the native folder chooser.</p>
+        </div>
+      </section>
+
+      <section class="page page-now" id="page-now" data-page="now" hidden>
+        <div class="empty empty-now" id="nowEmpty">
+          <span class="icon i-audio-lines empty__icon"></span>
+          <p class="empty__title">Nothing playing</p>
+          <p class="empty__text">Pick a track and the visualiser starts with the sound.</p>
+          <div class="empty__actions">
+            <button class="btn btn-primary" type="button" data-page="search"><span class="icon i-search"></span><span>Search music</span></button>
+            <button class="btn btn-ghost" type="button" data-page="library"><span class="icon i-folder"></span><span>Browse library</span></button>
+          </div>
+        </div>
+
+        <div class="now-grid" id="nowBody" hidden>
+          <div class="stage-column">
+            <div class="stage mode-music" id="stage">
+              <div class="stage__canvas-wrap" id="vizSlot"><canvas class="stage__canvas" id="vizCanvas"></canvas><pre class="stage__mono" id="vizMono" hidden></pre></div>
+              <div class="stage__video-slot" id="videoSlot"><canvas class="stage__canvas stage__video" id="videoCanvas"></canvas><pre class="stage__mono" id="videoMono" hidden></pre></div>
+              <div class="pip" id="pip" hidden>
+                <div class="pip__head"><span class="pip__label"><span class="icon i-monitor-play"></span>Video</span><button class="btn btn-icon btn-xs" type="button" data-action="split-off" aria-label="Close video inset"><span class="icon i-x"></span></button></div>
+                <div class="pip__body" id="pipBody"></div>
+              </div>
+              <div class="dock" id="dock" hidden>
+                <span class="dock__label"><span class="icon i-audio-lines"></span>Spectrum</span>
+                <div class="dock__body"><canvas id="dockCanvas"></canvas><pre class="stage__mono dock__mono" id="dockMono" hidden></pre></div>
+              </div>
+              <div class="stage__overlay">
+                <span class="badge" id="stageMode">Visualizer</span>
+                <span class="badge badge-quiet" id="stageGrid">180 x 50</span>
+                <button class="btn btn-icon btn-xs stage__full" type="button" id="btnFullscreen" aria-label="Fullscreen"><span class="icon i-maximize-2"></span></button>
+              </div>
+              <div class="stage__msg" id="stageMsg" hidden><span class="icon i-loader-2 spin"></span><span id="stageMsgText">Resolving stream</span></div>
+            </div>
+            <div class="stage-bar">
+              <div class="stage-bar__meta">
+                <span class="stage-bar__title" id="stageTitle"></span>
+                <span class="stage-bar__channel" id="stageChannel"></span>
+              </div>
+              <div class="stage-bar__actions">
+                <button class="btn btn-ghost btn-sm" type="button" data-action="download"><span class="icon i-download"></span><span>Download</span></button>
+                <button class="btn btn-ghost btn-sm" type="button" data-action="fullscreen"><span class="icon i-maximize-2"></span><span>Fullscreen</span></button>
+              </div>
+            </div>
+          </div>
+
+          <aside class="now-side">
+            <div class="panel np-card">
+              <p class="eyebrow">Now playing</p>
+              <h2 class="np-title" id="npTitle">Nothing playing</h2>
+              <p class="np-channel" id="npChannel"></p>
+              <input class="range range-seek" id="seek" type="range" min="0" max="100" step="0.1" value="0" aria-label="Seek">
+              <div class="times"><span id="posLabel">0:00</span><span id="durLabel">0:00</span></div>
+              <div class="transport">
+                <button class="btn btn-icon" type="button" data-action="prev" aria-label="Previous track"><span class="icon i-skip-back"></span></button>
+                <button class="btn btn-icon" type="button" data-action="back" aria-label="Back 10 seconds"><span class="icon i-arrow-left"></span><span class="btn-mini">10</span></button>
+                <button class="btn btn-play" id="playBtn" type="button" data-action="toggle" aria-label="Play"><span class="icon i-play" id="playIcon"></span></button>
+                <button class="btn btn-icon" type="button" data-action="fwd" aria-label="Forward 10 seconds"><span class="icon i-arrow-right"></span><span class="btn-mini">10</span></button>
+                <button class="btn btn-icon" type="button" data-action="next" aria-label="Next track"><span class="icon i-skip-forward"></span></button>
+              </div>
+              <div class="volume-row">
+                <button class="btn btn-icon btn-sm" type="button" id="muteBtn" data-action="mute" aria-label="Mute"><span class="icon i-volume-2" id="volIcon"></span></button>
+                <input class="range" id="volume" type="range" min="0" max="100" step="1" value="80" aria-label="Volume">
+                <span class="mono" id="volLabel">80</span>
+              </div>
+              <div class="mode-row">
+                <div class="segmented" role="group" aria-label="Playback mode">
+                  <button class="seg-btn" type="button" data-mode="music"><span class="icon i-audio-lines"></span>Music</button>
+                  <button class="seg-btn" type="button" data-mode="video"><span class="icon i-monitor-play"></span>Video</button>
+                </div>
+                <button class="btn btn-ghost btn-sm" type="button" data-action="split" id="splitBtn"><span class="icon i-picture-in-picture-2"></span><span id="splitLabel">Split</span></button>
+              </div>
+              <p class="status-line" id="statusLine" hidden></p>
+            </div>
+
+            <div class="panel">
+              <div class="panel__head">
+                <p class="eyebrow">Visualizer</p>
+                <span class="pill" id="vizName">bars</span>
+              </div>
+              <div class="viz-control">
+                <button class="btn btn-icon btn-sm" type="button" data-action="viz-prev" aria-label="Previous visualizer"><span class="icon i-chevron-right flip"></span></button>
+                <span class="viz-control__name" id="vizCurrent">bars</span>
+                <button class="btn btn-icon btn-sm" type="button" data-action="viz-next" aria-label="Next visualizer"><span class="icon i-chevron-right"></span></button>
+              </div>
+              <p class="eyebrow eyebrow-tight">Palette</p>
+              <div class="palettes" id="palettes"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel__head">
+                <p class="eyebrow">Up next</p>
+                <button class="btn btn-ghost btn-sm" type="button" data-page="queue"><span>Queue</span><span class="icon i-chevron-right"></span></button>
+              </div>
+              <div class="up-next" id="upNext"></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="page" id="page-queue" data-page="queue" hidden>
+        <div class="page-head page-head-row">
+          <div>
+            <p class="eyebrow">Playback</p>
+            <h1>Queue</h1>
+            <p class="page-sub" id="queueSub">Nothing queued.</p>
+          </div>
+          <div class="head-actions">
+            <button class="btn btn-ghost" type="button" data-page="search"><span class="icon i-plus"></span><span>Add tracks</span></button>
+            <button class="btn btn-ghost" type="button" id="queueClear"><span class="icon i-trash-2"></span><span>Clear</span></button>
+          </div>
+        </div>
+        <div class="track-list" id="queueList"></div>
+        <div class="empty" id="queueEmpty">
+          <span class="icon i-list-music empty__icon"></span>
+          <p class="empty__title">The queue is empty</p>
+          <p class="empty__text">Search for something, or add a folder from your library.</p>
+          <div class="empty__actions"><button class="btn btn-primary" type="button" data-page="search"><span class="icon i-search"></span><span>Search music</span></button></div>
+        </div>
+      </section>
+
+      <section class="page" id="page-settings" data-page="settings" hidden>
+        <div class="page-head">
+          <p class="eyebrow">Defaults</p>
+          <h1>Settings</h1>
+          <p class="page-sub">Changes save as you click. Every option here is also a flag and a settings-file key.</p>
+        </div>
+        <div class="settings-grid">
+          <div class="panel">
+            <div class="panel__head"><p class="eyebrow">Playback</p><span class="save-state" id="saveState"></span></div>
+            <div class="setting" data-setting="mode">
+              <div class="setting__text"><span class="setting__name">Default mode</span><span class="setting__hint">A file with no video stream still plays as a visualiser.</span></div>
+              <div class="segmented" role="group" aria-label="Default mode">
+                <button class="seg-btn" type="button" data-setting-value="music">Music</button>
+                <button class="seg-btn" type="button" data-setting-value="video">Video</button>
+              </div>
+            </div>
+            <div class="setting" data-setting="quality">
+              <div class="setting__text"><span class="setting__name">Quality cap</span><span class="setting__hint">Auto follows the grid. A cap lowers decode cost on small machines.</span></div>
+              <div class="choices" data-choices="quality">
+                <button class="chip" type="button" data-setting-value="0">Auto</button>
+                <button class="chip" type="button" data-setting-value="240">240p</button>
+                <button class="chip" type="button" data-setting-value="360">360p</button>
+                <button class="chip" type="button" data-setting-value="480">480p</button>
+                <button class="chip" type="button" data-setting-value="720">720p</button>
+                <button class="chip" type="button" data-setting-value="1080">1080p</button>
+              </div>
+            </div>
+            <div class="setting" data-setting="visualizer">
+              <div class="setting__text"><span class="setting__name">Visualizer</span><span class="setting__hint">The same styles as `rasterbar viz`.</span></div>
+              <div class="choices choices-wrap" data-choices="viz"></div>
+            </div>
+            <div class="setting" data-setting="palette">
+              <div class="setting__text"><span class="setting__name">Palette</span><span class="setting__hint">Colour scheme for the spectrum and every style.</span></div>
+              <div class="palettes palettes-settings" data-choices="palette"></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel__head"><p class="eyebrow">Library and network</p></div>
+            <div class="setting setting-stack" data-setting="cachedir">
+              <div class="setting__text"><span class="setting__name">Download folder</span><span class="setting__hint" id="cacheDirLabel">No folder set.</span></div>
+              <div class="inline-actions">
+                <button class="btn btn-ghost btn-sm" type="button" id="settingsPickFolder"><span class="icon i-folder"></span><span>Choose folder</span></button>
+                <button class="btn btn-ghost btn-sm" type="button" id="settingsClearFolder"><span class="icon i-x"></span><span>Clear</span></button>
+              </div>
+            </div>
+            <div class="setting setting-stack" data-setting="cookies">
+              <div class="setting__text"><span class="setting__name">Cookies from browser</span><span class="setting__hint">YouTube bot-checks by IP. A signed-in browser is the only cure.</span></div>
+              <div class="choices" data-choices="cookies">
+                <button class="chip" type="button" data-setting-value="">None</button>
+                <button class="chip" type="button" data-setting-value="firefox">Firefox</button>
+                <button class="chip" type="button" data-setting-value="chrome">Chrome</button>
+                <button class="chip" type="button" data-setting-value="chromium">Chromium</button>
+                <button class="chip" type="button" data-setting-value="brave">Brave</button>
+                <button class="chip" type="button" data-setting-value="edge">Edge</button>
+              </div>
+            </div>
+            <p class="muted small">Saved to <code>~/.config/rasterbar/config.json</code>. A flag on the command line still wins.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="page-about" data-page="about" hidden>
+        <div class="page-head">
+          <p class="eyebrow">The same player</p>
+          <h1>About RasterBar</h1>
+          <p class="page-sub">One Go binary. A terminal player, a local web UI, and the same visualiser pipeline behind both.</p>
+        </div>
+        <div class="settings-grid">
+          <div class="panel">
+            <p class="eyebrow">How it works</p>
+            <p class="about-copy">The Go process resolves streams with yt-dlp, decodes audio with mpv's audio path and video with ffmpeg, computes the spectrum with a hand-rolled FFT, and draws each frame with the same visualisers the terminal uses. This window receives those frames over one local HTTP stream. The browser is a renderer, not a second player.</p>
+            <ul class="facts">
+              <li><span class="icon i-check"></span><span>No Electron, no Tauri, no third-party Go modules.</span></li>
+              <li><span class="icon i-check"></span><span>Bound to loopback and protected by a per-run token.</span></li>
+              <li><span class="icon i-check"></span><span>Works offline for anything already in the download cache.</span></li>
+            </ul>
+            <div class="about-actions">
+              <button class="btn btn-ghost" type="button" id="btnCheckUpdate"><span class="icon i-refresh-cw"></span><span>Check for updates</span></button>
+              <span class="pill" id="versionPill">development</span>
+            </div>
+            <p class="muted small" id="updateMsg" hidden></p>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">Keyboard</p>
+            <div class="keys">
+              <div><kbd>space</kbd><span>play / pause</span></div>
+              <div><kbd>&larr;</kbd><kbd>&rarr;</kbd><span>seek 10 seconds</span></div>
+              <div><kbd>n</kbd><kbd>p</kbd><span>next / previous track</span></div>
+              <div><kbd>m</kbd><span>mute</span></div>
+              <div><kbd>f</kbd><span>fullscreen</span></div>
+            </div>
+            <p class="eyebrow eyebrow-tight">From the terminal</p>
+            <pre class="code-block"><code>rasterbar web
+rasterbar app
+rasterbar list ~/Music --play
+rasterbar "lofi hip hop radio"</code></pre>
+            <p class="muted small">The terminal UI has more: timestamps, chapters, split panes and a click-only settings screen. Run <code>rasterbar help</code>.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <nav class="mobile-nav" aria-label="Main">
+    <button class="mobile-nav__item" type="button" data-page="search"><span class="icon i-search"></span><span>Search</span></button>
+    <button class="mobile-nav__item" type="button" data-page="library"><span class="icon i-library"></span><span>Library</span></button>
+    <button class="mobile-nav__item" type="button" data-page="now"><span class="icon i-monitor-play"></span><span>Playing</span></button>
+    <button class="mobile-nav__item" type="button" data-page="queue"><span class="icon i-list-music"></span><span>Queue</span></button>
+    <button class="mobile-nav__item" type="button" data-page="settings"><span class="icon i-settings"></span><span>Settings</span></button>
+  </nav>
+</div>
+
+<audio id="audio" preload="auto"></audio>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+<div class="install-bar" id="installBar" hidden>
+  <div><strong>Install RasterBar</strong><span>Open it like an app, without browser chrome.</span></div>
+  <div class="install-bar__actions"><button class="btn btn-primary btn-sm" type="button" id="installConfirm">Install</button><button class="btn btn-ghost btn-sm" type="button" id="installDismiss">Not now</button></div>
+</div>
+<script src="/assets/app.js" defer></script>
+</body>
+</html>
