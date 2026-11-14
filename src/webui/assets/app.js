@@ -605,6 +605,12 @@ $('#muteBtn').addEventListener('click', () => {
 // transport delegation
 
 document.addEventListener('click', async (event) => {
+  const modeBtn = event.target.closest('[data-mode]');
+  if (modeBtn) {
+    const video = modeBtn.dataset.mode === 'video';
+    api('/api/mode', { video }).catch((e) => toast(e.message, 'error'));
+    return;
+  }
   const action = event.target.closest('[data-action]');
   if (!action) return;
   const name = action.dataset.action;
@@ -1270,6 +1276,22 @@ const initial = (location.hash || '#search').slice(1);
 go(initial, false);
 loadVersion();
 connect();
+// Unlock audio on the first user gesture. Browsers block programmatic play()
+// unless it follows a user interaction; the track's real src only arrives
+// seconds later (yt-dlp), so by then the gesture has expired. Playing a
+// silent buffer now keeps the media element 'unlocked' for the whole session.
+let audioUnlocked = false;
+function unlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  const prev = audio.src;
+  if (!prev) audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+  const p = audio.play();
+  if (p && p.then) p.then(() => { if (!prev) { audio.pause(); audio.removeAttribute('src'); audio.load(); } }).catch(() => {});
+  ['pointerdown', 'keydown', 'touchstart'].forEach((e) => document.removeEventListener(e, unlockAudio, true));
+}
+['pointerdown', 'keydown', 'touchstart'].forEach((e) => document.addEventListener(e, unlockAudio, true));
+
 audio.volume = 0.8;
 paintRange($('#volume'));
 paintRange($('#seek'));
