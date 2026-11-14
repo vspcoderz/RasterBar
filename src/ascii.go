@@ -275,26 +275,50 @@ func resolveAudioPair(track Track) (mediaPair, error) {
 		}, nil
 	}
 
-	info, err := ytdlpInfo(track)
-	if err != nil {
-		return mediaPair{}, err
+	// Two independent yt-dlp -J calls: one mints the tap's grant, the other
+	// mpv's. They are independent, so run them together — music mode used to
+	// wait for them back to back, which is where the long "Resolving stream"
+	// spinner came from.
+	type tapRes struct {
+		info ytInfo
+		err  error
 	}
-	tapURL, err := pickAudio(info.Formats)
-	if err != nil {
-		return mediaPair{}, err
+	type audioRes struct {
+		url  string
+		dur  float64
+		ch   []Chapter
+		err  error
 	}
-	audioURL, _, _, err := audioURLOnce(track)
+	tapCh := make(chan tapRes, 1)
+	audioCh := make(chan audioRes, 1)
+	go func() {
+		info, err := ytdlpInfo(track)
+		tapCh <- tapRes{info: info, err: err}
+	}()
+	go func() {
+		url, dur, ch, err := audioURLOnce(track)
+		audioCh <- audioRes{url: url, dur: dur, ch: ch, err: err}
+	}()
+	tr := <-tapCh
+	ar := <-audioCh
+	if tr.err != nil {
+		return mediaPair{}, tr.err
+	}
+	if ar.err != nil {
+		return mediaPair{}, ar.err
+	}
+	tapURL, err := pickAudio(tr.info.Formats)
 	if err != nil {
 		return mediaPair{}, err
 	}
 	return mediaPair{
 		tapURL:   tapURL,
-		audioURL: audioURL,
+		audioURL: ar.url,
 		// Free: the still is in the response the tap's URL came from, so the
 		// split view's thumbnail mode costs no request of its own.
-		thumbURL: pickThumbnail(info),
-		dur:      info.Duration,
-		chapters: chaptersFrom(info.Chapters),
+		thumbURL: pickThumbnail(tr.info),
+		dur:      tr.info.Duration,
+		chapters: chaptersFrom(tr.info.Chapters),
 	}, nil
 }
 
