@@ -226,21 +226,23 @@ type webQueueItem struct {
 	Channel  string `json:"channel"`
 	Duration string `json:"duration"`
 	Thumb    string `json:"thumb,omitempty"`
-	Local    bool   `json:"local"`
-	URL      string `json:"url,omitempty"`
+	Local     bool   `json:"local"`
+	LocalPath string `json:"local_path,omitempty"`
+	URL       string `json:"url,omitempty"`
 	Series   string `json:"series,omitempty"`
 }
 
 func queueItem(t Track) webQueueItem {
 	return webQueueItem{
-		ID:       t.ID,
-		Title:    t.Title,
-		Channel:  t.ChannelText(),
-		Duration: t.DurationText(),
-		Thumb:    t.Thumbs,
-		Local:    t.IsLocal(),
-		URL:      t.URL,
-		Series:   t.Series,
+		ID:        t.ID,
+		Title:     t.Title,
+		Channel:   t.ChannelText(),
+		Duration:  t.DurationText(),
+		Thumb:     t.Thumbs,
+		Local:     t.IsLocal(),
+		LocalPath: t.LocalPath,
+		URL:       t.URL,
+		Series:    t.Series,
 	}
 }
 

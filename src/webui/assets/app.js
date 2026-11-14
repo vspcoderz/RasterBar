@@ -72,6 +72,7 @@ function normalise(t) {
     duration: t.duration || '--:--',
     thumb: t.thumb || t.thumbs || '',
     local,
+    localPath: t.local_path || t.localPath || '',
     url: t.url || '',
     series: t.series || '',
   };
@@ -897,9 +898,23 @@ $('#queueClear').addEventListener('click', async () => {
 // ---------------------------------------------------------------------------
 // search
 
+function looksLikeURL(q) {
+  return /^(https?|ftp):\/\//i.test(q) || /^www\./i.test(q) || /^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(q);
+}
+
 async function doSearch(query) {
   const q = query.trim();
   if (!q) return;
+  if (looksLikeURL(q)) {
+    const url = /^https?:\/\//i.test(q) ? q : 'https://' + q;
+    try {
+      await api('/api/queue', { tracks: [{ title: url, url }], index: 0 });
+      go('now');
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+    return;
+  }
   $('#searchBtn').disabled = true;
   $('#searchBtn').textContent = 'Searching';
   $('#searchEmpty').hidden = true;

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -438,19 +439,50 @@ func (s *webServer) apiPickFolder(w http.ResponseWriter, r *http.Request) {
 		errors.New("no folder picker available (install zenity or kdialog), type the path instead"))
 }
 
+// normalizeTrack folds the shapes a browser can send into the one the player
+// expects. A local file sometimes arrives with its path in `url` (no scheme),
+// and a pasted link can arrive without a scheme; sorting it out here means
+// resolveMedia never sees a half-labelled track.
+func normalizeTrack(t *Track) {
+	if t.URL == "" {
+		return
+	}
+	if strings.HasPrefix(t.URL, "file://") {
+		u, err := url.Parse(t.URL)
+		if err == nil && u.Path != "" {
+			if t.LocalPath == "" {
+				t.LocalPath = filepath.Clean(u.Path)
+			}
+			t.URL = ""
+		}
+		return
+	}
+	if filepath.IsAbs(t.URL) && !strings.Contains(t.URL, "://") {
+		if t.LocalPath == "" {
+			t.LocalPath = t.URL
+		}
+		t.URL = ""
+	}
+}
+
 func validateTracks(tracks []Track) error {
-	for i, t := range tracks {
+	for i := range tracks {
+		normalizeTrack(&tracks[i])
+		t := tracks[i]
 		if len(t.Title) > 500 {
 			return fmt.Errorf("track %d: title too long", i)
 		}
-		if t.URL != "" && !strings.HasPrefix(t.URL, "http://") && !strings.HasPrefix(t.URL, "https://") {
-			return fmt.Errorf("track %d: unsupported url", i)
+		if t.URL != "" {
+			if !strings.HasPrefix(t.URL, "http://") && !strings.HasPrefix(t.URL, "https://") &&
+				!strings.HasPrefix(t.URL, "ftp://") {
+				return fmt.Errorf("track %d: unsupported url %q (expected http, https, ftp or a local path)", i, t.URL)
+			}
 		}
 		if t.LocalPath != "" && !filepath.IsAbs(t.LocalPath) {
 			return fmt.Errorf("track %d: local path must be absolute", i)
 		}
 		if t.URL == "" && t.LocalPath == "" {
-			return fmt.Errorf("track %d: nothing to play", i)
+			return fmt.Errorf("track %d: nothing to play (no url and no local path)", i)
 		}
 	}
 	return nil
